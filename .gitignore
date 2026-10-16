@@ -1,0 +1,20 @@
+# Claude Code session state
+.claude/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test coverage transient files
+.coverage
+.coverage.*
+ci/.coverage.*
+
+# OS artifacts
+.DS_Store
+Thumbs.db

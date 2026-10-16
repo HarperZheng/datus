@@ -1,0 +1,502 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Unit tests for datus/agent/node/node_factory.py
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from datus.agent.node.node import Node
+from datus.agent.node.node_factory import _resolve_node_class_type, create_interactive_node, create_node_input
+from datus.configuration.node_type import NodeType
+from datus.schemas.ask_metrics_agentic_node_models import AskMetricsNodeInput, AskMetricsNodeResult
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _mock_agent_config(**kwargs):
+    config = MagicMock()
+    config.agentic_nodes = kwargs.get("agentic_nodes", None)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Tests: _resolve_node_class_type
+# ---------------------------------------------------------------------------
+
+
+class TestResolveNodeClassType:
+    def test_no_agentic_nodes(self):
+        config = _mock_agent_config(agentic_nodes=None)
+        assert _resolve_node_class_type("my_agent", config) is None
+
+    def test_missing_subagent(self):
+        config = _mock_agent_config(agentic_nodes={"other": {}})
+        assert _resolve_node_class_type("my_agent", config) is None
+
+    def test_returns_node_class(self):
+        config = _mock_agent_config(agentic_nodes={"my_agent": {"node_class": "gen_report"}})
+        assert _resolve_node_class_type("my_agent", config) == "gen_report"
+
+    def test_returns_type_when_node_class_missing(self):
+        config = _mock_agent_config(agentic_nodes={"my_agent": {"type": "ask_metrics"}})
+        assert _resolve_node_class_type("my_agent", config) == "ask_metrics"
+
+    def test_node_class_takes_precedence_over_type(self):
+        config = _mock_agent_config(agentic_nodes={"my_agent": {"node_class": "gen_report", "type": "ask_metrics"}})
+        assert _resolve_node_class_type("my_agent", config) == "gen_report"
+
+    def test_pydantic_model_dump(self):
+        node_config = MagicMock()
+        node_config.model_dump.return_value = {"node_class": "gen_report"}
+        config = _mock_agent_config(agentic_nodes={"my_agent": node_config})
+        assert _resolve_node_class_type("my_agent", config) == "gen_report"
+
+
+# ---------------------------------------------------------------------------
+# Tests: create_interactive_node
+# ---------------------------------------------------------------------------
+
+
+class TestCreateInteractiveNode:
+    @patch(
+        "datus.agent.node.semantic_modeling_agentic_node.SemanticModelingAgenticNode.__init__",
+        return_value=None,
+    )
+    def test_semantic_modeling(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("semantic_modeling", config)
+        mock_init.assert_called_once_with(
+            agent_config=config, execution_mode="interactive", scope=None, session_id=None
+        )
+
+    @patch("datus.agent.node.chat_agentic_node.ChatAgenticNode.__init__", return_value=None)
+    def test_default_chat_node(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node(None, config, node_id_suffix="_test")
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_id"] == "chat_test"
+        assert call_kwargs["node_type"] == "chat"
+
+    @patch("datus.agent.node.sql_summary_agentic_node.SqlSummaryAgenticNode.__init__", return_value=None)
+    def test_gen_sql_summary(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("gen_sql_summary", config)
+        mock_init.assert_called_once_with(
+            node_name="gen_sql_summary",
+            agent_config=config,
+            execution_mode="interactive",
+            scope=None,
+            session_id=None,
+        )
+
+    @patch("datus.agent.node.gen_report_agentic_node.GenReportAgenticNode.__init__", return_value=None)
+    def test_gen_report(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("gen_report", config, node_id_suffix="_cli")
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_id"] == "gen_report_cli"
+        assert call_kwargs["node_type"] == "gen_report"
+
+    @patch("datus.agent.node.ask_metrics_agentic_node.AskMetricsAgenticNode.__init__", return_value=None)
+    def test_ask_metrics(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("ask_metrics", config, node_id_suffix="_cli")
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_id"] == "ask_metrics_cli"
+        assert call_kwargs["node_type"] == "ask_metrics"
+        assert call_kwargs["node_name"] == "ask_metrics"
+
+    @patch("datus.agent.node.ask_metrics_agentic_node.AskMetricsAgenticNode.__init__", return_value=None)
+    @patch("datus.agent.node.node_factory._resolve_node_class_type", return_value="ask_metrics")
+    def test_config_driven_ask_metrics(self, mock_resolve, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("custom_metric_agent", config)
+        mock_init.assert_called_once()
+        assert mock_init.call_args[1]["node_name"] == "custom_metric_agent"
+
+    @patch("datus.agent.node.ask_metrics_agentic_node.AskMetricsAgenticNode.__init__", return_value=None)
+    def test_type_driven_custom_ask_metrics(self, mock_init):
+        config = _mock_agent_config(agentic_nodes={"custom_metric_agent": {"type": "ask_metrics"}})
+        create_interactive_node("custom_metric_agent", config)
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_type"] == "ask_metrics"
+        assert call_kwargs["node_name"] == "custom_metric_agent"
+
+    @patch("datus.agent.node.gen_report_agentic_node.GenReportAgenticNode.__init__", return_value=None)
+    @patch("datus.agent.node.node_factory._resolve_node_class_type", return_value="gen_report")
+    def test_config_driven_gen_report(self, mock_resolve, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("custom_agent", config)
+        mock_init.assert_called_once()
+        assert mock_init.call_args[1]["node_name"] == "custom_agent"
+
+    @patch("datus.agent.node.gen_table_agentic_node.GenTableAgenticNode.__init__", return_value=None)
+    def test_gen_table(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("gen_table", config)
+        mock_init.assert_called_once_with(
+            agent_config=config, execution_mode="interactive", node_name=None, scope=None, session_id=None
+        )
+
+    @patch("datus.agent.node.gen_sql_agentic_node.GenSQLAgenticNode.__init__", return_value=None)
+    def test_default_subagent_is_gen_sql(self, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("my_custom_sql", config, node_id_suffix="_cli")
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_id"] == "my_custom_sql_cli"
+        assert call_kwargs["node_type"] == "gen_sql"
+
+    @patch("datus.agent.node.gen_table_agentic_node.GenTableAgenticNode.__init__", return_value=None)
+    @patch("datus.agent.node.node_factory._resolve_node_class_type", return_value="gen_table")
+    def test_config_driven_gen_table(self, mock_resolve, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("wide_table_builder", config)
+        mock_init.assert_called_once_with(
+            agent_config=config,
+            execution_mode="interactive",
+            node_name="wide_table_builder",
+            scope=None,
+            session_id=None,
+        )
+
+    @patch("datus.agent.node.gen_skill_agentic_node.SkillCreatorAgenticNode.__init__", return_value=None)
+    @patch("datus.agent.node.node_factory._resolve_node_class_type", return_value="gen_skill")
+    def test_config_driven_gen_skill(self, mock_resolve, mock_init):
+        config = _mock_agent_config()
+        create_interactive_node("skill_designer", config, node_id_suffix="_cli")
+        mock_init.assert_called_once()
+        call_kwargs = mock_init.call_args[1]
+        assert call_kwargs["node_id"] == "skill_designer_cli"
+        assert call_kwargs["node_name"] == "skill_designer"
+        assert call_kwargs["node_type"] == "gen_skill"
+
+    @patch("datus.agent.node.feedback_agentic_node.FeedbackAgenticNode.__init__", return_value=None)
+    def test_feedback_routes_to_feedback_node(self, mock_init):
+        """`/feedback` must land on FeedbackAgenticNode, not the gen_sql fallback."""
+        config = _mock_agent_config()
+        create_interactive_node("feedback", config)
+        mock_init.assert_called_once_with(
+            agent_config=config, execution_mode="interactive", scope=None, session_id=None
+        )
+
+    @patch("datus.agent.node.gen_sql_agentic_node.GenSQLAgenticNode.__init__", return_value=None)
+    def test_execution_mode_workflow_propagates(self, mock_init):
+        """API workflow callers pass execution_mode="workflow"; factory must forward it."""
+        config = _mock_agent_config()
+        create_interactive_node("my_custom_sql", config, execution_mode="workflow")
+        mock_init.assert_called_once()
+        assert mock_init.call_args[1]["execution_mode"] == "workflow"
+
+    @patch("datus.agent.node.feedback_agentic_node.FeedbackAgenticNode.__init__", return_value=None)
+    def test_execution_mode_workflow_for_feedback(self, mock_init):
+        """Workflow flag also propagates to nodes that take agent_config-only signatures."""
+        config = _mock_agent_config()
+        create_interactive_node("feedback", config, execution_mode="workflow")
+        mock_init.assert_called_once_with(agent_config=config, execution_mode="workflow", scope=None, session_id=None)
+
+    @patch("datus.agent.node.gen_sql_agentic_node.GenSQLAgenticNode.__init__", return_value=None)
+    def test_node_id_override(self, mock_init):
+        """node_id kwarg must take precedence over the auto-generated suffix."""
+        config = _mock_agent_config()
+        create_interactive_node("my_custom_sql", config, node_id_suffix="_cli", node_id="api-session-42")
+        assert mock_init.call_args[1]["node_id"] == "api-session-42"
+
+    @patch("datus.agent.node.chat_agentic_node.ChatAgenticNode.__init__", return_value=None)
+    def test_node_id_override_for_chat(self, mock_init):
+        """Default chat node honours the node_id override (used by the API path)."""
+        config = _mock_agent_config()
+        create_interactive_node(None, config, node_id="api-session-7")
+        assert mock_init.call_args[1]["node_id"] == "api-session-7"
+
+    @patch("datus.agent.node.gen_table_agentic_node.GenTableAgenticNode.__init__", return_value=None)
+    def test_gen_table_scope_propagates(self, mock_init):
+        """API path passes user_id as scope; gen_table must isolate session by user."""
+        config = _mock_agent_config()
+        create_interactive_node("gen_table", config, scope="user-42")
+        assert mock_init.call_args[1]["scope"] == "user-42"
+
+    @patch("datus.agent.node.gen_job_agentic_node.GenJobAgenticNode.__init__", return_value=None)
+    def test_gen_job_scope_propagates(self, mock_init):
+        """gen_job session files must land under the per-user shard on the API path."""
+        config = _mock_agent_config()
+        create_interactive_node("gen_job", config, scope="user-42")
+        mock_init.assert_called_once_with(
+            agent_config=config, execution_mode="interactive", scope="user-42", session_id=None
+        )
+
+    @patch("datus.agent.node.gen_skill_agentic_node.SkillCreatorAgenticNode.__init__", return_value=None)
+    def test_gen_skill_scope_propagates(self, mock_init):
+        """gen_skill must accept and forward scope so user-scoped skill drafts are isolated."""
+        config = _mock_agent_config()
+        create_interactive_node("gen_skill", config, scope="user-42")
+        assert mock_init.call_args[1]["scope"] == "user-42"
+
+    @patch("datus.agent.node.explore_agentic_node.ExploreAgenticNode.__init__", return_value=None)
+    def test_explore_execution_mode_propagates(self, mock_init):
+        """explore must receive execution_mode so workflow callers don't trip the
+        interactive permission-hook ASK path (which would block on a missing
+        broker listener in API / gateway runs)."""
+        config = _mock_agent_config()
+        create_interactive_node("explore", config, execution_mode="workflow")
+        assert mock_init.call_args[1]["execution_mode"] == "workflow"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Node / NodeType ask_metrics wiring
+# ---------------------------------------------------------------------------
+
+
+class TestNodeSemanticWiring:
+    def test_new_instance_defaults_to_semantic_modeling(self):
+        config = _mock_agent_config()
+
+        with patch(
+            "datus.agent.node.semantic_modeling_agentic_node.SemanticModelingAgenticNode.__init__",
+            return_value=None,
+        ):
+            node = Node.new_instance(
+                node_id="semantic_node",
+                description="semantic authoring",
+                node_type=NodeType.TYPE_SEMANTIC,
+                agent_config=config,
+            )
+
+        assert node.__class__.__name__ == "SemanticModelingAgenticNode"
+
+    def test_new_instance_routes_semantic_modeling(self):
+        config = _mock_agent_config()
+
+        with patch(
+            "datus.agent.node.semantic_modeling_agentic_node.SemanticModelingAgenticNode.__init__",
+            return_value=None,
+        ) as mock_init:
+            node = Node.new_instance(
+                node_id="semantic_node",
+                description="semantic authoring",
+                node_type=NodeType.TYPE_SEMANTIC,
+                agent_config=config,
+                node_name="semantic_modeling",
+                is_subagent=True,
+                session_id="session-1",
+            )
+
+        assert node.__class__.__name__ == "SemanticModelingAgenticNode"
+        mock_init.assert_called_once_with(
+            agent_config=config,
+            execution_mode="workflow",
+            authoring_scope="full",
+            is_subagent=True,
+            session_id="session-1",
+        )
+
+    def test_new_instance_propagates_datasets_only_scope_before_setup(self):
+        from datus.schemas.semantic_agentic_node_models import SemanticNodeInput
+
+        config = _mock_agent_config()
+        input_data = SemanticNodeInput(user_message="Model the orders dataset", authoring_scope="datasets")
+
+        with patch(
+            "datus.agent.node.semantic_modeling_agentic_node.SemanticModelingAgenticNode.__init__",
+            return_value=None,
+        ) as mock_init:
+            node = Node.new_instance(
+                node_id="semantic_node",
+                description="dataset authoring",
+                node_type=NodeType.TYPE_SEMANTIC,
+                input_data=input_data,
+                agent_config=config,
+                node_name="semantic_modeling",
+            )
+
+        mock_init.assert_called_once_with(
+            agent_config=config,
+            execution_mode="workflow",
+            authoring_scope="datasets",
+            is_subagent=False,
+            session_id=None,
+        )
+        assert node.input is input_data
+
+
+class TestNodeAskMetricsWiring:
+    @patch("datus.agent.node.ask_metrics_agentic_node.AskMetricsAgenticNode.__init__", return_value=None)
+    def test_new_instance_routes_ask_metrics(self, mock_init):
+        config = _mock_agent_config()
+
+        node = Node.new_instance(
+            node_id="metric_node",
+            description="metric QA",
+            node_type=NodeType.TYPE_ASK_METRICS,
+            input_data=None,
+            agent_config=config,
+            tools=[],
+            node_name="custom_metric_agent",
+            is_subagent=True,
+            session_id="session-1",
+        )
+
+        assert node.__class__.__name__ == "AskMetricsAgenticNode"
+        mock_init.assert_called_once()
+        call_args = mock_init.call_args.args
+        call_kwargs = mock_init.call_args.kwargs
+        assert call_args[:7] == (
+            "metric_node",
+            "metric QA",
+            NodeType.TYPE_ASK_METRICS,
+            None,
+            config,
+            [],
+            "custom_metric_agent",
+        )
+        assert call_kwargs["execution_mode"] == "workflow"
+        assert call_kwargs["is_subagent"] is True
+        assert call_kwargs["session_id"] == "session-1"
+
+    @patch("datus.agent.node.ask_metrics_agentic_node.AskMetricsAgenticNode.__init__", return_value=None)
+    def test_from_dict_converts_ask_metrics_input_and_result(self, mock_init):
+        config = _mock_agent_config()
+        node = Node.from_dict(
+            {
+                "id": "metric_node",
+                "description": "metric QA",
+                "type": NodeType.TYPE_ASK_METRICS,
+                "input": {"user_message": "What was revenue last month?", "database": "warehouse"},
+                "status": "completed",
+                "result": {"success": True, "response": "Revenue was 10.", "markdown_report": "Revenue was 10."},
+                "start_time": None,
+                "end_time": None,
+                "dependencies": [],
+                "metadata": {},
+            },
+            agent_config=config,
+        )
+
+        init_input = mock_init.call_args.args[3]
+        assert isinstance(init_input, AskMetricsNodeInput)
+        assert init_input.user_message == "What was revenue last month?"
+        assert init_input.database == "warehouse"
+        assert isinstance(node.result, AskMetricsNodeResult)
+        assert node.result.response == "Revenue was 10."
+
+    def test_node_type_input_uses_ask_metrics_model(self):
+        result = NodeType.type_input(NodeType.TYPE_ASK_METRICS, {"user_message": "Show revenue"})
+
+        assert isinstance(result, AskMetricsNodeInput)
+        assert result.user_message == "Show revenue"
+
+
+# ---------------------------------------------------------------------------
+# Tests: create_node_input
+# ---------------------------------------------------------------------------
+
+
+def _load_node_class(module_path, class_name):
+    import importlib
+
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)
+
+
+class TestCreateNodeInput:
+    @pytest.mark.parametrize(
+        "node_module,node_class_name,message,kwargs,expected_attrs",
+        [
+            (
+                "datus.agent.node.chat_agentic_node",
+                "ChatAgenticNode",
+                "hello",
+                {"catalog": "cat", "database": "db"},
+                {"user_message": "hello", "catalog": "cat"},
+            ),
+            (
+                "datus.agent.node.gen_sql_agentic_node",
+                "GenSQLAgenticNode",
+                "generate SQL",
+                {"catalog": "cat", "plan_mode": True},
+                {"user_message": "generate SQL", "plan_mode": True},
+            ),
+            (
+                "datus.agent.node.semantic_modeling_agentic_node",
+                "SemanticModelingAgenticNode",
+                "build model",
+                {"catalog": "cat", "prompt_language": "zh"},
+                {"user_message": "build model", "prompt_language": "zh"},
+            ),
+            (
+                "datus.agent.node.sql_summary_agentic_node",
+                "SqlSummaryAgenticNode",
+                "summarize",
+                {"database": "mydb"},
+                {"user_message": "summarize", "database": "mydb"},
+            ),
+            (
+                "datus.agent.node.gen_table_agentic_node",
+                "GenTableAgenticNode",
+                "create table",
+                {"catalog": "cat", "database": "db"},
+                {"user_message": "create table", "catalog": "cat", "database": "db"},
+            ),
+            (
+                "datus.agent.node.gen_report_agentic_node",
+                "GenReportAgenticNode",
+                "report",
+                {"catalog": "cat", "database": "db"},
+                {"user_message": "report", "catalog": "cat", "database": "db"},
+            ),
+            (
+                "datus.agent.node.ask_metrics_agentic_node",
+                "AskMetricsAgenticNode",
+                "metric answer",
+                {"catalog": "cat", "database": "db"},
+                {"user_message": "metric answer", "catalog": "cat", "database": "db"},
+            ),
+            (
+                "datus.agent.node.feedback_agentic_node",
+                "FeedbackAgenticNode",
+                "analyze and archive",
+                {"database": "db"},
+                {"user_message": "analyze and archive", "database": "db"},
+            ),
+        ],
+    )
+    def test_create_node_input(self, node_module, node_class_name, message, kwargs, expected_attrs):
+        node_class = _load_node_class(node_module, node_class_name)
+        node = MagicMock(spec=node_class)
+        result = create_node_input(message, node, **kwargs)
+        for attr, expected_value in expected_attrs.items():
+            assert getattr(result, attr) == expected_value, (
+                f"{node_class_name}: expected {attr}={expected_value!r}, got {getattr(result, attr)!r}"
+            )
+
+    def test_feedback_source_session_id_wired(self):
+        """Feedback branch must forward source_session_id to FeedbackNodeInput."""
+        node_class = _load_node_class("datus.agent.node.feedback_agentic_node", "FeedbackAgenticNode")
+        node = MagicMock(spec=node_class)
+        result = create_node_input(
+            "analyze and archive",
+            node,
+            database="db",
+            source_session_id="chat_session_abc",
+        )
+        assert result.source_session_id == "chat_session_abc"
+        assert result.database == "db"
+        assert result.user_message == "analyze and archive"
+
+    def test_feedback_source_session_id_defaults_to_none(self):
+        """CLI callers leave source_session_id unset → FeedbackNodeInput carries None."""
+        node_class = _load_node_class("datus.agent.node.feedback_agentic_node", "FeedbackAgenticNode")
+        node = MagicMock(spec=node_class)
+        result = create_node_input("/feedback", node)
+        assert result.source_session_id is None

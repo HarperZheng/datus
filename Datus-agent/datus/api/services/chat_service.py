@@ -1,0 +1,532 @@
+"""
+Stateless chat service — thin proxy over ChatTaskManager.
+
+Each request assembles configuration and delegates to ChatTaskManager
+for the actual agentic loop execution. Session management methods
+read from disk each time (no in-memory state).
+"""
+
+import json
+import os
+import uuid
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+
+from datus.agent.node.chat_agentic_node import ChatAgenticNode
+from datus.api.models.base_models import Result
+from datus.api.models.cli_models import (
+    AtContextData,
+    ChatHistoryData,
+    ChatSessionData,
+    ChatSessionItemInfo,
+    CompactSessionData,
+    CompactSessionInput,
+    IMessageContent,
+    SSEErrorData,
+    SSEEvent,
+    SSEMessagePayload,
+    StreamChatInput,
+)
+from datus.api.services.action_sse_converter import action_to_sse_event, answered_ask_user_to_sse_event
+from datus.api.services.chat_task_manager import (
+    TurnEndCallback,
+    _is_visible_assistant_response,
+    _remember_assistant_message,
+    _should_include_final_response,
+    _should_skip_duplicate_assistant_message,
+)
+from datus.configuration.agent_config import AgentConfig
+from datus.models.session_manager import SessionManager, session_matches_agent
+from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from datus.utils.config_utils import coerce_positive_int
+from datus.utils.exceptions import DatusException, ErrorCode
+from datus.utils.loggings import get_logger
+from datus.utils.time_utils import now_utc_iso
+
+logger = get_logger(__name__)
+
+# Session-list pagination bounds. Overridable via the ``api`` section of
+# agent.yml (``api.default_session_page_size`` / ``api.max_session_page_size``),
+# mirroring ``api.max_prefetch_tables``. Both are finite so that the default
+# request path — clients that omit ``limit`` entirely — stays bounded.
+_DEFAULT_SESSION_PAGE_SIZE = 50
+_DEFAULT_MAX_SESSION_PAGE_SIZE = 200
+
+
+def _is_ask_user_call(action: ActionHistory) -> bool:
+    input_data = action.input if isinstance(action.input, dict) else {}
+    return (
+        action.role == ActionRole.TOOL
+        and action.status == ActionStatus.PROCESSING
+        and input_data.get("function_name") == "ask_user"
+    )
+
+
+def _is_task_result(action: ActionHistory) -> bool:
+    input_data = action.input if isinstance(action.input, dict) else {}
+    return (
+        action.role == ActionRole.TOOL
+        and action.status != ActionStatus.PROCESSING
+        and input_data.get("function_name") == "task"
+    )
+
+
+def _subagent_session_id(result_action: ActionHistory) -> Optional[str]:
+    output = result_action.output if isinstance(result_action.output, dict) else {}
+    result = output.get("result", output)
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return None
+    sub_session_id = result.get("session_id") if isinstance(result, dict) else None
+    return sub_session_id if isinstance(sub_session_id, str) and sub_session_id else None
+
+
+def _is_safe_session_id(session_id: str) -> bool:
+    try:
+        SessionManager._validate_session_id(session_id)
+    except ValueError:
+        return False
+    # The validator allows dots; ``..`` as a directory name would leave the user's scope.
+    return ".." not in session_id
+
+
+def _load_subagent_runs(session_dir: str, sub_session_id: str) -> List[List[ActionHistory]]:
+    """A subagent session's stored actions, one list per prompt it received."""
+    # SessionManager() creates its directory, so check for the file before building one.
+    if not os.path.isfile(os.path.join(session_dir, f"{sub_session_id}.db")):
+        return []
+    try:
+        raw_messages = SessionManager(session_dir=session_dir).get_session_messages(sub_session_id)
+    except Exception as e:
+        logger.warning(f"Failed to read subagent session {sub_session_id} for history: {e}")
+        return []
+
+    # The prompt itself is already on the task card.
+    runs: List[List[ActionHistory]] = []
+    for msg in raw_messages:
+        if msg.get("role") == "user":
+            runs.append([])
+        elif msg.get("role") == "assistant":
+            if not runs:
+                runs.append([])
+            runs[-1].extend(msg.get("actions") or [])
+    return runs
+
+
+def _subagent_run_actions(
+    session_dir: str,
+    call_id: str,
+    result_action: ActionHistory,
+    runs_cache: Dict[str, List[List[ActionHistory]]],
+) -> List[ActionHistory]:
+    """The steps one ``task`` call's subagent ran, stamped as depth-1 children of the call.
+
+    ``session_dir`` is where ``SubAgentTaskTool`` nests subagent sessions for this main
+    session, inside the user's scope. A resumed session holds several runs, and each
+    ``task`` result takes the next one; ``runs_cache`` reads each session once per request.
+    """
+    sub_session_id = _subagent_session_id(result_action)
+    if not sub_session_id or not _is_safe_session_id(sub_session_id):
+        return []
+    if sub_session_id not in runs_cache:
+        runs_cache[sub_session_id] = _load_subagent_runs(session_dir, sub_session_id)
+    runs = runs_cache[sub_session_id]
+    if not runs:
+        return []
+
+    actions = runs.pop(0)
+    for action in actions:
+        action.depth = max(action.depth, 1)
+        action.parent_action_id = action.parent_action_id or call_id
+    return actions
+
+
+def _actions_to_payloads(
+    messages: List[ActionHistory],
+    event_id: int,
+    expand_subagent: Optional[Callable[[str, ActionHistory], List[ActionHistory]]] = None,
+) -> tuple[List[SSEMessagePayload], int]:
+    """Convert one stored assistant group into history payloads.
+
+    ``expand_subagent`` returns the steps a ``task`` call's subagent ran; they go
+    out flat, right before the task result, in the order the live stream sends them.
+    """
+    sse_messages: List[SSEMessagePayload] = []
+    assistant_response_seen = False
+    tool_result_seen = False
+    # Maps fingerprint -> owning message_id; the helpers below
+    # need the owner to tell a legitimate UPDATE from a repeat.
+    seen_assistant_message_fingerprints: dict[str, str] = {}
+    tool_results = {
+        a.action_id.removeprefix("complete_"): a
+        for a in messages
+        if a.role == ActionRole.TOOL and a.status != ActionStatus.PROCESSING
+    }
+    replayed_ask_user_ids: set[str] = set()
+    for action in messages:
+        if action.role == ActionRole.TOOL and action.status != ActionStatus.PROCESSING:
+            if action.action_id.removeprefix("complete_") in replayed_ask_user_ids:
+                # Folded into the card, but it still counts as a tool result.
+                tool_result_seen = True
+                continue
+        if expand_subagent and _is_task_result(action):
+            call_id = action.action_id.removeprefix("complete_")
+            sub_payloads, event_id = _actions_to_payloads(expand_subagent(call_id, action), event_id)
+            sse_messages.extend(sub_payloads)
+        sse_event = None
+        if _is_ask_user_call(action) and action.action_id in tool_results:
+            sse_event = answered_ask_user_to_sse_event(
+                action, tool_results[action.action_id], event_id, str(uuid.uuid4())
+            )
+            if sse_event:
+                replayed_ask_user_ids.add(action.action_id)
+        if sse_event is None:
+            include_final_response = _should_include_final_response(action, assistant_response_seen)
+            sse_event = action_to_sse_event(
+                action,
+                event_id,
+                str(uuid.uuid4()),
+                include_user_message=True,
+                include_final_response=include_final_response,
+            )
+        if sse_event:
+            if _should_skip_duplicate_assistant_message(
+                action,
+                sse_event,
+                seen_assistant_message_fingerprints,
+            ):
+                continue
+            sse_messages.append(sse_event.data.payload)
+            event_id += 1
+            _remember_assistant_message(sse_event, seen_assistant_message_fingerprints)
+            if _is_visible_assistant_response(action, sse_event, tool_result_seen=tool_result_seen):
+                assistant_response_seen = True
+            if action.role == ActionRole.TOOL and action.status != ActionStatus.PROCESSING:
+                tool_result_seen = True
+    return sse_messages, event_id
+
+
+class ChatService:
+    """Thin service that delegates chat execution to ChatTaskManager.
+
+    Owned by DatusService. Session management methods read from disk.
+    """
+
+    def __init__(self, agent_config: AgentConfig, task_manager=None, project_id: Optional[str] = None) -> None:
+        self.agent_config = agent_config
+        self._task_manager = task_manager
+
+        # Session directory: {home}/sessions — must match agent's path_manager.sessions_dir
+        self._session_dir = self.agent_config.session_dir
+
+    # ------------------------------------------------------------------
+    # Streaming chat (thin proxy)
+    # ------------------------------------------------------------------
+
+    async def stream_chat(
+        self,
+        request: StreamChatInput,
+        sub_agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
+        stats_context: Optional[Dict[str, Any]] = None,
+        on_turn_end: Optional[TurnEndCallback] = None,
+    ) -> AsyncGenerator[SSEEvent, None]:
+        """Start a background chat task and yield SSE events."""
+        task_manager = self._task_manager
+        try:
+            task = await task_manager.start_chat(
+                self.agent_config,
+                request,
+                sub_agent_id=sub_agent_id,
+                user_id=user_id,
+                policy_context=policy_context,
+                stats_context=stats_context,
+                on_turn_end=on_turn_end,
+            )
+        except (ValueError, DatusException) as e:
+            error_code = e.code.name if isinstance(e, DatusException) else ErrorCode.COMMON_VALIDATION_FAILED.name
+            yield SSEEvent(
+                id=1,
+                event="error",
+                data=SSEErrorData(error=str(e), error_type=error_code, session_id=request.session_id),
+                timestamp=now_utc_iso(),
+            )
+            return
+        async for event in task_manager.consume_events(task):
+            yield event
+
+    # ------------------------------------------------------------------
+    # Session management (stateless — reads from disk each time)
+    # ------------------------------------------------------------------
+
+    def session_exists(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Check if a session exists on disk."""
+        session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+        return session_mgr.session_exists(session_id)
+
+    def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
+        offset: int = 0,
+        limit: Optional[int] = None,
+    ) -> Result[ChatSessionData]:
+        """List chat sessions from disk, optionally filtered by agent.
+
+        When ``subagent_id`` is ``None`` every session for *user_id* is
+        returned. When set, only sessions whose id prefix encodes that agent
+        are returned; the sentinel ``"chat"`` selects the default chat agent
+        (including legacy prefix-less sessions).
+
+        ``offset``/``limit`` are applied *before* the per-session enrichment
+        below: only the requested page pays the per-file ``get_session_info``
+        cost (an individual sqlite open), so cost no longer scales with the
+        user's total lifetime session count. Ordering ids by file mtime here
+        (via ``sort_by_modified``, a cheap ``stat`` pass) is a proxy for the
+        final ``last_updated``-based sort applied to the enriched page below;
+        the two can disagree at page boundaries in rare cases, which is an
+        accepted tradeoff for avoiding an eager full-directory sqlite scan.
+
+        The page size is always finite. ``limit=None`` (the caller omitted it)
+        means "server default", not "unbounded" — otherwise the default request
+        path would still open every session file and re-trigger the very
+        timeouts pagination was added to prevent. An explicitly requested
+        ``limit`` is clamped down to ``api.max_session_page_size`` rather than
+        rejected, so an over-large page still returns a valid first page, and a
+        non-positive one falls back to the default; ``total_count`` reports the
+        unpaginated total for callers to page through. Both bounds come from
+        the ``api`` section of agent.yml.
+
+        Note that only the *sqlite enrichment* is page-bounded. Listing the
+        directory and stat-ing each file for the mtime sort still costs one
+        ``stat`` per session, so that pass scales with the total; it is orders
+        of magnitude cheaper than the per-file sqlite open it replaces.
+        """
+        try:
+            api_config = getattr(self.agent_config, "api_config", {}) or {}
+            max_page_size = coerce_positive_int(api_config.get("max_session_page_size"), _DEFAULT_MAX_SESSION_PAGE_SIZE)
+            default_page_size = min(
+                coerce_positive_int(api_config.get("default_session_page_size"), _DEFAULT_SESSION_PAGE_SIZE),
+                max_page_size,
+            )
+            # A non-positive ``limit`` is treated as unspecified rather than
+            # passed through: the route pins ``ge=1``, but a direct caller
+            # passing -1 would otherwise slice ``all_ids[offset:-1]`` and
+            # enrich nearly every session — the exact cost this bounds.
+            page_size = min(coerce_positive_int(limit, default_page_size), max_page_size)
+            # Likewise the route pins ``ge=0``; clamp again for non-HTTP callers,
+            # since a negative offset would silently slice from the tail.
+            offset = max(offset, 0)
+
+            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            all_ids = session_mgr.list_sessions(sort_by_modified=True)
+            if subagent_id is not None:
+                all_ids = [sid for sid in all_ids if session_matches_agent(sid, subagent_id)]
+
+            total_count = len(all_ids)
+            page_ids = all_ids[offset : offset + page_size]
+
+            sessions = []
+            for sid in page_ids:
+                try:
+                    info = session_mgr.get_session_info(sid)
+                    if not info.get("exists", False):
+                        continue
+                    created_at = info.get("created_at") or ""
+                    last_updated = info.get("updated_at") or info.get("file_modified_iso") or created_at
+                    sessions.append(
+                        ChatSessionItemInfo(
+                            user_query=info.get("first_user_message"),
+                            session_id=sid,
+                            created_at=created_at,
+                            last_updated=last_updated,
+                            total_turns=info.get("message_count", 0),
+                            token_count=info.get("total_tokens", 0),
+                            last_sql_queries=[],
+                            is_active=False,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to read session {sid}: {e}")
+
+            sessions.sort(key=lambda x: x.last_updated or x.created_at, reverse=True)
+            return Result[ChatSessionData](
+                success=True,
+                data=ChatSessionData(
+                    sessions=sessions,
+                    total_count=total_count,
+                ),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list sessions: {e}")
+            return Result[ChatSessionData](success=False, errorCode="SESSION_LIST_ERROR", errorMessage=str(e))
+
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> Result[ChatSessionData]:
+        """Delete a session from disk."""
+        try:
+            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            if session_mgr.session_exists(session_id):
+                session_mgr.delete_session(session_id)
+
+            return Result[ChatSessionData](
+                success=True,
+                data=ChatSessionData(
+                    session_id=session_id,
+                    created_at="",
+                    last_updated=now_utc_iso(),
+                    total_turns=0,
+                    token_count=0,
+                    last_sql_queries=[],
+                    is_active=False,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id}: {e}")
+            return Result[ChatSessionData](success=False, errorCode="SESSION_DELETE_ERROR", errorMessage=str(e))
+
+    async def compact_session(
+        self, request: CompactSessionInput, user_id: Optional[str] = None
+    ) -> Result[CompactSessionData]:
+        """Compact a session by loading it into a temporary node and running compaction."""
+        session_id = request.session_id
+        try:
+            # Create a temporary ChatAgenticNode to load the session
+            node = ChatAgenticNode(
+                node_id=session_id,
+                description="Temporary node for compaction",
+                node_type="chat",
+                input_data=None,
+                agent_config=self.agent_config,
+                tools=None,
+                scope=user_id,
+                session_id=session_id,
+            )
+
+            # Load the existing SQLite session so _session is populated
+            node._get_or_create_session()
+
+            # The public ``compact`` API replaces the legacy ``_manual_compact``
+            # entrypoint. Pass ``mode="major"`` because the API surface is the
+            # equivalent of an explicit ``/compact`` invocation — it always
+            # wants the LLM summarization path, never the rule-based minor
+            # archive pass (which runs autonomously inside the agent loop).
+            result = await node.compact(mode="major", reason="api_request")
+
+            if not result.get("success", False):
+                return Result[CompactSessionData](
+                    success=True,
+                    data=CompactSessionData(session_id=session_id, success=False, error="Compact failed"),
+                )
+
+            return Result[CompactSessionData](
+                success=True,
+                data=CompactSessionData(session_id=session_id, success=True),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to compact session {session_id}: {e}")
+            return Result[CompactSessionData](success=False, errorCode="SESSION_COMPACT_ERROR", errorMessage=str(e))
+
+    def get_history(self, session_id: str, user_id: Optional[str] = None) -> Result[ChatHistoryData]:
+        """Get chat history messages for a session."""
+        try:
+            # Use SessionManager to get messages from SQLite
+            session_manager = SessionManager(session_dir=self._session_dir, scope=user_id)
+            raw_messages = session_manager.get_session_messages(session_id)
+            tool_results = session_manager.get_tool_result_contents(session_id)
+
+            if not raw_messages:
+                return Result[ChatHistoryData](success=True, data=ChatHistoryData())
+
+            sse_messages: List[SSEMessagePayload] = []
+            event_id = 0
+            # Subagent sessions nest under this one, in the user's scope. Only that
+            # directory is read: the flat pre-fix layout is shared by every user.
+            subagent_dir = (
+                os.path.join(session_manager.session_dir, session_id) if _is_safe_session_id(session_id) else None
+            )
+            subagent_runs: Dict[str, List[List[ActionHistory]]] = {}
+
+            for idx, msg in enumerate(raw_messages):
+                role = msg.get("role", "")
+                if role == "user":
+                    content = msg.get("content", "")
+                    if content:
+                        at_ctx_raw = msg.get("at_context")
+                        at_context = None
+                        if isinstance(at_ctx_raw, dict):
+                            at_context = AtContextData(
+                                table_paths=at_ctx_raw.get("table_paths") or [],
+                                metric_paths=at_ctx_raw.get("metric_paths") or [],
+                                sql_paths=at_ctx_raw.get("sql_paths") or [],
+                                knowledge_paths=at_ctx_raw.get("knowledge_paths") or [],
+                            )
+                        # A manual-execution record renders as readable Markdown
+                        # so the raw sentinel never reaches web clients.
+                        from datus.cli.manual_exec import exec_to_markdown
+
+                        content = exec_to_markdown(content)
+                        sse_messages.append(
+                            SSEMessagePayload(
+                                message_id=str(uuid.uuid4()),
+                                role="user",
+                                content=[IMessageContent(**part) for part in msg["message_contents"]]
+                                if msg.get("message_contents")
+                                else [IMessageContent(type="markdown", payload={"content": content})],
+                                at_context=at_context,
+                            )
+                        )
+                        event_id += 1
+                elif role == "assistant":
+                    if "actions" in msg:
+                        payloads, event_id = _actions_to_payloads(
+                            msg["actions"],
+                            event_id,
+                            expand_subagent=(
+                                (
+                                    lambda call_id, result_action: _subagent_run_actions(
+                                        subagent_dir, call_id, result_action, subagent_runs
+                                    )
+                                )
+                                if subagent_dir
+                                else None
+                            ),
+                        )
+                        sse_messages.extend(payloads)
+                    elif msg.get("content"):
+                        sse_messages.append(
+                            SSEMessagePayload(
+                                message_id=str(uuid.uuid4()),
+                                role="assistant",
+                                content=[IMessageContent(type="markdown", payload={"content": msg["content"]})],
+                            )
+                        )
+                        event_id += 1
+
+            # Restore the canonical streamed result, including its duration,
+            # after conversion so expanded Subagent results are restored too.
+            for message in sse_messages:
+                for part in message.content:
+                    if part.type == "call-tool-result":
+                        saved = tool_results.get(part.payload.get("callToolId"))
+                        if saved is not None:
+                            part.payload = saved
+
+            logger.info(
+                "chat.history_loaded",
+                session_id=session_id,
+                stored_messages=len(raw_messages),
+                returned_messages=len(sse_messages),
+            )
+            return Result[ChatHistoryData](success=True, data=ChatHistoryData(messages=sse_messages))
+
+        except Exception as e:
+            logger.error(f"Failed to get history for session {session_id}: {e}")
+            return Result[ChatHistoryData](
+                success=False,
+                errorCode="SESSION_HISTORY_ERROR",
+                errorMessage=f"Failed to get session history: {str(e)}",
+            )

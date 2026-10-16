@@ -1,0 +1,1188 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Unit tests for datus/cli/execution_state.py.
+
+Tests cover:
+- PendingInteraction dataclass
+- InteractionCancelled exception
+- InteractionBroker: init, request, submit, fetch, has_pending, is_queue_empty
+- merge_interaction_stream: merging execute_stream and broker output
+
+NO MOCK EXCEPT LLM. All classes under test are real implementations.
+"""
+
+import asyncio
+from datetime import datetime
+
+import pytest
+
+from datus.cli.execution_state import (
+    ExecutionInterrupted,
+    InteractionBroker,
+    InteractionCancelled,
+    InterruptController,
+    PendingInputQueue,
+    PendingInteraction,
+    auto_submit_interaction,
+    merge_interaction_stream,
+)
+from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from datus.schemas.interaction_event import InteractionEvent
+
+# ===========================================================================
+# InterruptController Tests
+# ===========================================================================
+
+
+class TestInterruptController:
+    """Tests for InterruptController thread-safe interrupt management."""
+
+    def test_initial_state_not_interrupted(self):
+        """Newly created controller is not in interrupted state."""
+        ctrl = InterruptController()
+        assert ctrl.is_interrupted is False
+        # check() should not raise
+        ctrl.check()
+
+    def test_interrupt_sets_flag(self):
+        """interrupt() sets the interrupted flag."""
+        ctrl = InterruptController()
+        ctrl.interrupt()
+        assert ctrl.is_interrupted is True
+
+    def test_check_raises_when_interrupted(self):
+        """check() raises ExecutionInterrupted after interrupt() is called."""
+        ctrl = InterruptController()
+        ctrl.interrupt()
+        with pytest.raises(ExecutionInterrupted, match="Execution interrupted by user"):
+            ctrl.check()
+
+    def test_reset_clears_interrupted_flag(self):
+        """reset() clears the interrupt signal for a new cycle."""
+        ctrl = InterruptController()
+        ctrl.interrupt()
+        assert ctrl.is_interrupted is True
+        ctrl.reset()
+        assert ctrl.is_interrupted is False
+        # check() should not raise after reset
+        ctrl.check()
+
+    def test_interrupt_and_check_cycle(self):
+        """Multiple interrupt-reset cycles work correctly."""
+        ctrl = InterruptController()
+        for _ in range(3):
+            ctrl.interrupt()
+            assert ctrl.is_interrupted is True
+            with pytest.raises(ExecutionInterrupted):
+                ctrl.check()
+            ctrl.reset()
+            assert ctrl.is_interrupted is False
+
+    def test_interrupt_invokes_registered_cancel_callback(self):
+        ctrl = InterruptController()
+        calls = []
+
+        token = ctrl.register_cancel_callback(lambda: calls.append("cancel"))
+        ctrl.interrupt()
+
+        assert calls == ["cancel"]
+        ctrl.unregister_cancel_callback(token)
+
+    def test_repeated_interrupt_does_not_recancel_active_operation(self):
+        ctrl = InterruptController()
+        calls = []
+
+        token = ctrl.register_cancel_callback(lambda: calls.append("cancel"))
+        ctrl.interrupt()
+        ctrl.interrupt()
+
+        assert calls == ["cancel"]
+        ctrl.unregister_cancel_callback(token)
+
+    def test_late_cancel_callback_runs_immediately(self):
+        ctrl = InterruptController()
+        calls = []
+        ctrl.interrupt()
+
+        token = ctrl.register_cancel_callback(lambda: calls.append("cancel"))
+
+        assert calls == ["cancel"]
+        ctrl.unregister_cancel_callback(token)
+
+    def test_unregistered_cancel_callback_does_not_run(self):
+        ctrl = InterruptController()
+        calls = []
+
+        token = ctrl.register_cancel_callback(lambda: calls.append("cancel"))
+        ctrl.unregister_cancel_callback(token)
+        ctrl.interrupt()
+
+        assert calls == []
+
+
+# ===========================================================================
+# PendingInteraction Tests
+# ===========================================================================
+
+
+class TestPendingInteractionInit:
+    """Tests for PendingInteraction dataclass creation."""
+
+    def test_pending_interaction_creation(self):
+        """PendingInteraction stores action_id, future, and choices correctly."""
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+        choices = [{"y": "Yes", "n": "No"}]
+
+        pending = PendingInteraction(action_id="test-id", future=future, choices=choices)
+
+        assert pending.action_id == "test-id"
+        assert pending.future is future
+        assert pending.choices == [{"y": "Yes", "n": "No"}]
+        assert isinstance(pending.created_at, datetime)
+        loop.close()
+
+    def test_pending_interaction_created_at_auto_set(self):
+        """PendingInteraction auto-sets created_at to current datetime."""
+        loop = asyncio.new_event_loop()
+        future = loop.create_future()
+
+        pending = PendingInteraction(action_id="test-id-2", future=future, choices=[{}])
+
+        assert isinstance(pending.created_at, datetime)
+        loop.close()
+
+
+# ===========================================================================
+# InteractionCancelled Tests
+# ===========================================================================
+
+
+class TestInteractionCancelled:
+    """Tests for InteractionCancelled exception."""
+
+    def test_exception_is_exception_subclass(self):
+        """InteractionCancelled is a subclass of Exception."""
+        assert issubclass(InteractionCancelled, Exception)
+
+    def test_exception_message(self):
+        """InteractionCancelled stores and returns the error message."""
+        exc = InteractionCancelled("test cancellation")
+        assert str(exc) == "test cancellation"
+
+    def test_exception_can_be_raised_and_caught(self):
+        """InteractionCancelled can be raised and caught specifically."""
+        with pytest.raises(InteractionCancelled, match="cancelled"):
+            raise InteractionCancelled("cancelled")
+
+
+# ===========================================================================
+# InteractionBroker Tests
+# ===========================================================================
+
+
+class TestInteractionBrokerInit:
+    """Tests for InteractionBroker initialization."""
+
+    def test_broker_init_empty_pending(self):
+        """Newly created broker has no pending interactions."""
+        broker = InteractionBroker()
+        assert broker.has_pending is False
+
+    def test_broker_init_empty_queue(self):
+        """Newly created broker has an empty output queue."""
+        broker = InteractionBroker()
+        assert broker.is_queue_empty() is True
+
+
+class TestInteractionBrokerIsPending:
+    """Tests for InteractionBroker.is_pending()."""
+
+    @pytest.mark.asyncio
+    async def test_is_pending_tracks_one_key_until_answered(self):
+        """is_pending is True only for the waiting key, and turns False once it is answered."""
+        broker = InteractionBroker()
+        task = asyncio.create_task(broker.request([InteractionEvent(content="Go?", choices={"y": "Yes", "n": "No"})]))
+        await asyncio.sleep(0.05)
+        action_id = broker._output_queue.get_nowait().action_id
+
+        assert broker.is_pending(action_id) is True
+        assert broker.is_pending("some-other-key") is False
+
+        assert await broker.submit(action_id, [["y"]]) is True
+        assert await task == [["y"]]
+        assert broker.is_pending(action_id) is False
+
+
+class TestInteractionBrokerRequest:
+    """Tests for InteractionBroker.request() method."""
+
+    @pytest.mark.asyncio
+    async def test_request_creates_pending_and_queues_action(self):
+        """request() adds a pending interaction and queues an ActionHistory for the UI."""
+        broker = InteractionBroker()
+
+        # Start the request in background; it will block until submit
+        async def do_request():
+            return await broker.request(
+                [
+                    InteractionEvent(
+                        content="Pick one",
+                        choices={"a": "Option A", "b": "Option B"},
+                        default_choice="a",
+                    )
+                ]
+            )
+
+        task = asyncio.create_task(do_request())
+
+        # Give the request coroutine time to queue the action
+        await asyncio.sleep(0.05)
+
+        assert broker.has_pending is True
+        assert broker.is_queue_empty() is False
+
+        # Fetch the queued action
+        action = broker._output_queue.get_nowait()
+        assert action.role == ActionRole.INTERACTION
+        assert action.status == ActionStatus.PROCESSING
+        assert action.action_type == "request_choice"
+        assert action.input["events"][0]["content"] == "Pick one"
+        assert action.input["events"][0]["choices"] == {"a": "Option A", "b": "Option B"}
+        assert action.input["events"][0]["default_choice"] == "a"
+
+        # Submit response so the task completes
+        action_id = action.action_id
+        await broker.submit(action_id, [["a"]])
+        result = await task
+
+        assert result == [["a"]]
+
+    @pytest.mark.asyncio
+    async def test_submit_auto_generates_success_action(self):
+        """submit() automatically queues a SUCCESS ActionHistory with user_choice."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request(
+                [
+                    InteractionEvent(
+                        content="Confirm?",
+                        choices={"y": "Yes", "n": "No"},
+                        default_choice="y",
+                    )
+                ]
+            )
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        # Get the queued PROCESSING action to find the action_id
+        action = broker._output_queue.get_nowait()
+        action_id = action.action_id
+
+        # Submit — this auto-generates a SUCCESS action
+        await broker.submit(action_id, [["y"]])
+        choice = await task
+
+        assert choice == [["y"]]
+
+        # Verify submit() auto-queued a SUCCESS action
+        success_action = broker._output_queue.get_nowait()
+        assert success_action.role == ActionRole.INTERACTION
+        assert success_action.status == ActionStatus.SUCCESS
+        assert success_action.action_id == action_id
+        assert success_action.output["user_choice"] == [["y"]]
+
+    @pytest.mark.asyncio
+    async def test_request_cancelled_propagates_cancelled_error(self):
+        """A cancelled run must stay cancelled: CancelledError, not InteractionCancelled.
+
+        Downgrading it let ``ask_user`` report an ordinary tool failure, so the
+        LLM kept going after ``/chat/stop`` said the run had ended.
+        """
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Pick one", choices={"a": "A"}, default_choice="a")])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        # Cancel the task (which cancels the future inside request())
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert not broker.has_pending
+
+    @pytest.mark.asyncio
+    async def test_request_raises_interaction_cancelled_when_broker_closes(self):
+        """Closing the broker cancels the question only — that stays catchable."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Pick one", choices={"a": "A"}, default_choice="a")])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        broker.close()
+
+        with pytest.raises(InteractionCancelled):
+            await task
+
+
+class TestInteractionBrokerSubmit:
+    """Tests for InteractionBroker.submit() method."""
+
+    @pytest.mark.asyncio
+    async def test_submit_unknown_action_id_returns_false(self):
+        """submit() returns False when action_id is not found."""
+        broker = InteractionBroker()
+        result = await broker.submit("nonexistent-id", [["choice"]])
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_submit_non_list_answers_returns_false(self):
+        """submit() returns False when answers is not a list (e.g. a bare string)."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Pick", choices={"a": "A"}, default_choice="a")])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        action_id = action.action_id
+
+        # Bare string violates the List[List[str]] contract
+        assert await broker.submit(action_id, "a") is False
+        # Nested non-list violates the contract
+        assert await broker.submit(action_id, ["a"]) is False
+        # Non-string leaf violates the contract
+        assert await broker.submit(action_id, [[1]]) is False
+
+        # Pending should still be live; submit valid answer to clean up
+        assert broker.has_pending is True
+        await broker.submit(action_id, [["a"]])
+        await task
+
+    @pytest.mark.asyncio
+    async def test_submit_invalid_choice_returns_false(self):
+        """submit() returns False when user_choice is not in the valid choices."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request(
+                [InteractionEvent(content="Pick", choices={"a": "A", "b": "B"}, default_choice="a")]
+            )
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        action_id = action.action_id
+
+        # Submit an invalid choice
+        result = await broker.submit(action_id, [["z"]])
+        assert result is False
+
+        # The pending should still be there
+        assert broker.has_pending is True
+
+        # Clean up: submit valid choice to unblock the task
+        await broker.submit(action_id, [["a"]])
+        await task
+
+    @pytest.mark.asyncio
+    async def test_submit_valid_choice_returns_true(self):
+        """submit() returns True when the choice is valid."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Pick", choices={"x": "X"}, default_choice="x")])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        action_id = action.action_id
+
+        result = await broker.submit(action_id, [["x"]])
+        assert result is True
+        assert broker.has_pending is False
+
+        choice = await task
+        assert choice == [["x"]]
+
+    @pytest.mark.asyncio
+    async def test_submit_empty_choices_accepts_any_text(self):
+        """When choices is empty dict, any free-text input is accepted."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Enter text", choices={}, allow_free_text=True)])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        action_id = action.action_id
+
+        result = await broker.submit(action_id, [["free text input"]])
+        assert result is True
+
+        choice = await task
+        assert choice == [["free text input"]]
+
+
+class TestInteractionBrokerFetch:
+    """Tests for InteractionBroker.fetch() async generator."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_yields_queued_actions(self):
+        """fetch() yields ActionHistory objects that were queued."""
+        broker = InteractionBroker()
+
+        # Manually put an action in the queue
+        action = ActionHistory(
+            action_id="test-action",
+            role=ActionRole.INTERACTION,
+            status=ActionStatus.PROCESSING,
+            action_type="request_choice",
+            messages="test",
+            input={},
+            output=None,
+        )
+        broker._output_queue.put_nowait(action)
+
+        # Fetch should yield the action
+        fetched_actions = []
+        fetch_gen = broker.fetch()
+
+        async def collect():
+            async for a in fetch_gen:
+                fetched_actions.append(a)
+                break  # Only collect one
+
+        await asyncio.wait_for(collect(), timeout=1.0)
+        assert len(fetched_actions) == 1
+        assert fetched_actions[0].action_id == "test-action"
+
+
+class TestInteractionBrokerEdgeCases:
+    """Edge case tests for InteractionBroker."""
+
+    def test_has_pending_reflects_state(self):
+        """has_pending property accurately reflects pending dict state."""
+        broker = InteractionBroker()
+        assert broker.has_pending is False
+
+    def test_is_queue_empty_reflects_state(self):
+        """is_queue_empty() reflects the queue state correctly."""
+        broker = InteractionBroker()
+        assert broker.is_queue_empty() is True
+
+        action = ActionHistory(
+            action_id="q-test",
+            role=ActionRole.INTERACTION,
+            status=ActionStatus.PROCESSING,
+            action_type="test",
+            messages="test",
+            input={},
+            output=None,
+        )
+        broker._output_queue.put_nowait(action)
+        assert broker.is_queue_empty() is False
+
+
+# ===========================================================================
+# merge_interaction_stream Tests
+# ===========================================================================
+
+
+class TestMergeInteractionStream:
+    """Tests for merge_interaction_stream function."""
+
+    @pytest.mark.asyncio
+    async def test_merge_yields_execute_stream_actions(self):
+        """merge_interaction_stream yields actions from execute_stream."""
+        broker = InteractionBroker()
+
+        async def execute_stream():
+            yield ActionHistory(
+                action_id="exec-1",
+                role=ActionRole.ASSISTANT,
+                status=ActionStatus.SUCCESS,
+                action_type="response",
+                messages="Hello",
+                input={},
+                output={"raw_output": "Hello"},
+            )
+
+        actions = []
+        async for action in merge_interaction_stream(execute_stream(), broker):
+            actions.append(action)
+
+        assert len(actions) == 1
+        assert actions[0].action_id == "exec-1"
+        assert actions[0].role == ActionRole.ASSISTANT
+
+    @pytest.mark.asyncio
+    async def test_merge_yields_interaction_actions(self):
+        """merge_interaction_stream yields actions from broker queue."""
+        broker = InteractionBroker()
+
+        # Queue an interaction action before starting the merge
+        interaction_action = ActionHistory(
+            action_id="interact-1",
+            role=ActionRole.INTERACTION,
+            status=ActionStatus.SUCCESS,
+            action_type="request_choice",
+            messages="Result",
+            input={},
+            output={"content": "Done"},
+        )
+        broker._output_queue.put_nowait(interaction_action)
+
+        async def execute_stream():
+            yield ActionHistory(
+                action_id="exec-1",
+                role=ActionRole.ASSISTANT,
+                status=ActionStatus.SUCCESS,
+                action_type="response",
+                messages="Hi",
+                input={},
+                output={"raw_output": "Hi"},
+            )
+
+        actions = []
+        async for action in merge_interaction_stream(execute_stream(), broker):
+            actions.append(action)
+
+        action_ids = {a.action_id for a in actions}
+        assert "exec-1" in action_ids
+        assert "interact-1" in action_ids
+
+    @pytest.mark.asyncio
+    async def test_merge_empty_execute_stream(self):
+        """merge_interaction_stream handles empty execute_stream correctly."""
+        broker = InteractionBroker()
+
+        async def execute_stream():
+            if False:
+                yield  # Make it an async generator
+
+        actions = []
+        async for action in merge_interaction_stream(execute_stream(), broker):
+            actions.append(action)
+
+        assert len(actions) == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_multiple_execute_actions(self):
+        """merge_interaction_stream yields multiple actions from execute_stream in order."""
+        broker = InteractionBroker()
+
+        async def execute_stream():
+            for i in range(3):
+                yield ActionHistory(
+                    action_id=f"exec-{i}",
+                    role=ActionRole.TOOL,
+                    status=ActionStatus.SUCCESS,
+                    action_type="tool_call",
+                    messages=f"Tool {i}",
+                    input={},
+                    output={"raw_output": f"result-{i}"},
+                )
+
+        actions = []
+        async for action in merge_interaction_stream(execute_stream(), broker):
+            actions.append(action)
+
+        assert len(actions) == 3
+        exec_ids = [a.action_id for a in actions if a.action_id.startswith("exec-")]
+        assert len(exec_ids) == 3
+
+    @pytest.mark.asyncio
+    async def test_merge_interleaves_execute_and_interaction(self):
+        """merge_interaction_stream interleaves execute_stream and broker actions."""
+        broker = InteractionBroker()
+
+        async def execute_stream():
+            # First yield an action
+            yield ActionHistory(
+                action_id="exec-0",
+                role=ActionRole.ASSISTANT,
+                status=ActionStatus.SUCCESS,
+                action_type="response",
+                messages="step 0",
+                input={},
+                output={"raw_output": "step 0"},
+            )
+            # Simulate a delay where broker action gets queued
+            await asyncio.sleep(0.05)
+            yield ActionHistory(
+                action_id="exec-1",
+                role=ActionRole.ASSISTANT,
+                status=ActionStatus.SUCCESS,
+                action_type="response",
+                messages="step 1",
+                input={},
+                output={"raw_output": "step 1"},
+            )
+
+        # Queue a broker action that should be picked up during the stream
+        broker._output_queue.put_nowait(
+            ActionHistory(
+                action_id="broker-0",
+                role=ActionRole.INTERACTION,
+                status=ActionStatus.SUCCESS,
+                action_type="request_choice",
+                messages="interaction",
+                input={},
+                output={"content": "done"},
+            )
+        )
+
+        actions = []
+        async for action in merge_interaction_stream(execute_stream(), broker):
+            actions.append(action)
+
+        action_ids = [a.action_id for a in actions]
+        assert "exec-0" in action_ids
+        assert "exec-1" in action_ids
+        assert "broker-0" in action_ids
+        assert len(actions) == 3
+
+
+# ===========================================================================
+# InteractionBroker close / sentinel Tests
+# ===========================================================================
+
+
+class TestInteractionBrokerClose:
+    """Tests for InteractionBroker.close() sentinel termination."""
+
+    def test_close_sets_closed(self):
+        """close() sets the _closed flag."""
+        broker = InteractionBroker()
+        assert broker._closed is False
+        broker.close()
+        assert broker._closed is True
+
+    def test_close_is_idempotent(self):
+        """Calling close() twice enqueues only one sentinel."""
+        broker = InteractionBroker()
+        broker.close()
+        broker.close()
+        assert broker._closed is True
+        # Only one sentinel in the queue
+        assert broker._output_queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_terminates_on_sentinel(self):
+        """fetch() stops generating after the sentinel is dequeued."""
+        broker = InteractionBroker()
+
+        action = ActionHistory(
+            action_id="before-close",
+            role=ActionRole.INTERACTION,
+            status=ActionStatus.PROCESSING,
+            action_type="request_choice",
+            messages="test",
+            input={},
+            output=None,
+        )
+        broker._output_queue.put_nowait(action)
+        broker.close()
+
+        fetched = []
+        async for item in broker.fetch():
+            fetched.append(item)
+
+        assert len(fetched) == 1
+        assert fetched[0].action_id == "before-close"
+
+    @pytest.mark.asyncio
+    async def test_reset_queue_clears_closed(self):
+        """reset_queue() resets the _closed flag and creates a fresh queue."""
+        broker = InteractionBroker()
+        broker.close()
+        assert broker._closed is True
+
+        broker.reset_queue()
+        assert broker._closed is False
+        assert broker.is_queue_empty() is True
+
+    @pytest.mark.asyncio
+    async def test_request_after_close_raises(self):
+        """request() after close() raises InteractionCancelled."""
+        broker = InteractionBroker()
+        broker.close()
+
+        with pytest.raises(InteractionCancelled, match="already closed"):
+            await broker.request([InteractionEvent(content="Q?", choices={"a": "A"})])
+
+
+# ===========================================================================
+# InteractionBroker.request() fail-fast Tests
+# ===========================================================================
+
+
+class TestInteractionBrokerRequestFailFast:
+    """Tests for request() fail-fast guards."""
+
+    @pytest.mark.asyncio
+    async def test_request_when_closed_raises(self):
+        """request() raises InteractionCancelled when broker is already closed."""
+        broker = InteractionBroker()
+        broker.close()
+
+        with pytest.raises(InteractionCancelled, match="already closed"):
+            await broker.request([InteractionEvent(content="Q?", choices={"a": "A"})])
+
+    @pytest.mark.asyncio
+    async def test_request_with_empty_events_raises(self):
+        """request() raises InteractionCancelled when events list is empty."""
+        broker = InteractionBroker()
+
+        with pytest.raises(InteractionCancelled, match="empty events"):
+            await broker.request([])
+
+
+# ===========================================================================
+# auto_submit_interaction Tests
+# ===========================================================================
+
+
+class TestAutoSubmitInteraction:
+    """Tests for auto_submit_interaction helper function."""
+
+    @pytest.mark.asyncio
+    async def test_batch_auto_submit(self):
+        """Batch questions: auto-submits first option value for each."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request(
+                [
+                    InteractionEvent(content="Q1?", choices={"1": "MySQL", "2": "PostgreSQL"}),
+                    InteractionEvent(content="Q2?", choices={"a": "Yes", "b": "No"}),
+                ]
+            )
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        await auto_submit_interaction(broker, action)
+
+        result = await task
+        assert result == [["1"], ["a"]]
+
+    @pytest.mark.asyncio
+    async def test_batch_with_free_text_question(self):
+        """Batch with empty choices dict: auto-submits empty string for that question."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request(
+                [
+                    InteractionEvent(content="Q1?", choices={"1": "MySQL"}),
+                    InteractionEvent(content="Q2?", choices={}, allow_free_text=True),
+                ]
+            )
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        await auto_submit_interaction(broker, action)
+
+        result = await task
+        assert result == [["1"], [""]]
+
+    @pytest.mark.asyncio
+    async def test_single_with_default(self):
+        """Single question with choices and default: auto-submits default."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request(
+                [InteractionEvent(content="Pick?", choices={"y": "Yes", "n": "No"}, default_choice="y")]
+            )
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        await auto_submit_interaction(broker, action)
+
+        result = await task
+        assert result == [["y"]]
+
+    @pytest.mark.asyncio
+    async def test_single_free_text(self):
+        """Single question without choices: auto-submits empty string."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Enter text?", choices={}, allow_free_text=True)])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        await auto_submit_interaction(broker, action)
+
+        result = await task
+        assert result == [[""]]
+
+    @pytest.mark.asyncio
+    async def test_single_no_default(self):
+        """Single question with choices but no default: auto-submits first choice key."""
+        broker = InteractionBroker()
+
+        async def do_request():
+            return await broker.request([InteractionEvent(content="Pick?", choices={"a": "Alpha", "b": "Beta"})])
+
+        task = asyncio.create_task(do_request())
+        await asyncio.sleep(0.05)
+
+        action = broker._output_queue.get_nowait()
+        await auto_submit_interaction(broker, action)
+
+        result = await task
+        assert result == [["a"]]
+
+    @pytest.mark.asyncio
+    async def test_empty_events(self):
+        """Empty events list: auto-submits empty string."""
+        broker = InteractionBroker()
+
+        # Manually create a pending interaction for this edge case
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        broker._pending["edge-id"] = PendingInteraction(
+            action_id="edge-id", future=future, choices=[{}], allow_free_text=True
+        )
+
+        action = ActionHistory(
+            action_id="edge-id",
+            role=ActionRole.INTERACTION,
+            status=ActionStatus.PROCESSING,
+            action_type="request_choice",
+            messages="",
+            input={"events": []},
+            output=None,
+        )
+
+        await auto_submit_interaction(broker, action)
+        # Let event loop process the call_soon_threadsafe callback
+        await asyncio.sleep(0.05)
+        assert future.result() == [[""]]
+
+
+# ===========================================================================
+# InteractionBroker.send + free-text request Tests
+# ===========================================================================
+
+
+class TestInteractionBrokerSend:
+    """Tests for the one-way ``send()`` helper used for plan-mode previews."""
+
+    @pytest.mark.asyncio
+    async def test_send_pushes_assistant_action_with_default_action_type(self):
+        broker = InteractionBroker()
+
+        await broker.send("# Plan\n- step 1", content_type="markdown")
+
+        action = await broker._output_queue.get()
+        assert action.role == ActionRole.ASSISTANT
+        assert action.status == ActionStatus.SUCCESS
+        assert action.action_type == "plan_preview"
+        assert action.messages == "# Plan\n- step 1"
+        assert action.output == {"content": "# Plan\n- step 1", "content_type": "markdown"}
+        # send() must not register a pending future — it is purely one-way.
+        assert broker.has_pending is False
+
+    @pytest.mark.asyncio
+    async def test_send_respects_custom_action_type_and_role(self):
+        broker = InteractionBroker()
+
+        await broker.send("hello", role=ActionRole.INTERACTION, action_type="custom_type")
+
+        action = await broker._output_queue.get()
+        assert action.role == ActionRole.INTERACTION
+        assert action.action_type == "custom_type"
+
+    @pytest.mark.asyncio
+    async def test_send_after_close_is_swallowed(self):
+        broker = InteractionBroker()
+        broker.close()
+
+        await broker.send("ignored", content_type="markdown")
+        # Only the sentinel pushed at close() should remain on the queue.
+        assert broker._output_queue.qsize() == 1
+
+
+class TestInteractionBrokerAllowFreeText:
+    """Tests for the ``allow_free_text`` flag on ``InteractionEvent`` / ``submit``."""
+
+    @pytest.mark.asyncio
+    async def test_allow_free_text_accepts_non_key_string(self):
+        from datus.schemas.interaction_event import InteractionEvent
+
+        broker = InteractionBroker()
+
+        # Drive the broker deterministically: start the request, wait for
+        # the action to appear on the output queue, then submit. This avoids
+        # ``if broker.has_pending`` polling branches (P0 conditional_assert).
+        request_task = asyncio.create_task(
+            broker.request(
+                [
+                    InteractionEvent(
+                        title="Plan",
+                        content="Confirm or revise?",
+                        choices={"confirm": "Confirm"},
+                        default_choice="confirm",
+                        allow_free_text=True,
+                    )
+                ]
+            )
+        )
+        request_action = await asyncio.wait_for(broker._output_queue.get(), timeout=1.0)
+        ok = await broker.submit(request_action.action_id, [["please add validation step"]])
+        assert ok is True
+        answers = await request_task
+
+        assert answers == [["please add validation step"]]
+
+    @pytest.mark.asyncio
+    async def test_allow_free_text_disabled_still_rejects_non_key(self):
+        from datus.schemas.interaction_event import InteractionEvent
+
+        broker = InteractionBroker()
+
+        request_task = asyncio.create_task(
+            broker.request(
+                [
+                    InteractionEvent(
+                        title="Yes/No",
+                        content="Yes or no?",
+                        choices={"y": "yes", "n": "no"},
+                        default_choice="y",
+                        allow_free_text=False,
+                    )
+                ]
+            )
+        )
+        request_action = await asyncio.wait_for(broker._output_queue.get(), timeout=1.0)
+        rejected = await broker.submit(request_action.action_id, [["garbage"]])
+        assert rejected is False
+        accepted = await broker.submit(request_action.action_id, [["y"]])
+        assert accepted is True
+        answers = await request_task
+
+        assert answers == [["y"]]
+
+    @pytest.mark.asyncio
+    async def test_allow_free_text_exposed_in_action_input(self):
+        from datus.schemas.interaction_event import InteractionEvent
+
+        broker = InteractionBroker()
+
+        async def submit_anything():
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if broker.has_pending:
+                    action_id = list(broker._pending.keys())[0]
+                    await broker.submit(action_id, [["confirm"]])
+                    return
+
+        asyncio.create_task(submit_anything())
+        await broker.request(
+            [
+                InteractionEvent(
+                    title="Plan",
+                    content="...",
+                    choices={"confirm": "Confirm"},
+                    default_choice="confirm",
+                    allow_free_text=True,
+                )
+            ]
+        )
+
+        action = broker._output_queue.get_nowait()
+        events = action.input.get("events", []) if isinstance(action.input, dict) else []
+        assert events and events[0].get("allow_free_text") is True
+
+
+class TestPendingInputQueue:
+    """Behavioural contract for the mid-run user-insert queue."""
+
+    def test_push_and_drain_preserves_fifo_order(self):
+        q = PendingInputQueue()
+        q.push("first")
+        q.push("second")
+        q.push("third")
+
+        # __len__ reflects pending count.
+        assert len(q) == 3
+
+        drained = q.drain()
+        assert drained == ["first", "second", "third"]
+        assert len(q) == 0
+
+    def test_drain_empties_queue_in_one_call(self):
+        q = PendingInputQueue()
+        for i in range(20):
+            q.push(f"msg-{i}")
+
+        drained = q.drain()
+        assert len(drained) == 20
+        assert drained[0] == "msg-0"
+        assert drained[-1] == "msg-19"
+        assert len(q) == 0
+        # Subsequent drain on empty queue returns nothing.
+        assert q.drain() == []
+
+    def test_snapshot_does_not_consume(self):
+        q = PendingInputQueue()
+        q.push("alpha")
+        q.push("beta")
+
+        snap1 = q.snapshot()
+        snap2 = q.snapshot()
+
+        assert snap1 == ["alpha", "beta"]
+        assert snap2 == ["alpha", "beta"]
+        # Snapshot returns a copy, not the internal deque view.
+        snap1.clear()
+        assert q.snapshot() == ["alpha", "beta"]
+        # Items still available for actual drain afterwards.
+        assert q.drain() == ["alpha", "beta"]
+
+    def test_clear_drops_pending_items(self):
+        q = PendingInputQueue()
+        q.push("x")
+        q.push("y")
+        q.clear()
+        assert len(q) == 0
+        assert q.snapshot() == []
+        assert q.drain() == []
+
+    def test_drain_on_empty_returns_empty_list(self):
+        q = PendingInputQueue()
+        assert q.drain() == []
+
+    def test_concurrent_push_from_multiple_threads_preserves_count(self):
+        import threading
+
+        q = PendingInputQueue()
+        n_threads = 8
+        # Stay strictly below MAX_PENDING_ITEMS so the contention test
+        # asserts thread-safety, not overflow behaviour.
+        per_thread = PendingInputQueue.MAX_PENDING_ITEMS // n_threads
+        assert n_threads * per_thread <= PendingInputQueue.MAX_PENDING_ITEMS
+        producers = []
+        barrier = threading.Barrier(n_threads)
+
+        def producer(tid):
+            barrier.wait()
+            for i in range(per_thread):
+                q.push(f"t{tid}-i{i}")
+
+        for tid in range(n_threads):
+            t = threading.Thread(target=producer, args=(tid,))
+            producers.append(t)
+            t.start()
+        for t in producers:
+            t.join()
+
+        # No items lost under contention; FIFO order within a single
+        # producer's pushes is preserved by the underlying deque.
+        items = q.drain()
+        assert len(items) == n_threads * per_thread
+
+    def test_push_beyond_cap_drops_oldest_and_warns(self, caplog):
+        q = PendingInputQueue()
+        cap = PendingInputQueue.MAX_PENDING_ITEMS
+        for i in range(cap):
+            q.push(f"old-{i}")
+        assert len(q) == cap
+
+        with caplog.at_level("WARNING", logger="datus.cli.execution_state"):
+            q.push("new")
+
+        assert len(q) == cap
+        snapshot = q.snapshot()
+        # Oldest entry was dropped, newest is at the tail.
+        assert snapshot[0] == "old-1"
+        assert snapshot[-1] == "new"
+        assert any("PendingInputQueue overflow" in rec.message for rec in caplog.records)
+
+
+class TestEmitUserInsert:
+    """``InteractionBroker.emit_user_insert`` enqueues a USER ActionHistory
+    visible to both the TUI and the API SSE consumers."""
+
+    @pytest.mark.asyncio
+    async def test_emit_pushes_user_action_with_user_insert_type(self):
+        broker = InteractionBroker()
+        broker.reset_queue()  # bind the queue to the running loop
+
+        broker.emit_user_insert("追加：还要顺便统计行数")
+
+        # The action lands in the broker's output queue, where
+        # ``broker.fetch()`` (and thus the merged action stream) consumes it.
+        action = broker._output_queue.get_nowait()
+        assert action.role == ActionRole.USER
+        assert action.action_type == "user_insert"
+        assert action.status == ActionStatus.SUCCESS
+        assert action.messages == "追加：还要顺便统计行数"
+        # ``_build_user_content`` reads ``input["user_message"]`` — emit
+        # must produce that shape so the SSE converter renders correctly.
+        assert action.input["user_message"] == "追加：还要顺便统计行数"
+        assert action.input.get("source") == "mid_run_insert"
+        assert action.output["user_message"] == "追加：还要顺便统计行数"
+
+    @pytest.mark.asyncio
+    async def test_emit_after_close_is_noop(self):
+        """A broker that has already closed must drop the emission rather
+        than raise — the filter is best-effort and the run might be tearing
+        down."""
+        broker = InteractionBroker()
+        broker.reset_queue()
+        broker.close()
+
+        # Drain the close sentinel so we can observe that nothing else lands.
+        sentinel = broker._output_queue.get_nowait()
+        assert sentinel is broker._STOP_SENTINEL
+
+        broker.emit_user_insert("ignored")
+
+        # No further item after the sentinel.
+        assert broker._output_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_multiple_emits_preserve_order(self):
+        broker = InteractionBroker()
+        broker.reset_queue()
+
+        broker.emit_user_insert("first")
+        broker.emit_user_insert("second")
+        broker.emit_user_insert("third")
+
+        actions = [broker._output_queue.get_nowait() for _ in range(3)]
+        assert [a.messages for a in actions] == ["first", "second", "third"]
+        for a in actions:
+            assert a.role == ActionRole.USER
+            assert a.action_type == "user_insert"

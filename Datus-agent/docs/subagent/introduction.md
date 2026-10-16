@@ -1,0 +1,159 @@
+# Subagent Guide
+
+## Overview
+
+Subagents are specialized AI assistants in Datus. They share the same project configuration as the main chat agent, but run with their own prompt, tool surface, session, and optional scoped context.
+
+A subagent can be:
+
+- A built-in system subagent such as `gen_sql`, `explore`, or `gen_job`
+- A custom subagent defined in `agent.agentic_nodes` in `agent.yml`
+
+## What a Subagent Includes
+
+A subagent can have:
+
+- **Dedicated system prompt**: separate prompt template and prompt version
+- **Custom tools**: native tools, MCP tools, skills, and node-specific rules
+- **Scoped context**: optional limits for tables, metrics, and reference SQL
+- **Independent session**: separate conversation history from the main chat node
+- **Delegation policy**: optional `task()` access to other subagents via the `subagents` field
+
+## Built-in Subagents
+
+The currently exposed built-in set is:
+
+1. `explore`: read-only schema, knowledge, and file exploration
+2. `gen_sql`: specialized SQL generation
+3. `ask_metrics`: answer questions using existing semantic metrics
+4. `gen_report`: structured report generation
+5. `semantic_modeling`: unified Dosi semantic-model and metric authoring
+6. `gen_sql_summary`: SQL summary generation
+7. `gen_table`: interactive table creation
+8. `gen_job`: data pipeline jobs (single-database ETL AND cross-database migration)
+9. `gen_skill`: skill creation and optimization
+10. `gen_visual_report`: self-contained visual report under `reports/<slug>/`
+
+Airflow scheduling and external BI operations such as Superset authoring are
+not subagent types. The main agent performs them directly with installed
+plugins and their bundled skills. The legacy `SchedulerAgenticNode` and
+`GenDashboardAgenticNode` implementations remain in the codebase temporarily,
+but they are not discoverable or executable as built-in or custom subagents.
+
+See [Built-in subagents](./builtin_subagents.md) for details.
+
+## Custom Subagents
+
+Custom subagents are configured under `agent.agentic_nodes`.
+
+The unified agent TUI (`/agent` or `/subagent`) Custom-tab wizard currently creates `gen_sql`-style or `gen_report`-style custom subagents. If you want to alias more specialized available node classes such as `explore`, `gen_table`, or `gen_skill`, edit `agent.yml` manually. Custom aliases of the legacy scheduling and external-BI node classes are ignored.
+
+Example:
+
+```yaml
+agent:
+  agentic_nodes:
+    finance_report:
+      node_class: gen_report
+      model: claude
+      system_prompt: finance_report
+      prompt_version: "1.0"
+      prompt_language: en
+      agent_description: "Finance reporting assistant"
+      tools: semantic_tools.*, db_tools.*, context_search_tools.list_subject_tree
+      subagents: explore, gen_sql
+      max_turns: 30
+      scoped_context:
+        datasource: finance
+        tables: mart.finance_daily, mart.finance_budget
+        metrics: finance.revenue.daily_revenue
+        sqls: finance.revenue.region_rollup
+      rules:
+        - Prefer existing finance metrics before writing new SQL
+```
+
+Notes:
+
+- `node_class` defaults to `gen_sql` if omitted
+- When writing `scoped_context` manually, set `datasource` explicitly
+- `subagents` controls which task types this node may delegate to
+
+## How to Use Subagents
+
+### Method 1: CLI Automatic or Explicit Routing
+
+Start the CLI:
+
+```bash
+datus --datasource production
+```
+
+Normally, describe the request directly and let the main agent delegate it. To route one message explicitly, append `@Agent <name>`:
+
+```text
+Generate a revenue metric from this SQL: SELECT SUM(revenue) FROM orders. @Agent semantic_modeling
+Analyze quarter-over-quarter revenue changes. @Agent finance_report
+```
+
+For several consecutive turns with one subagent, run `/agent <name>` first and then enter normal messages. The legacy `/<name> <message>` form is no longer supported.
+
+### Method 2: Web Interface
+
+Start the web interface:
+
+```bash
+datus --web --datasource production
+```
+
+Open a specific subagent directly:
+
+```bash
+datus --web --datasource production --subagent finance_report
+```
+
+Direct URLs also work:
+
+```text
+http://localhost:8501/?subagent=semantic_modeling
+http://localhost:8501/?subagent=finance_report
+```
+
+### Method 3: Subagent as Tool (`task()`)
+
+The main chat agent can delegate complex work to specialized subagents through the `task()` tool.
+
+```mermaid
+graph LR
+    A[User Question] --> B[Chat Agent]
+    B --> C{Needs delegation?}
+    C -->|No| D[Direct response]
+    C -->|Yes| E["task(type=...)"]
+    E --> F[Specialized subagent]
+    F --> G[Result returned]
+    G --> D
+```
+
+Important behavior:
+
+- `chat` defaults to `subagents: "*"` and can delegate to all discoverable subagents
+- Most other agentic nodes default to `subagents: explore`
+- Setting `subagents` to an empty value disables the `task()` tool
+- Subagent nodes do not get their own nested `task()` tool; delegation depth is capped at two levels
+
+### Common Task Types
+
+| Type | Purpose |
+|------|---------|
+| `explore` | Gather schema, sample data, knowledge, or file context |
+| `gen_sql` | Generate SQL with deeper multi-step reasoning |
+| `gen_report` | Produce structured reports and analysis |
+| `semantic_modeling` | Author Dosi semantic models and metrics |
+| `gen_sql_summary` | Summarize SQL into reusable knowledge |
+| `gen_table` | Create tables interactively |
+| `gen_job` | Build data pipeline jobs (single-database ETL or cross-database migration) |
+| `gen_skill` | Create or optimize skills |
+| `gen_visual_report` | Produce a self-contained visual report under `reports/<slug>/` |
+| Custom names | Any discoverable custom subagent defined in `agent.yml` |
+
+For Airflow or external BI work, ask the main agent to use the installed
+plugin directly; do not call `task()` or create a custom subagent alias.

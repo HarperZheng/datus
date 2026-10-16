@@ -1,0 +1,224 @@
+import os
+
+import pytest
+
+from datus.configuration.agent_config import AgentConfig
+from datus.configuration.agent_config_loader import load_agent_config
+from datus.utils.constants import DBType
+from datus.utils.exceptions import DatusException
+from tests.conftest import TEST_CONF_DIR
+
+
+@pytest.fixture
+def agent_config(tmp_path) -> AgentConfig:
+    # ``home=tmp_path`` pins every derived path inside the pytest-managed tmp
+    # dir. The unit-tests autouse ``_isolate_project_cwd`` fixture already
+    # chdir-s into tmp_path, so the yml's relative paths never resolve under
+    # the repo root.
+    return load_agent_config(config=str(TEST_CONF_DIR / "agent.yml"), home=str(tmp_path), reload=True)
+
+
+def test_config_exception(tmp_path):
+    with pytest.raises(DatusException, match="Agent configuration file not found: not_found.yml"):
+        load_agent_config(config="not_found.yml", reload=True)
+
+    with pytest.raises(
+        DatusException,
+        match="Unexcepted value of Node Type, excepted value:",
+    ):
+        load_agent_config(config=str(TEST_CONF_DIR / "wrong_nodes_agent.yml"), home=str(tmp_path), reload=True)
+
+    agent_config = load_agent_config(config=str(TEST_CONF_DIR / "agent.yml"), home=str(tmp_path), reload=True)
+
+    with pytest.raises(DatusException, match="Unsupported value `abc` for field `benchmark`"):
+        agent_config.override_by_args(datasource="snowflake", benchmark="abc")
+
+    with pytest.raises(DatusException, match="Unsupported value `abc` for field `datasource`"):
+        agent_config.override_by_args(datasource="abc")
+
+
+def test_date_parsing_tool_config_loads(tmp_path):
+    config_path = tmp_path / "agent.yml"
+    config_path.write_text(
+        "agent:\n  date_parsing:\n    language: zh\n",
+        encoding="utf-8",
+    )
+
+    config = load_agent_config(config=str(config_path), home=str(tmp_path), reload=True)
+
+    assert config.date_parsing_language == "zh"
+
+
+def test_string_node_config_loads_current_node(tmp_path):
+    config_path = tmp_path / "agent.yml"
+    config_path.write_text("agent:\n  nodes: gen_sql\n", encoding="utf-8")
+
+    config = load_agent_config(config=str(config_path), home=str(tmp_path), reload=True)
+
+    assert set(config.nodes) == {"gen_sql"}
+
+
+def test_service_config_structure(agent_config: AgentConfig):
+    """Verify service config sections load into AgentConfig."""
+    assert set(agent_config.services.datasources) >= {"bird_school", "snowflake", "local_duckdb"}
+    assert "bird_school" in agent_config.services.datasources
+    assert "snowflake" in agent_config.services.datasources
+    assert "local_duckdb" in agent_config.services.datasources
+    assert "superset" in agent_config.services.bi_platforms
+    assert "airflow_local" in agent_config.services.schedulers
+
+
+@pytest.mark.parametrize("database", ["bird_school", "snowflake", "local_duckdb"])
+def test_configuration_load(database: str, agent_config: AgentConfig):
+    assert agent_config.target
+    assert agent_config.models
+    assert agent_config.active_model()
+    assert agent_config.rag_base_path
+
+    assert agent_config.nodes
+
+    agent_config.override_by_args(
+        **{
+            "schema_linking_rate": "slow",
+            "datasource": database,
+        }
+    )
+
+    assert agent_config.schema_linking_rate == "slow"
+    # rag_storage_path() lives under the project-sharded data_dir now:
+    # ``{home}/data/{project_name}/datus_db``. The name ``datus_db`` is fixed;
+    # project isolation happens via the parent directory.
+    storage_path = agent_config.rag_storage_path()
+    assert storage_path.endswith("datus_db")
+    assert f"/data/{agent_config.project_name}/datus_db" in storage_path.replace(os.sep, "/")
+
+    agent_config.current_datasource = ""
+    assert agent_config.current_datasource == ""
+    assert agent_config.db_type == ""
+
+    error_db = "abc"
+    with pytest.raises(DatusException, match=f"Unsupported value `{error_db}` for field `datasource`"):
+        agent_config.current_datasource = error_db
+
+    error_benchmark = "abc"
+    with pytest.raises(DatusException, match=f"Unsupported value `{error_benchmark}` for field `benchmark`"):
+        agent_config.benchmark_path(error_benchmark)
+
+
+def test_benchmark_db_check(agent_config: AgentConfig):
+    db_name = "snowflake"
+    agent_config.services.datasources[db_name].type = DBType.SQLITE
+
+    with pytest.raises(DatusException, match="spider2 only support snowflake"):
+        agent_config.override_by_args(
+            **{
+                "benchmark": "spider2",
+                "datasource": db_name,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    argnames=["database", "benchmark", "expected_suffix"],
+    argvalues=[
+        ("bird_school", "bird_dev", "benchmark/bird/dev_20240627"),
+        ("snowflake", "spider2", "benchmark/spider2/spider2-snow"),
+    ],
+)
+def test_benchmark_config(database: str, benchmark: str, expected_suffix: str, agent_config: AgentConfig):
+    agent_config.override_by_args(
+        **{
+            "datasource": database,
+            "benchmark": benchmark,
+        }
+    )
+    benchmark_path = agent_config.benchmark_path(benchmark)
+    assert benchmark_path.replace(os.sep, "/").endswith(expected_suffix)
+    assert "benchmark" in benchmark_path
+
+
+def test_storage_config(agent_config: AgentConfig):
+    assert agent_config.storage_configs == {}
+
+
+def test_storage_config_not_polluted_by_global_embedding_cache(tmp_path, monkeypatch):
+    from datus.storage.embedding_models import EMBEDDING_MODELS
+
+    class _CachedModel:
+        model_name = "cached-model"
+
+    monkeypatch.setitem(EMBEDDING_MODELS, "document", _CachedModel())
+
+    agent_config = load_agent_config(config=str(TEST_CONF_DIR / "agent.yml"), home=str(tmp_path), reload=True)
+
+    assert agent_config.storage_configs == {}
+    assert "document" not in agent_config.storage_configs
+
+
+def test_init_embedding_models_returns_current_storage_models():
+    from datus.configuration.agent_config import ModelConfig
+    from datus.storage.embedding_models import EMBEDDING_MODELS, init_embedding_models
+
+    original_models = dict(EMBEDDING_MODELS)
+    EMBEDDING_MODELS.clear()
+    try:
+        default_model = ModelConfig(type="openai", api_key="mock-api-key", model="mock-model")
+        storage_models = init_embedding_models(
+            {
+                "database": {"model_name": "shared-embedding", "dim_size": 384},
+                "document": {"model_name": "shared-embedding", "dim_size": 384},
+                "base_path": "data",
+                "embedding_device_type": "cpu",
+            },
+            openai_configs={},
+            default_openai_config=default_model,
+        )
+
+        assert set(storage_models) == {"database", "document"}
+        assert storage_models["database"] is storage_models["document"]
+        assert EMBEDDING_MODELS["database"] is storage_models["database"]
+        assert EMBEDDING_MODELS["document"] is storage_models["document"]
+    finally:
+        EMBEDDING_MODELS.clear()
+        EMBEDDING_MODELS.update(original_models)
+
+
+def test_get_db_name_type(agent_config: AgentConfig):
+    agent_config.current_datasource = "bird_school"
+    db_name, db_type = agent_config.current_db_name_type(db_name="bird_school")
+    assert db_name == "bird_school"
+    assert db_type == DBType.SQLITE
+
+    agent_config.current_datasource = "local_duckdb"
+    db_name, db_type = agent_config.current_db_name_type(db_name="local_duckdb")
+    assert db_name == "local_duckdb"
+    assert db_type == DBType.DUCKDB
+
+    # Regression: db_name="starrocks" collides with a different datasource key
+    # but must derive the type from current_datasource, not from starrocks
+    agent_config.current_datasource = "bird_school"
+    db_name, db_type = agent_config.current_db_name_type(db_name="starrocks")
+    assert db_name == "starrocks"
+    assert db_type == DBType.SQLITE
+
+
+def test_get_db_name_type_with_custom_db_name(agent_config: AgentConfig):
+    """When db_name is not a datasource key, it should be preserved as the database name."""
+    agent_config.current_datasource = "bird_sqlite"
+    db_name, db_type = agent_config.current_db_name_type(db_name="my_custom_db")
+    assert db_name == "my_custom_db"
+    assert db_type == DBType.SQLITE
+
+
+def test_get_db_name_type_single_datasource_fallback(agent_config: AgentConfig):
+    """When db_name is provided but current_datasource is not set, falls back to single datasource."""
+    agent_config._current_datasource = ""
+    original = dict(agent_config.services.datasources)
+    single_key = next(iter(original))
+    agent_config.services.datasources = {single_key: original[single_key]}
+    try:
+        db_name, db_type = agent_config.current_db_name_type(db_name="custom_db")
+        assert db_name == "custom_db"
+        assert db_type == original[single_key].type
+    finally:
+        agent_config.services.datasources = original

@@ -1,0 +1,14 @@
+# BI Dashboard Test Input Configuration
+# NOTE: Use chart 'name' (slice_name in Superset) instead of 'id' for stable identification.
+# Chart IDs may change across environments or redeployments.
+# To find chart names: check Superset UI or use API: GET /api/v1/dashboard/{id}/charts
+
+- input:
+    platform: superset
+    dashboard_url: http://127.0.0.1:8088/superset/dashboard/datus-nightly-placeholder/
+    api_base_url: http://127.0.0.1:8088
+    dialect: postgresql
+    seed_dashboard: true
+    valid_charts:
+      - name: "Datus Revenue by Region"
+      - name: "Datus Orders by Channel"

@@ -1,0 +1,557 @@
+agent:
+  home: ~/.datus
+  logging:
+    level: INFO  # CLI > DATUS_LOG_LEVEL > this value > INFO
+  # Storage layout (refactored):
+  #   * ~/.datus/sessions/{project_name}/        — sessions sharded per project
+  #   * ~/.datus/data/                           — storage-backend root; each
+  #       backend owns its project isolation (e.g. the built-in sqlite/lance
+  #       backends use a ``{project_name}/`` subdirectory, a future Postgres
+  #       backend could use a schema name instead)
+  #   * ~/.datus/{conf,logs,template,run,...}    — global, shared across projects
+  #   * {cwd}/subject/{semantic_models,sql_summaries}/ — project KB
+  #   * {cwd}/.datus/skills/                     — project-level skills (optional)
+  #
+  # ``project_name`` is derived from the current working directory (``/`` → ``-``)
+  # so every CWD gets its own sessions/data shard without extra configuration.
+  # Set ``agent.project_name`` to override — useful when running datus from
+  # symlinks, monorepo subdirs, or CI sandboxes that should share the same
+  # sessions/data shards.  Must match ``^[a-zA-Z0-9_-]+$`` and be ≤ 200 chars.
+  # project_name: my_project
+  #
+  # LLM configuration layout (v2)
+  #
+  # - ``agent.providers.<name>`` (preferred)
+  #   Provider-level credentials. Configure the API key (or rely on the env
+  #   var declared in ``conf/providers.yml``) once per provider; the ``/model``
+  #   slash command in the CLI can then switch between any model exposed by
+  #   that provider without rewriting YAML. Supported providers (keys) are
+  #   shipped in ``conf/providers.yml``: openai, claude, claude_subscription,
+  #   codex, deepseek, kimi, qwen, gemini, glm, minimax, openrouter,
+  #   alibaba_coding, bigmodel_coding, zai_coding, minimax_coding, kimi_coding.
+  #
+  # - ``agent.models.<name>`` (legacy / custom)
+  #   Retained for self-hosted or private-deployment models — hand-edit this
+  #   section when you need a bespoke base_url / model SKU. The ``/model``
+  #   command surfaces entries here under the ``Custom`` group.
+  #
+  # The active selection lives in ``{project_root}/.datus/config.yml`` as:
+  #   target:
+  #     provider: openai        # key of agent.providers
+  #     model:    gpt-4.1       # concrete SKU
+  # or, for a custom entry:
+  #   target:
+  #     custom: my-internal-model
+  # The ``agent.target`` field below is still honored for backwards compat
+  # when no project-level override exists.
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+    claude:
+      api_key: ${ANTHROPIC_API_KEY}
+    deepseek:
+      api_key: ${DEEPSEEK_API_KEY}
+    gemini:
+      api_key: ${GEMINI_API_KEY}
+    # Claude Pro/Max (subscription token via `claude setup-token`, auto-detected).
+    claude_subscription:
+      auth_type: subscription
+    # ChatGPT Plus/Pro (browser OAuth through `datus init`).
+    codex:
+      auth_type: oauth
+
+  # target: deepseek      # legacy — only read when .datus/config.yml is absent
+
+  # ``models`` is optional; use it for self-hosted or private-deployment
+  # endpoints that aren't covered by ``conf/providers.yml``. Each entry has
+  # the same shape as before:
+  #   <name>:
+  #     type: openai            # one of: openai|claude|deepseek|kimi|gemini|...
+  #     base_url: https://internal.example.com/v1
+  #     api_key: ${MY_KEY}
+  #     model: internal-gpt-4
+  # models: {}
+
+  # ``nodes.<name>.model`` refers to an entry in ``agent.models`` (custom models
+  # only). Leave it empty or omit to inherit whichever provider/model is
+  # active according to ``./.datus/config.yml`` + ``agent.providers``.
+
+  # ---------------------------------------------------------------------------
+  # Permission profile — pick a base security posture, layer user-defined
+  # rules on top via ``rules``. Override at runtime with ``/permission``.
+  # ``/profile`` remains as a deprecated CLI alias for compatibility.
+  #
+  # Profiles:
+  #   normal    — Read-only allowed; all writes prompt; named destructive deny
+  #   auto      — Normal + workspace writes auto + SQL non-destructive writes
+  #               auto; remaining bash/SQL prompts receive a single-shot AI
+  #               review. Confident low/medium-risk actions auto-run; high or
+  #               critical risk still requires confirmation (and is denied in
+  #               non-interactive runs).
+  #   dangerous — Nearly everything auto (writes outside workspace still prompt)
+  #
+  # User rules in ``rules:`` are evaluated after the profile base, so they
+  # override the profile via last-match-wins. See
+  # docs/superpowers/specs/2026-04-22-permission-profile-design.md
+  # for the full rule listing.
+  # ---------------------------------------------------------------------------
+  # permissions:
+  #   profile: normal
+  #   # AI review is enabled by default only for the ``auto`` profile. Static
+  #   # deny rules always win. Omit ``model`` (or use ``default``) to follow
+  #   # the active model; use ``provider/model`` or ``custom/alias`` to give
+  #   # the reviewer a separate model. An explicit model failure fails closed
+  #   # and never falls back to another model.
+  #   # The context and token bounds below cap reviewer cost: history evidence
+  #   # is trimmed to fit ``max_history_bytes`` (the planned action itself is
+  #   # never trimmed), and too small a ``max_completion_tokens`` truncates the
+  #   # structured verdict, which fails closed into a manual prompt.
+  #   # Every reviewed call reports its verdict on the tool call in the CLI
+  #   # ("AI review ✓ passed · low risk · conf 0.92 · <rationale>"), including
+  #   # ones the reviewer auto-allowed; ctrl+o shows the full rationale.
+  #   # auto_review:
+  #   #   enabled: true
+  #   #   model: openai/gpt-5-mini
+  #   #   timeout_seconds: 20
+  #   #   confidence_threshold: 0.8
+  #   #   max_completion_tokens: 1024
+  #   #   max_history_bytes: 24576
+  #   #   max_user_messages: 8
+  #   #   max_prior_actions: 20
+  #   # rules:
+  #   #   - tool: db_tools
+  #   #     pattern: execute_ddl
+  #   #     permission: deny
+  #   #
+  #   # Command-level bash rules (optional; profile whitelist applies when
+  #   # omitted). Pattern syntax — no colon = exact command; "prefix:*" =
+  #   # prefix match; "prefix:glob" = prefix + first-argument glob. Decision
+  #   # order: deny (also matches wrapped commands like ``xargs rm``) →
+  #   # safety ceiling (bash -c / sudo / $() / redirection / background & /
+  #   # loops & subshells never auto-allow statically) → ask → allow →
+  #   # default (ask). Two redirections are exempt from that ceiling because
+  #   # they name no path and so cannot do anything the argv could not:
+  #   # file-descriptor duplication (``2>&1``, ``>&2``, ``<&0``) and a
+  #   # ``/dev/null`` target (``2>/dev/null``, ``&>/dev/null``). Any other
+  #   # redirection still requires confirmation. A command chained with
+  #   # ``|``, ``&&``, ``||`` or ``;`` is
+  #   # judged per sub-command: it auto-runs only if every sub-command is
+  #   # allowed, and any denied sub-command blocks the whole chain. A
+  #   # safety-ceiling ASK is still eligible for ``auto_review`` above, which
+  #   # reads the full command text; only unparseable commands always require a
+  #   # person, and safety-ceiling asks are never offered as project grants.
+  #   # The confirmation prompt lists every sub-command that needs approval and
+  #   # offers once / session / project scopes; "project" appends one prefix PER
+  #   # sub-command to ``.datus/config.yml``'s ``bash_allow`` list, so
+  #   # re-running the same chain later does not prompt again.
+  #   # bash_commands:
+  #   #   allow:
+  #   #     - "git status"            # exact: not "git status --short"
+  #   #     - "git log:*"             # prefix: any arguments
+  #   #     - "python:scripts/*.py"   # first arg must match the glob
+  #   #   deny:
+  #   #     - "rm:*"                  # also catches "xargs rm", "find -exec rm"
+  #   #     - "git push:*"            # deny always beats allow
+  #   #   ask:
+  #   #     - "docker:*"              # confirm every call (session approval per bucket)
+  #   #   classifier:                 # deprecated bash-only compatibility override
+  #   #     enabled: false
+  #   #
+  #   # Installed plugins may declare bash rules for their own ``datus <plugin>``
+  #   # namespace (normal/auto only), layered between the profile base and the
+  #   # rules above — a user ``deny`` always beats a plugin ``allow``. A
+  #   # plugin ``ask`` rule can be relaxed per project via the prompt's
+  #   # "allow (project)" choice (or a matching ``bash_allow`` entry in
+  #   # ``.datus/config.yml``): an exact-match grant auto-runs that pattern.
+  #   #
+  #   # Per-class SQL statement rules for ``execute_sql`` (optional; profile
+  #   # defaults apply when omitted). The statement is classified into a kind
+  #   # and gated by its class:
+  #   #   read        — SELECT / SHOW / DESCRIBE / EXPLAIN
+  #   #   write       — INSERT, CREATE, benign DDL (COMMENT/GRANT/ANALYZE/...),
+  #   #                 USE/SET/CALL. NOTE: CALL/EXEC can run arbitrary stored
+  #   #                 procedures — set ``write: ask`` if that matters to you.
+  #   #   destructive — UPDATE, DELETE, MERGE, DROP, TRUNCATE, ALTER, REPLACE
+  #   #   unknown     — unparseable SQL (fail-safe)
+  #   # Profile defaults: normal = read allow, rest ask; auto = read+write
+  #   # allow, destructive/unknown ask; dangerous = everything allow.
+  #   # The confirmation prompt offers once / session / project scopes;
+  #   # "project" appends the statement kind (e.g. ``drop``) to
+  #   # ``.datus/config.yml``'s ``sql_allow`` list, which auto-allows that
+  #   # exact kind in this project from then on.
+  #   # sql_statements:
+  #   #   read: allow
+  #   #   write: ask
+  #   #   destructive: ask
+  #   #   unknown: ask
+
+  # ---------------------------------------------------------------------------
+  # General-purpose bash tool.
+  #   enabled          — master switch; false removes the ``bash`` tool entirely
+  #   allowed_patterns — execution-layer hard whitelist (default ["*"])
+  #   sandbox          — OS-level sandbox wrapped around every command
+  #                      (macOS sandbox-exec / Linux bubblewrap). When enabled,
+  #                      file writes are restricted to the workspace, the
+  #                      session data dir and tmp; file reads to system dirs +
+  #                      the same allowlist. Fail-closed: if no mechanism is
+  #                      available (Windows, Linux without bwrap) commands are
+  #                      rejected. Toggle at runtime with /sandbox on|off.
+  #   sandbox.mode     — "normal" (default) keeps ~/.datus readable and the
+  #                      session data dir writable. "strict" is the
+  #                      multi-tenant tier: workspace + tmp + explicit
+  #                      allowlists ONLY (~/.datus fully blocked) and the
+  #                      child env is reduced to a small allowlist so
+  #                      process-wide secrets never reach commands.
+  #   sandbox.deny_network — cut network access inside the sandbox
+  #                      (bwrap --unshare-net / Seatbelt deny network*).
+  # ---------------------------------------------------------------------------
+  # bash:
+  #   enabled: true
+  #   sandbox:
+  #     enabled: false
+  #     mode: normal          # normal | strict
+  #     allow_read: []        # extra readable dirs (e.g. ~/.gitconfig)
+  #     allow_write: []       # extra writable dirs
+  #     deny_network: false   # true blocks all network inside the sandbox
+
+  # ---------------------------------------------------------------------------
+  # Filesystem tools (read_file / write_file / edit_file / delete_file / glob /
+  # grep) and the scheduler tools' SQL-file lookup.
+  #   strict      — fail-closed on paths outside the project root instead of
+  #                 asking the user (API / gateway surfaces set this; the CLI
+  #                 leaves it false and prompts instead).
+  #   allow_read  — extra absolute dirs readable outside the project root
+  #   allow_write — extra absolute dirs readable AND writable outside it
+  # allow_read/allow_write are the escape hatch for directories a deployment
+  # mounts next to the workspace — e.g. an Airflow DAGs folder the agent must
+  # write DAG files into — without giving up ``strict``. Relative entries are
+  # ignored (they would resolve against the process CWD).
+  # ---------------------------------------------------------------------------
+  # filesystem:
+  #   strict: false
+  #   allow_read: []
+  #   allow_write:
+  #     - /data/airflow/dags
+
+  nodes:
+    schema_linking:
+      matching_rate: fast
+    output:
+      prompt_version: "1.0" # It can be unconfigured, and the latest version is used by default
+      check_result: true # Whether to check the results of the previous step, the default value is false
+    chat:
+      workspace_root: sql2
+      max_turns: 25
+      prompt_version: "1.0" # It can be unconfigured, and the latest version is used by default
+
+  # Configuration for date_parsing_tools.parse_temporal_expressions.
+  date_parsing:
+    language: en # en/zh
+
+  export:
+    max_lines: 1000  # Maximum number of exported data rows, default is 1000
+  # Benchmark data is stored at {agent.home}/benchmark/{name}
+  # Supported benchmarks: bird_dev, spider2, semantic_layer and other benchmarks you customize
+  # Directory structure:
+  #   {agent.home}/benchmark/bird/
+  #   {agent.home}/benchmark/spider2/
+  #   {agent.home}/benchmark/semantic_layer/
+  #   {agent.name}/benchmark/{customized_benchmark}
+
+  # Configuration of custom benchmarks
+  # benchmark:
+  #   my_benchmark:
+  #       question_file: dev.json # Relative path to the benchmark question file, can be csv/json/json
+  #       question_id_key: question_id # The question id, use the line number when empty; The default value is question_id
+  #       db_key: db_id # The key corresponding to database name; By default, the database of datasources will be taken.
+  #       use_tables_key: tables # Optional: specify which tables to use
+
+  #       # Below is the configuration of the baseline answer to evaluate，if evaluation is not required, you do not need to configure it.
+  #       gold_sql_path: "gold/sql" # The standard SQL relative path，Can be a directory ({gold_sql_path}/{task_id}.sql) or json/csv file
+  #       gold_sql_key: "" # The key corresponding to the gold SQL.When `gold_sql_path` is a file, this configuration cannot be empty
+  #       gold_result_path: "gold/exec_result" # Optional, the standard answer relative path，Can be a directory ({gold_sql_path}/{task_id}.sql) or json/csv file. If not set, gold sql will be executed to obtain the standard answer
+  #       gold_result_key: "" # Optional, the key corresponding to the standard answer. When `gold_result_path` is a file, this configuration cannot be empty
+
+
+  # local datasources configuration
+  services:
+    datasources:
+      snowflake:
+        type: snowflake
+        account: ${SNOWFLAKE_ACCOUNT}  # Use environment variables or real values
+        username: ${SNOWFLAKE_USER}
+        password: ${SNOWFLAKE_PASSWORD}
+        # For Snowflake key pair auth, omit password and use:
+        # private_key_file: ${SNOWFLAKE_PRIVATE_KEY_FILE}
+        # private_key_file_pwd: ${SNOWFLAKE_PRIVATE_KEY_FILE_PWD}  # optional
+        # role: ${SNOWFLAKE_ROLE}  # optional
+        # database: BBC
+        # schema: BBC_NEWS
+      # bird_sqlite: # This section is configured for the bird-dev benchmarking, you should download the database file and unzip it before you can continue
+      #   type: sqlite
+      #   # just support glob pattern. Ensure that the corresponding database files exist in the configuration directory.
+      #   path_pattern: benchmark/bird/dev_20240627/dev_databases/**/*.sqlite # https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
+      local_sqlite_ssb:
+        type: sqlite
+        uri: sqlite:////Users/xxx/benchmark/SSB.db
+      local_sqlite2:
+        type: sqlite
+        uri: sqlite:////Users/xxx/benchmark/SSB.db
+      local_duckdb_ssb:
+        type: duckdb
+        uri: duckdb:////absolute/path/to/db.db # absolute path
+      local_duckdb_abc:
+        type: duckdb
+        uri: duckdb:///relative/path/to/abc.duckdb # relative path
+      starrocks:
+        type: starrocks
+        host: ${STARROCKS_HOST}
+        port: ${STARROCKS_PORT}
+        username: ${STARROCKS_USER}
+        password: ${STARROCKS_PASSWORD}
+        database: ${STARROCKS_DATABASE}
+    # Dosi is the built-in semantic runtime.
+    # Default selection across BI and Scheduler follows one rule:
+    # explicit call-site arg → ``./.datus/config.yml`` project pin → YAML
+    # ``default: true`` flag → single-entry shortcut → raise on ambiguity.
+    # Mark at most one entry per section with ``default: true``.
+    bi_platforms:
+      superset:
+        type: superset
+        api_base_url: http://localhost:8088
+        username: admin
+        password: admin
+        # default: true             # uncomment to make this the global default BI
+        extra: # Special configurations for different platforms
+          provider: db
+    schedulers:
+      airflow_local:
+        name: airflow_local
+        type: airflow
+        api_base_url: http://localhost:8080/api/v1
+        username: ${AIRFLOW_USERNAME}
+        password: ${AIRFLOW_PASSWORD}
+        # default: true             # uncomment to make this the global default scheduler
+        dags_folder: /path/to/airflow/dags
+        dag_discovery_timeout: 60
+        dag_discovery_poll_interval: 5
+        # Available Airflow Connection IDs for scheduled jobs.
+        # Create these connections in Airflow (Admin > Connections) first,
+        # then list them here so the agent knows which conn_id to use.
+        connections:
+          starrocks_default: "StarRocks production database"
+          # pg_analytics: "PostgreSQL analytics warehouse"
+
+  storage:
+    # Data path is now fixed at {agent.home}/data
+    # Final storage paths: {home}/data/datus_db_{datasource}, {home}/data/sub_agents/{agent_name}, etc.
+
+    # Storage backend configuration
+    # The base storage layer is backend-agnostic; concrete implementations are pluggable.
+    # rdb:
+    #   type: sqlite              # Relational DB backend: sqlite (default)
+    # vector:
+    #   type: lance               # Vector DB backend: lance (default)
+
+    embedding_device_type: cpu # If set to cpu, it will be specified as cpu, otherwise, it will be automatically selected based on the current machine
+    # Local model suggestions:
+    # 1. if you want extreme performance, choose the small multilingual model with 384 dimensions: all-MiniLM-L6-v2 (~100M) or intfloat/multilingual-e5-small (~460M).
+    # 2. if you want performance and retrieval quality, choose the 1024-dimension multilingual model: intfloat/multilingual-e5-large-instruct (~1.2G)
+    # 3. if you pay more attention to retrieval quality, you can choose 1024-dimension model according to language (English/Chinese): BAAI/bge-large-en-v1.5 or BAAI/bge-large-zh-v1.5 (~1.2G)
+    # Of course, you can also choose your own model according to your business.
+    # If you don't configure the following models, all-MiniLM-L6-v2 will be selected by default.
+    # Cloud model suggestions: Now we just support openai.
+    database:
+      registry_name: openai # default is sentence-transformers
+      model_name: text-embedding-v3-small
+      dim_size: 1024
+      batch_size: 10 # Aliyun only supports no more than 10
+      target_model: openai # target model in agent.models, if not set, the agent's target configuration will be used
+    document:
+      model_name: all-MiniLM-L6-v2 #~100MB The lightest model
+      dim_size: 384
+    metric:
+      model_name: all-MiniLM-L6-v2
+      dim_size: 384
+    semantic_model:
+      model_name: all-MiniLM-L6-v2
+      dim_size: 384
+    reference_sql:
+      model_name: all-MiniLM-L6-v2
+      dim_size: 384
+
+  workflow:
+    plan: planA
+
+    planA:
+      - schema_linking
+      - gen_sql
+      - output
+
+    # Workflow configuration with parallel execution and selection
+    bird_para:
+      - schema_linking
+      - parallel:
+        - gen_sql
+        - gen_sql
+      - selection
+      - execute_sql
+      - output
+
+    # Sub-workflow example
+    multi_approach:
+      - schema_linking
+      - parallel:
+        - subworkflow1
+        - subworkflow2
+        - subworkflow3
+      - selection
+      - execute_sql
+      - output
+
+    subworkflow1:
+      - gen_sql
+
+    subworkflow2:
+      - gen_sql
+
+    subworkflow3:
+      - gen_sql
+
+    # Sub-workflow with config example
+    multi_agent:
+      - schema_linking
+      - parallel:
+        - subworkflow_cfg1
+        - subworkflow_cfg2
+        - subworkflow_cfg3
+      - selection
+      - execute_sql
+      - output
+
+    subworkflow_cfg1:
+      steps:
+      - gen_sql
+      config: multi/agent1.yaml
+
+    subworkflow_cfg2:
+      steps:
+      - gen_sql
+      config: multi/agent2.yaml
+
+    subworkflow_cfg3:
+      steps:
+      - gen_sql
+      config: multi/agent3.yaml
+
+  skills:
+    directories:
+      - ~/.datus/skills
+      - ./skills
+
+  api:
+    # Bounds on the HTTP API's datasource access. All three exist because a
+    # single metadata or SQL round-trip can run for seconds on a real warehouse,
+    # and these requests run on a shared thread pool.
+    #
+    # How long POST /sql/execute waits for its datasource's connector before
+    # giving up with DATASOURCE_BUSY. The connector is shared per datasource and
+    # carries mutable database context, so statements on one datasource run one
+    # at a time; without a bound, a queue would pin worker threads that every
+    # other request needs too. Nothing is executed on timeout, so even a write
+    # is safe to retry.
+    sql_queue_budget_seconds: 30
+    # Largest batch POST /table/columns will accept (autocomplete prefetch).
+    max_prefetch_tables: 500
+    # How long one prefetch batch may spend resolving uncached tables before it
+    # returns what it has. Tables it did not reach are simply omitted, and the
+    # client re-asks per table.
+    prefetch_budget_seconds: 3
+
+  autocomplete:
+    # After switching / adding / editing a datasource, refresh the LanceDB
+    # schema index in the background so @Table completion reflects new
+    # tables without a manual rebuild. Set to ``false`` to disable.
+    background_sync_enabled: true
+    # Also run the background sync once at REPL startup for the default
+    # datasource.
+    background_sync_on_startup: true
+    # Include sample rows in the sync. Enabling this makes the sync
+    # noticeably slower (seconds → tens of seconds on large schemas) in
+    # exchange for richer completion hints.
+    background_sync_include_values: false
+
+  agentic_nodes:
+    # Built-in subagents ship with a ``DEFAULT_SKILLS`` class attribute so every
+    # node loads its canonical skills out of the box. Override ``skills:`` here
+    # only when you want to narrow or broaden the pattern; omit the key to keep
+    # the defaults. Set ``skills: ""`` to explicitly disable skill loading.
+    semantic_modeling:
+      model: anthropic
+      max_turns: 50
+
+    gen_sql_summary:
+      model: deepseek_v3
+      max_turns: 30
+
+    gen_sql:
+      model: deepseek_v3
+      system_prompt: gen_sql
+      tools: db_tools.*, context_search_tools.*, date_parsing_tools.*
+      max_turns: 30
+
+    gen_table:
+      model: anthropic
+      max_turns: 20
+      # Default: "gen-table, table-validation"
+
+    gen_job:
+      model: anthropic
+      max_turns: 40
+      # Default: "gen-table, table-validation, data-migration"
+
+    gen_dashboard:
+      model: anthropic
+      # Default: "bi-validation, grafana-dashboard, superset-dashboard"
+
+    gen_skill:
+      model: anthropic
+      # Default: "create-skill, optimize-skill"
+  # Platform documentation (datasource-independent, stored at {home}/data/document/{platform}/)
+  # Each key under 'document' is either a reserved global setting (e.g. tavily_api_key)
+  #
+  # Common options:
+  #   type: github / website / local
+  #   source: GitHub repo "owner/repo", website URL, or local path
+  #   version: Document version (auto-detected if omitted)
+  #   chunk_size: Target chunk size in characters (default: 1024)
+  #   include_patterns: File/URL patterns to include (glob for local, regex for website)
+  #   exclude_patterns: File/URL patterns to exclude (glob for local, regex for website)
+  #
+  # GitHub-specific options:
+  #   github_token: GitHub API token (falls back to GITHUB_TOKEN env var)
+  #   github_ref: Git branch or tag to fetch from (default: default branch)
+  #   paths: Paths within the repo to fetch (default: ["docs", "README.md"])
+  #
+  # Website-specific options:
+  #   max_depth: Maximum crawl depth (default: 2)
+  #   NOTE: 'paths' is NOT supported for website type. Use include_patterns instead.
+  document:
+    tavily_api_key: ${TAVILY_API_KEY}
+    starrocks:
+      type: github
+      source: StarRocks/starrocks
+      paths: ["docs/sql-reference"] # just for github
+      chunk_size: 1024
+      github_token: ${GITHUB_TOKEN}
+    snowflake:
+      type: website
+      source: https://docs.snowflake.com/en/
+      max_depth: 3
+      include_patterns: ["/en/user-guide", "/en/sql-reference"]
+    local_docs:
+      type: local
+      source: /path/to/docs
+      include_patterns: ["*.md"]
+      exclude_patterns: ["CHANGELOG.md"]

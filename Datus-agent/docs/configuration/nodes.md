@@ -1,0 +1,201 @@
+---
+title: 'Nodes'
+description: 'Configure workflow nodes for schema linking, SQL generation, and other processing tasks'
+---
+
+## Overview
+
+Nodes are the building blocks of Datus Agent workflows. Each node performs a specific task in the data processing pipeline, from schema linking and SQL generation to output formatting. This guide covers how to configure each node type for optimal performance.
+
+## Configuration Structure
+
+Fixed workflow nodes are configured in `nodes`; agentic workflow nodes such as `gen_sql` are configured in `agentic_nodes`:
+
+```yaml
+nodes:
+  node_name:
+    model: provider_name
+    prompt_version: "1.0"
+    # Additional node-specific parameters
+agentic_nodes:
+  gen_sql:
+    model: provider_name
+    system_prompt: gen_sql
+    max_turns: 30
+```
+
+!!! tip
+    The `model` parameter in node configurations references provider keys defined in [`models`](agent.md#models-configuration).
+
+## Core Nodes
+
+### Schema Linking
+
+The schema linking node uses vector search to match table metadata, sample data, and extended knowledge definitions related to user questions.
+
+```yaml
+schema_linking:
+  model: openai                    # LLM model for schema selection
+  matching_rate: fast              # fast/medium/slow/from_llm
+  prompt_version: "1.0"            # Prompt version to use
+```
+
+**Configuration Parameters:**
+
+- **model**: LLM model key from top-level `models` configuration
+- **matching_rate**: Controls how many matching results to return
+    - `fast`: Top 5 matching data (fastest, least comprehensive)
+    - `medium`: Top 10 matching data (balanced)
+    - `slow`: Top 20 matching data (most comprehensive)
+    - `from_llm`: Use LLM to select the most relevant tables from all available metadata
+- **prompt_version**: Version of the prompt template to use
+
+### GenSQL
+
+Uses the agentic SQL generator to produce and validate SQL with database, semantic, and context-search tools.
+
+```yaml
+agentic_nodes:
+  gen_sql:
+    model: deepseek_v3                    # LLM for SQL generation
+    system_prompt: gen_sql                # Uses the canonical gen_sql_system prompt
+    prompt_version: "1.2"                 # Prompt template version
+    tools: db_tools.*, context_search_tools.*
+    max_turns: 30
+```
+
+**Configuration Parameters:**
+
+- **model**: LLM model for SQL generation
+- **system_prompt**: Prompt family for SQL generation; use `gen_sql`, which maps to the canonical `gen_sql_system` template
+- **prompt_version**: Prompt template version (latest used by default)
+- **tools**: Tool patterns available to the SQL generator
+- **max_turns**: Maximum number of tool-assisted reasoning turns
+
+## Processing Nodes
+
+### Output
+
+Formats and outputs SQL results to files and provides final responses.
+
+```yaml
+output:
+  model: anthropic                 # LLM for output formatting
+  prompt_version: "1.0"            # Prompt template version
+  check_result: true               # Enable result validation
+```
+
+**Configuration Parameters:**
+
+- **model**: LLM model for result formatting and validation
+- **prompt_version**: Output formatting prompt version
+- **check_result**: When true, LLM validates generated SQL and results for completeness and accuracy
+
+## Interactive Nodes
+
+### Chat
+
+Enables multi-turn conversations with access to databases, files, metrics, and knowledge bases.
+
+```yaml
+agentic_nodes:
+  chat:
+    workspace_root: sql2             # Root directory for file operations
+    model: anthropic                 # LLM for conversation
+    max_turns: 25                    # Maximum conversation turns
+```
+
+**Configuration Parameters:**
+
+- **workspace_root**: Root directory where file tools can operate
+- **model**: LLM model for multi-turn dialogue
+- **max_turns**: Maximum number of tool-assisted reasoning turns
+
+## Utility Nodes
+
+### Compare
+
+Compares generated SQL with reference SQL for benchmarking purposes.
+
+```yaml
+compare:
+  # Used primarily in benchmark scenarios
+  prompt_version: "1.0"
+```
+
+### Fix
+
+Analyzes and fixes SQL queries using dialect-specific rules.
+
+```yaml
+fix:
+  model: openai                    # LLM for SQL fixing
+  prompt_version: "1.0"            # Prompt version
+```
+
+## Complete Node Configuration Example
+
+```yaml
+nodes:
+  # Schema discovery and linking
+  schema_linking:
+    model: openai
+    matching_rate: fast
+    prompt_version: "1.0"
+
+  # Output formatting and validation
+  output:
+    model: anthropic
+    prompt_version: "1.0"
+    check_result: true
+
+  # SQL fixing
+  fix:
+    model: openai
+    prompt_version: "1.0"
+
+agentic_nodes:
+  # SQL generation
+  gen_sql:
+    model: deepseek_v3
+    system_prompt: gen_sql
+    prompt_version: "1.2"
+    tools: db_tools.*, context_search_tools.*, date_parsing_tools.*, platform_doc_tools.*
+    max_turns: 30
+
+  # Interactive chat
+  chat:
+    workspace_root: workspace
+    model: anthropic
+    max_turns: 25
+
+# Date parsing tool configuration (independent of workflow nodes)
+date_parsing:
+  language: en                     # en/zh
+```
+
+Metric search, date parsing, and platform documentation search are function tools rather than workflow nodes. Enable them on agentic nodes with `context_search_tools.*`, `date_parsing_tools.*`, and `platform_doc_tools.*` respectively.
+
+## Model Assignment Strategy
+
+The model names below refer to the `model` field inside each `models.<key>` provider entry (not the `nodes.*.model` key, which should use the provider key name like `openai` or `anthropic`).
+
+**For Schema Linking:**
+
+- Use fast, cost-effective models: `gpt-3.5-turbo`, `deepseek-v4-flash`
+- For complex schemas: `gpt-4`, `claude-4-sonnet`
+
+**For SQL Generation:**
+
+- Recommended: `deepseek-v4-flash`, `gpt-4-turbo`, `claude-4-sonnet`
+- Avoid: Basic models that struggle with complex SQL
+
+**For Agentic Workflows:**
+
+- Best: `claude-4-sonnet`, `gpt-4-turbo`, `claude-4-opus`
+- Good: `gemini-2.5-flash`
+
+**For Output and Chat:**
+
+- Recommended: `claude-4-sonnet`, `gpt-4-turbo`
+- Good for formatting: `anthropic` models

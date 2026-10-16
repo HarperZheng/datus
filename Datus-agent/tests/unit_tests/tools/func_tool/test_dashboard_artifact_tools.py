@@ -1,0 +1,1438 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Unit tests for dashboard artifact tools.
+
+Covers:
+* Helpers: ``sql_quote_scalar``, ``resolve_bind_placeholders``,
+  ``render_dashboard_template``.
+* ``DashboardArtifactTools.start_new_dashboard`` /
+  ``bind_existing_dashboard`` — LLM-driven intent declaration. The LLM
+  supplies the ``slug`` directly; the tool refuses to overwrite an
+  existing directory.
+* ``_require_active`` guard — save_query_template / validate_render fail
+  fast when no dashboard is bound.
+* ``save_query_template`` — header parsing, type coercion through the
+  trial render, column inference, persistence on disk, error paths.
+* ``validate_render`` — entry point check, useQuerySql 2-arg requirement,
+  params-key contract against the saved template declaration, import
+  allowlist, escape detection, unreferenced-file warnings.
+* ``DashboardFilesystemFuncTool`` — deny rules for ``queries/*``,
+  ``.jsx/.js/.css`` allowlist under ``render/``.
+
+No mocks; we use a real SQLite database wired through ``DBFuncTool`` so
+``save_query_template`` exercises the production code path.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from datus.schemas.gen_visual_dashboard_models import TemplateParamDecl
+from datus.tools.func_tool import DashboardArtifactTools, DashboardFilesystemFuncTool, DBFuncTool
+from datus.tools.func_tool.dashboard_artifact_tools import (
+    extract_bind_names,
+    render_dashboard_template,
+    resolve_bind_placeholders,
+    sql_quote_scalar,
+    strip_sql_comments,
+)
+
+# ----------------------------------------------------------------------------- #
+# Fixtures                                                                      #
+# ----------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def sqlite_db(tmp_path: Path) -> Path:
+    db_path = tmp_path / "demo.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE sales (region TEXT, month TEXT, revenue REAL)")
+        conn.executemany(
+            "INSERT INTO sales VALUES (?,?,?)",
+            [
+                ("NA", "2026-01", 1500.0),
+                ("EU", "2026-01", 1200.0),
+                ("NA", "2026-02", 1800.0),
+                ("APAC", "2026-02", 950.0),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def db_func_tool(sqlite_db: Path) -> DBFuncTool:
+    from datus.tools.db_tools.config import SQLiteConfig
+    from datus.tools.db_tools.sqlite_connector import SQLiteConnector
+
+    connector = SQLiteConnector(SQLiteConfig(db_path=str(sqlite_db)))
+    return DBFuncTool(connector_or_manager=connector)
+
+
+@pytest.fixture
+def unbound_tools(db_func_tool: DBFuncTool, project_root: Path) -> DashboardArtifactTools:
+    agent_config = SimpleNamespace(project_root=str(project_root))
+    return DashboardArtifactTools(agent_config=agent_config, db_func_tool=db_func_tool)
+
+
+@pytest.fixture
+def dashboard_tools(unbound_tools: DashboardArtifactTools) -> DashboardArtifactTools:
+    result = unbound_tools.start_new_dashboard(
+        slug="demo_test",
+        name="demo test",
+        description="Smoke-test dashboard used by the dashboard-artifact-tools unit tests.",
+    )
+    assert result.success == 1, result.error
+    return unbound_tools
+
+
+# ----------------------------------------------------------------------------- #
+# Helper functions                                                              #
+# ----------------------------------------------------------------------------- #
+
+
+class TestSqlQuoteScalar:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            (None, "NULL"),
+            (True, "TRUE"),
+            (False, "FALSE"),
+            (42, "42"),
+            (3.14, "3.14"),
+            ("hello", "'hello'"),
+            ("o'brien", "'o''brien'"),
+            ("2026-01-01", "'2026-01-01'"),
+        ],
+    )
+    def test_quoting(self, value, expected):
+        assert sql_quote_scalar(value) == expected
+
+
+class TestResolveBindPlaceholders:
+    def test_scalar_substitution(self):
+        decls = [TemplateParamDecl(name="d", type="date"), TemplateParamDecl(name="n", type="integer")]
+        out = resolve_bind_placeholders("WHERE d = :d AND n > :n", decls, {"d": "2026-01-01", "n": 5})
+        assert out == "WHERE d = '2026-01-01' AND n > 5"
+
+    def test_array_expanded_to_in_list(self):
+        decls = [TemplateParamDecl(name="xs", type="string[]")]
+        out = resolve_bind_placeholders("WHERE r IN :xs", decls, {"xs": ["NA", "EU"]})
+        assert out == "WHERE r IN ('NA', 'EU')"
+
+    def test_empty_array_yields_unsatisfiable_predicate(self):
+        decls = [TemplateParamDecl(name="xs", type="string[]")]
+        out = resolve_bind_placeholders("WHERE r IN :xs", decls, {"xs": []})
+        assert "(NULL)" in out
+
+    def test_missing_required_raises(self):
+        decls = [TemplateParamDecl(name="x", type="string", required=True)]
+        with pytest.raises(ValueError, match="missing from sample_params"):
+            resolve_bind_placeholders("SELECT :x", decls, {})
+
+    def test_missing_optional_left_in_place(self):
+        decls = [TemplateParamDecl(name="x", type="string", required=False)]
+        out = resolve_bind_placeholders("SELECT :x", decls, {})
+        assert out == "SELECT :x"
+
+    def test_unknown_placeholder_left_in_place(self):
+        # Caller may use ``:foo`` for something other than a declared param
+        # (e.g. a sentinel). Validator catches at execute time; we don't crash.
+        decls = [TemplateParamDecl(name="x", type="string")]
+        out = resolve_bind_placeholders("SELECT :foo", decls, {"x": "v"})
+        assert out == "SELECT :foo"
+
+    def test_postgres_double_colon_cast_preserved(self):
+        decls = [TemplateParamDecl(name="x", type="integer")]
+        out = resolve_bind_placeholders("SELECT :x::integer", decls, {"x": 7})
+        # ``::integer`` is a PostgreSQL cast — not a placeholder.
+        assert "7::integer" in out
+
+    def test_array_with_non_list_raises(self):
+        decls = [TemplateParamDecl(name="xs", type="string[]")]
+        with pytest.raises(ValueError, match="declared as an array"):
+            resolve_bind_placeholders("SELECT :xs", decls, {"xs": "not-a-list"})
+
+
+class TestRenderDashboardTemplate:
+    def test_full_render_pipeline(self):
+        tpl = (
+            "-- @datus-params start_date:date, regions:string[]:optional\n"
+            "SELECT region, SUM(revenue) FROM sales\n"
+            "WHERE month >= :start_date\n"
+            "{% if regions %}AND region IN :regions{% endif %}\n"
+            "GROUP BY region"
+        )
+        decls = [
+            TemplateParamDecl(name="start_date", type="date", required=True),
+            TemplateParamDecl(name="regions", type="string[]", required=False),
+        ]
+        out = render_dashboard_template(tpl, decls, {"start_date": "2026-01-01", "regions": ["NA"]})
+        assert "WHERE month >= '2026-01-01'" in out
+        assert "AND region IN ('NA')" in out
+
+    def test_optional_param_branch_skipped_when_omitted(self):
+        tpl = (
+            "-- @datus-params start_date:date, regions:string[]:optional\n"
+            "SELECT 1 WHERE :start_date IS NOT NULL\n"
+            "{% if regions %}AND region IN :regions{% endif %}"
+        )
+        decls = [
+            TemplateParamDecl(name="start_date", type="date", required=True),
+            TemplateParamDecl(name="regions", type="string[]", required=False),
+        ]
+        out = render_dashboard_template(tpl, decls, {"start_date": "2026-01-01"})
+        assert "AND region IN" not in out
+
+    def test_jinja_parse_error_raises(self):
+        decls = [TemplateParamDecl(name="x", type="string")]
+        with pytest.raises(ValueError, match="Jinja2 parse error"):
+            render_dashboard_template("{% if x %}", decls, {"x": "v"})
+
+    def test_datus_params_header_optional_tail_does_not_leak(self):
+        # Regression: the ``-- @datus-params x:string[]:optional`` header used
+        # to survive the render and pass ``:optional`` through to the driver,
+        # which treated it as an unbound bind parameter.
+        tpl = (
+            "-- @datus-params start_date:date, store_ids:string[]:optional\n"
+            "SELECT * FROM raw_orders WHERE day = :start_date\n"
+            "{% if store_ids %}AND store_id IN :store_ids{% endif %}"
+        )
+        decls = [
+            TemplateParamDecl(name="start_date", type="date", required=True),
+            TemplateParamDecl(name="store_ids", type="string[]", required=False),
+        ]
+        out = render_dashboard_template(tpl, decls, {"start_date": "2026-01-01", "store_ids": []})
+        assert ":optional" not in out
+        assert "@datus-params" not in out
+        assert "WHERE day = '2026-01-01'" in out
+        assert "store_id IN" not in out  # empty array → {% if %} branch skipped
+
+    def test_inline_comment_with_colon_token_stripped(self):
+        # An inline ``-- :foo`` comment in the template body would also leak
+        # ``:foo`` into the bound SQL without comment stripping.
+        tpl = "-- @datus-params start_date:date\nSELECT 1 -- baseline :foo placeholder\nWHERE day = :start_date"
+        decls = [TemplateParamDecl(name="start_date", type="date", required=True)]
+        out = render_dashboard_template(tpl, decls, {"start_date": "2026-01-01"})
+        assert ":foo" not in out
+        assert "baseline" not in out  # comment fully removed
+        assert "WHERE day = '2026-01-01'" in out
+
+
+class TestStripSqlComments:
+    def test_strips_line_comment(self):
+        assert strip_sql_comments("SELECT 1 -- ignored\nFROM t") == "SELECT 1 \nFROM t"
+
+    def test_strips_block_comment(self):
+        assert strip_sql_comments("SELECT /* note */ 1") == "SELECT  1"
+
+    def test_strips_multiline_block_comment(self):
+        assert strip_sql_comments("SELECT /* line1\nline2 */ 1") == "SELECT  1"
+
+    def test_preserves_dashes_inside_single_quoted_literal(self):
+        sql = "SELECT 'foo -- bar' AS label FROM t"
+        assert strip_sql_comments(sql) == sql
+
+    def test_preserves_dashes_inside_double_quoted_identifier(self):
+        sql = 'SELECT "col -- with dashes" FROM t'
+        assert strip_sql_comments(sql) == sql
+
+    def test_honors_sql_doubled_single_quote_escape(self):
+        # ``''`` inside a string is an escaped single quote, not the end of
+        # the literal. The ``-- danger`` that follows must stay quoted.
+        sql = "SELECT 'it''s -- danger' FROM t"
+        assert strip_sql_comments(sql) == sql
+
+    def test_unterminated_block_comment_truncates_to_eof(self):
+        # We bias toward keeping the connector from seeing dangling text — if
+        # the LLM somehow emits an unterminated ``/*``, drop everything after.
+        assert strip_sql_comments("SELECT 1 /* unterminated") == "SELECT 1 "
+
+    def test_line_comment_at_eof_without_newline(self):
+        assert strip_sql_comments("SELECT 1 -- tail") == "SELECT 1 "
+
+
+class TestExtractBindNames:
+    """``extract_bind_names`` underpins the declared-but-never-bound guard
+    inside ``save_query_template``. The cases below pin down the behavior
+    the guard relies on — header tokens excluded, comment binds excluded,
+    binds inside Jinja2 blocks counted, ``::`` casts not false-matched."""
+
+    def test_excludes_datus_params_header_tokens(self):
+        # The header's ``start_date:date`` token must NOT be picked up as a
+        # bind reference — otherwise every header-only template would pass
+        # the guard for free.
+        sql = (
+            "-- @datus-params start_date:date, end_date:date\nSELECT 1 FROM t WHERE c >= :start_date AND c < :end_date"
+        )
+        assert extract_bind_names(sql) == {"start_date", "end_date"}
+
+    def test_binds_only_in_header_returns_empty(self):
+        # The DeepSeek supply_perishable_pie failure mode: header declares
+        # params, body never binds them. After stripping the comment line
+        # the body has no ``:name`` references.
+        sql = "-- @datus-params start_date:date, end_date:date\nSELECT 1 FROM raw_supplies"
+        assert extract_bind_names(sql) == set()
+
+    def test_bind_inside_jinja_if_block_is_found(self):
+        sql = (
+            "-- @datus-params start_date:date, regions:string[]:optional\n"
+            "SELECT * FROM t WHERE day >= :start_date\n"
+            "{% if regions %}AND region IN :regions{% endif %}"
+        )
+        assert extract_bind_names(sql) == {"start_date", "regions"}
+
+    def test_postgres_double_colon_cast_not_a_bind(self):
+        sql = "-- @datus-params start_date:date\nSELECT CAST(c AS DATE) AS d, x::int FROM t WHERE day >= :start_date"
+        # ``::int`` must not be lexed as a bind named ``int``; only
+        # ``:start_date`` survives.
+        assert extract_bind_names(sql) == {"start_date"}
+
+    def test_colon_inside_line_comment_does_not_count(self):
+        sql = "-- @datus-params start_date:date\nSELECT 1 FROM t  -- TODO: bind :start_date here later"
+        # Stripping comments first means the body has no ``:name`` left.
+        assert extract_bind_names(sql) == set()
+
+    def test_colon_inside_block_comment_does_not_count(self):
+        sql = "-- @datus-params x:date\nSELECT 1 FROM t /* :x will be added next sprint */"
+        assert extract_bind_names(sql) == set()
+
+    def test_multiple_binds_on_same_line(self):
+        sql = "-- @datus-params a:integer, b:integer\nSELECT :a + :b AS total FROM t"
+        assert extract_bind_names(sql) == {"a", "b"}
+
+
+# ----------------------------------------------------------------------------- #
+# start_new_dashboard / bind_existing_dashboard                                 #
+# ----------------------------------------------------------------------------- #
+
+
+class TestStartNewDashboard:
+    def test_uses_supplied_slug_and_writes_manifest(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+        result = unbound_tools.start_new_dashboard(
+            slug="north_sales",
+            name="north sales",
+            description="Live north-region sales dashboard with date and channel filters.",
+        )
+        assert result.success == 1
+        payload = result.result
+        assert payload["dashboard_slug"] == "north_sales"
+        assert payload["mode"] == "new"
+        assert payload["dashboard_dir"] == "dashboards/north_sales"
+        assert payload["render_dir"] == "dashboards/north_sales/render"
+        assert payload["queries_dir"] == "dashboards/north_sales/queries"
+        assert payload["manifest_path"] == "dashboards/north_sales/manifest.json"
+
+        assert unbound_tools.dashboard_slug == "north_sales"
+        assert (project_root / "dashboards" / "north_sales" / "queries").is_dir()
+        assert (project_root / "dashboards" / "north_sales" / "render").is_dir()
+
+        manifest_path = project_root / "dashboards" / "north_sales" / "manifest.json"
+        assert manifest_path.is_file()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["slug"] == "north_sales"
+        assert manifest["name"] == "north sales"
+        assert manifest["description"] == "Live north-region sales dashboard with date and channel filters."
+        assert manifest["kind"] == "dashboard"
+        assert manifest["created_at"].endswith("Z")
+
+    def test_chinese_name_is_preserved_in_manifest(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+        result = unbound_tools.start_new_dashboard(
+            slug="sales_live",
+            name="销售看板",
+            description="实时销售看板，按地区过滤。",
+        )
+        assert result.success == 1, result.error
+        manifest = json.loads(
+            (project_root / "dashboards" / "sales_live" / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["slug"] == "sales_live"
+        assert manifest["name"] == "销售看板"
+
+    def test_empty_name_rejected(self, unbound_tools: DashboardArtifactTools):
+        result = unbound_tools.start_new_dashboard(slug="ok", name=" ", description="x")
+        assert result.success == 0
+        assert "name" in (result.error or "").lower()
+
+    def test_empty_description_rejected(self, unbound_tools: DashboardArtifactTools):
+        result = unbound_tools.start_new_dashboard(slug="ok", name="ok", description="")
+        assert result.success == 0
+        assert "description" in (result.error or "").lower()
+
+    @pytest.mark.parametrize(
+        "bad_slug",
+        [
+            "",
+            "Has-Hyphen",
+            "has space",
+            "中文",
+            "a" * 81,
+        ],
+    )
+    def test_invalid_slug_rejected(self, unbound_tools: DashboardArtifactTools, bad_slug: str):
+        result = unbound_tools.start_new_dashboard(slug=bad_slug, name="ok", description="ok")
+        assert result.success == 0
+        assert "slug" in (result.error or "").lower()
+
+    def test_existing_directory_rejected(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+        (project_root / "dashboards" / "preexisting").mkdir(parents=True)
+        result = unbound_tools.start_new_dashboard(slug="preexisting", name="x", description="y")
+        assert result.success == 0
+        assert "already exists" in (result.error or "").lower()
+
+
+class TestBindExistingDashboard:
+    def test_binds_when_directory_and_app_jsx_exist(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+        existing = project_root / "dashboards" / "existing_demo"
+        (existing / "queries").mkdir(parents=True)
+        (existing / "render").mkdir()
+        (existing / "render" / "app.jsx").write_text("export default function D() { return null; }\n")
+
+        result = unbound_tools.bind_existing_dashboard("existing_demo")
+        assert result.success == 1, result.error
+        assert result.result["mode"] == "edit"
+        assert result.result["dashboard_slug"] == "existing_demo"
+        assert unbound_tools.dashboard_slug == "existing_demo"
+
+    def test_rejects_missing_directory(self, unbound_tools: DashboardArtifactTools):
+        result = unbound_tools.bind_existing_dashboard("nope")
+        assert result.success == 0
+        assert "not found" in (result.error or "").lower()
+
+    def test_rejects_missing_app_jsx(self, unbound_tools: DashboardArtifactTools, project_root: Path):
+        incomplete = project_root / "dashboards" / "partial"
+        (incomplete / "queries").mkdir(parents=True)
+        (incomplete / "render").mkdir()
+        result = unbound_tools.bind_existing_dashboard("partial")
+        assert result.success == 0
+        assert "render/app.jsx" in (result.error or "")
+
+    def test_rejects_invalid_slug_format(self, unbound_tools: DashboardArtifactTools):
+        result = unbound_tools.bind_existing_dashboard("Not-A-Valid-Slug!")
+        assert result.success == 0
+        assert "match" in (result.error or "").lower()
+
+
+class TestRequireActive:
+    def test_save_query_template_rejects_when_unbound(self, unbound_tools: DashboardArtifactTools):
+        # Required brief args supplied to prove the binding check runs
+        # BEFORE arg validation — even a fully-valid call must be rejected
+        # when no dashboard is bound.
+        result = unbound_tools.save_query_template(
+            name="q",
+            sql_template="-- @datus-params x:string\nSELECT :x",
+            sample_params={"x": "v"},
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        error = (result.error or "").lower()
+        assert "no active dashboard" in error
+        assert "start_new_dashboard" in error
+        assert "bind_existing_dashboard" in error
+
+    def test_validate_render_rejects_when_unbound(self, unbound_tools: DashboardArtifactTools):
+        result = unbound_tools.validate_render()
+        assert result.success == 0
+        assert "no active dashboard" in (result.error or "").lower()
+
+
+# ----------------------------------------------------------------------------- #
+# save_query_template                                                           #
+# ----------------------------------------------------------------------------- #
+
+
+_REVENUE_TEMPLATE = (
+    "-- @datus-params month_floor:string, regions:string[]:optional\n"
+    "SELECT region, SUM(revenue) AS revenue FROM sales\n"
+    "WHERE month >= :month_floor\n"
+    "{% if regions %}AND region IN :regions{% endif %}\n"
+    "GROUP BY region\n"
+    "ORDER BY revenue DESC"
+)
+
+
+class TestSaveQueryTemplate:
+    def test_persists_sql_and_params_json(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        result = dashboard_tools.save_query_template(
+            name="revenue_by_region",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={"month_floor": "2026-01", "regions": ["NA", "EU"]},
+            goal="Revenue per region with optional filter",
+            hypothesis="Regional revenue diverges enough to justify a region drilldown.",
+        )
+        assert result.success == 1, result.error
+        payload = result.result
+        assert payload["name"] == "revenue_by_region"
+        assert payload["data_ref"] == "queries/revenue_by_region"
+        names = [c["name"] for c in payload["columns"]]
+        assert names == ["region", "revenue"]
+        # 2 rows are inside NA / EU + month >= 2026-01.
+        assert payload["sample_row_count"] == 2
+        # The brief sidecar joins the .sql.j2 / .params.json bundle.
+        assert payload["brief_path"].endswith("revenue_by_region.brief.json")
+
+        dash_slug = dashboard_tools.dashboard_slug or ""
+        sql_path = project_root / "dashboards" / dash_slug / "queries" / "revenue_by_region.sql.j2"
+        params_path = project_root / "dashboards" / dash_slug / "queries" / "revenue_by_region.params.json"
+        brief_path = project_root / "dashboards" / dash_slug / "queries" / "revenue_by_region.brief.json"
+        assert sql_path.exists()
+        assert params_path.exists()
+        assert brief_path.exists()
+        meta = json.loads(params_path.read_text())
+        decl_names = [p["name"] for p in meta["params"]]
+        assert decl_names == ["month_floor", "regions"]
+        # The legacy ``description`` slot in params.json now mirrors ``goal``.
+        assert meta["description"] == "Revenue per region with optional filter"
+        # The brief file holds only hypothesis / uses / caveats now.
+        brief_data = json.loads(brief_path.read_text(encoding="utf-8"))
+        assert "goal" not in brief_data
+        assert "datasource" not in brief_data
+        assert "created_at" not in brief_data
+
+    def test_invalid_slug_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="Bad Name!",
+            sql_template="-- @datus-params x:string\nSELECT :x",
+            sample_params={"x": "v"},
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "match" in (result.error or "")
+
+    def test_empty_template_rejected(self, dashboard_tools: DashboardArtifactTools):
+        # Empty-template validation runs before goal/hypothesis checks —
+        # omit them deliberately to prove the empty branch is the trigger.
+        result = dashboard_tools.save_query_template(
+            name="empty",
+            sql_template="   ",
+            sample_params={},
+            goal="",
+            hypothesis="",
+        )
+        assert result.success == 0
+        assert "must not be empty" in (result.error or "")
+
+    def test_empty_goal_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="no_goal",
+            sql_template="-- @datus-params x:string\nSELECT :x",
+            sample_params={"x": "v"},
+            goal="  ",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "goal" in (result.error or "").lower()
+
+    def test_empty_hypothesis_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="no_hypothesis",
+            sql_template="-- @datus-params x:string\nSELECT :x",
+            sample_params={"x": "v"},
+            goal="trivial sanity template",
+            hypothesis="  ",
+        )
+        assert result.success == 0
+        assert "hypothesis" in (result.error or "").lower()
+
+    def test_uses_recorded_in_brief_file(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        result = dashboard_tools.save_query_template(
+            name="revenue_uses",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={"month_floor": "2026-01"},
+            goal="Revenue per region with optional filter",
+            hypothesis="Regional revenue diverges enough to justify drilldown.",
+            uses={
+                "metrics": [{"path": ["Revenue"], "name": "total_revenue"}],
+            },
+        )
+        assert result.success == 1, result.error
+        dash_slug = dashboard_tools.dashboard_slug or ""
+        brief_file = project_root / "dashboards" / dash_slug / "queries" / "revenue_uses.brief.json"
+        data = json.loads(brief_file.read_text(encoding="utf-8"))
+        assert data["uses"]["metrics"] == [{"path": ["Revenue"], "name": "total_revenue"}]
+        assert data["uses"]["reference_sql"] == []
+
+    def test_unknown_sample_param_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="bad_params",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={"month_floor": "2026-01", "rogue": 1},
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "not declared" in (result.error or "")
+
+    def test_missing_required_sample_param_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="bad_params2",
+            sql_template=_REVENUE_TEMPLATE,
+            sample_params={},
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "missing required" in (result.error or "")
+
+    def test_missing_header_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="no_header",
+            sql_template="SELECT 1 AS a",
+            sample_params={},
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "@datus-params" in (result.error or "")
+
+    def test_declared_param_never_bound_rejected(self, dashboard_tools: DashboardArtifactTools):
+        # Reproduces the live failure mode from the sample_shop_business_analysis
+        # ``supply_perishable_pie`` template — header declares ``start_date`` /
+        # ``end_date`` but the SQL body ignores both. Without the guard the
+        # tool persists a template that silently produces a static snapshot
+        # while the dashboard UI still hands it date values.
+        result = dashboard_tools.save_query_template(
+            name="ignored_dates",
+            sql_template=("-- @datus-params start_date:string, end_date:string\nSELECT COUNT(*) AS n FROM sales"),
+            sample_params={"start_date": "2026-01", "end_date": "2026-12"},
+            goal="aggregate over all rows ignoring the supplied window",
+            hypothesis="header should have dropped these params or used them",
+        )
+        assert result.success == 0
+        err = result.error or ""
+        assert "never bound" in err
+        assert "start_date" in err
+        assert "end_date" in err
+
+    def test_partial_unbound_param_rejected(self, dashboard_tools: DashboardArtifactTools):
+        # Only one of two declared params is bound — the other still trips
+        # the guard, and the error names just the unbound one.
+        result = dashboard_tools.save_query_template(
+            name="half_used",
+            sql_template=(
+                "-- @datus-params start_date:string, end_date:string\n"
+                "SELECT COUNT(*) AS n FROM sales WHERE month >= :start_date"
+            ),
+            sample_params={"start_date": "2026-01", "end_date": "2026-12"},
+            goal="half-bound template",
+            hypothesis="end_date is ignored",
+        )
+        assert result.success == 0
+        err = result.error or ""
+        assert "['end_date']" in err
+        assert "start_date" not in err.split("never bound")[1].split(".")[0]
+
+    def test_param_bound_inside_jinja_block_accepted(
+        self,
+        dashboard_tools: DashboardArtifactTools,
+        project_root: Path,
+    ):
+        # An optional param referenced only inside ``{% if %}`` still counts
+        # as bound — the placeholder text exists in the template body whether
+        # or not Jinja2 ultimately includes that branch at render time.
+        result = dashboard_tools.save_query_template(
+            name="jinja_bound_optional",
+            sql_template=(
+                "-- @datus-params month_floor:string, regions:string[]:optional\n"
+                "SELECT region, SUM(revenue) AS revenue FROM sales\n"
+                "WHERE month >= :month_floor\n"
+                "{% if regions %}AND region IN :regions{% endif %}\n"
+                "GROUP BY region"
+            ),
+            sample_params={"month_floor": "2026-01"},
+            goal="optional regions filter exercised at render time",
+            hypothesis="trial without regions still produces NA + EU + APAC rows",
+        )
+        assert result.success == 1, result.error
+
+    def test_write_operations_rejected(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="bad_write",
+            sql_template=("-- @datus-params region:string\nDELETE FROM sales WHERE region = :region"),
+            sample_params={"region": "NA"},
+            goal="attempt a write",
+            hypothesis="connector should refuse the mutation",
+        )
+        assert result.success == 0
+        assert "read-only" in (result.error or "").lower()
+
+    def test_sample_params_must_be_dict(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.save_query_template(
+            name="bad_args",
+            sql_template="-- @datus-params x:string\nSELECT :x",
+            sample_params="not a dict",  # type: ignore[arg-type]
+            goal="trivial sanity template",
+            hypothesis="trivial single-row sanity result",
+        )
+        assert result.success == 0
+        assert "JSON object" in (result.error or "")
+
+    def test_empty_header_accepted_for_static_query(
+        self,
+        dashboard_tools: DashboardArtifactTools,
+        project_root: Path,
+    ):
+        # Regression for the deadlock the agent ran into when authoring a
+        # genuinely time-invariant template (catalog rollup): the old chain
+        # of guards meant the agent could neither (a) declare time params
+        # it doesn't use (rejected by the unbound-param validator), (b)
+        # drop the header entirely (rejected by parse_datus_params_header),
+        # nor (c) write ``-- @datus-params`` with an empty body (used to be
+        # rejected as "lists no parameters"). The bare empty header is now
+        # the canonical way to declare zero parameters; the unbound-param
+        # check is trivially satisfied when no params are declared.
+        result = dashboard_tools.save_query_template(
+            name="supply_perishable_split",
+            sql_template=("-- @datus-params\nSELECT COUNT(*) AS n FROM sales"),
+            sample_params={},
+            goal="static catalog rollup — perishable vs non-perishable",
+            hypothesis="no time/store filter applies because the catalog is static",
+        )
+        assert result.success == 1, result.error
+        # The params.json sidecar should record zero declared params.
+        dash_slug = dashboard_tools.dashboard_slug or ""
+        params_path = project_root / "dashboards" / dash_slug / "queries" / "supply_perishable_split.params.json"
+        meta = json.loads(params_path.read_text())
+        assert meta["params"] == []
+
+
+# ----------------------------------------------------------------------------- #
+# validate_render                                                               #
+# ----------------------------------------------------------------------------- #
+
+
+def _seed_template(dashboard_tools: DashboardArtifactTools, slug: str = "revenue_by_region") -> None:
+    """Persist a sample template the validator can match against."""
+    result = dashboard_tools.save_query_template(
+        name=slug,
+        sql_template=_REVENUE_TEMPLATE,
+        sample_params={"month_floor": "2026-01"},
+        goal="Revenue per region with optional filter",
+        hypothesis="Regional revenue diverges enough to justify drilldown.",
+    )
+    assert result.success == 1, result.error
+
+
+def _write_render(project_root: Path, dashboard_slug: str, files: dict[str, str]) -> Path:
+    render = project_root / "dashboards" / dashboard_slug / "render"
+    render.mkdir(parents=True, exist_ok=True)
+    for rel, content in files.items():
+        target = render / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return render
+
+
+_VALID_APP_JSX = """\
+import React from 'react';
+import { useDatusArtifact } from '@datus/web-artifact';
+
+export default function App() {
+  const { useQuerySql } = useDatusArtifact();
+  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });
+  return React.createElement('pre', null, JSON.stringify(data?.rows ?? []));
+}
+"""
+
+
+class TestValidateRender:
+    def test_missing_source_names_both_query_types_and_save_operations(self, dashboard_tools, project_root):
+        _seed_template(dashboard_tools)
+        (dashboard_tools.queries_dir / "revenue_by_region.sql.j2").unlink()
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": _VALID_APP_JSX})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "revenue_by_region.sql.j2" in result.error
+        assert "revenue_by_region.metric.json" in result.error
+        assert "save_query_template" in result.error
+        assert "save_metric_query_template" in result.error
+
+    def test_happy_path(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": _VALID_APP_JSX})
+
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["app_jsx_path"].endswith("render/app.jsx")
+        assert "queries/revenue_by_region" in result.result["query_refs"]
+        # Kind + slug let the frontend refresh the preview immediately.
+        assert result.result["artifact_kind"] == "dashboard"
+        assert result.result["artifact_slug"] == dashboard_tools.dashboard_slug
+
+    def test_rejects_hook_below_an_early_return(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        early_return = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data, loading } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  if (loading) return null;\n"
+            "  const rows = React.useMemo(() => data?.rows ?? [], [data]);\n"
+            "  return React.createElement('div', null, rows.length);\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": early_return})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "useMemo() on line 7" in (result.error or "")
+        assert "line 6" in (result.error or "")
+
+    def test_rejects_useQuerySql_without_params_arg(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app_no_params = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  useQuerySql('queries/revenue_by_region');\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_no_params})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "second `params` argument" in (result.error or "")
+
+    def test_rejects_missing_required_param_key(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app_missing_key = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  useQuerySql('queries/revenue_by_region', {});\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_missing_key})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "missing required" in (result.error or "")
+        assert "month_floor" in (result.error or "")
+
+    def test_accepts_shorthand_param_keys(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app_shorthand = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const month_floor = '2026-01';\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor });\n"
+            "  return React.createElement('pre', null, JSON.stringify(data?.rows ?? []));\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_shorthand})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert "queries/revenue_by_region" in result.result["query_refs"]
+
+    def test_shorthand_does_not_capture_value_position_identifiers(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        # Regression: the shorthand handling must not treat the value side of
+        # `{ month_floor: someVar }` as a separate (unknown) key.
+        _seed_template(dashboard_tools)
+        app_explicit = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const some_var = '2026-01';\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: some_var });\n"
+            "  return React.createElement('pre', null, JSON.stringify(data?.rows ?? []));\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_explicit})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+
+    def test_accepts_multiline_shorthand_param_object(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        # The subagent often emits the params object across multiple lines.
+        # `\s*` in both `_PARAMS_KEY_RE` and `_PARAMS_SHORTHAND_KEY_RE` is
+        # expected to absorb the newline + indentation between keys.
+        _seed_template(dashboard_tools)
+        app_multiline_shorthand = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const month_floor = '2026-01';\n"
+            "  const regions = ['NA', 'EU'];\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', {\n"
+            "    month_floor,\n"
+            "    regions,\n"
+            "  });\n"
+            "  return React.createElement('pre', null, JSON.stringify(data?.rows ?? []));\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_multiline_shorthand})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert "queries/revenue_by_region" in result.result["query_refs"]
+
+    def test_accepts_multiline_mixed_shorthand_and_explicit(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        # Mixed form across lines: one key uses shorthand, the other uses
+        # explicit `key: value` syntax. Neither side may be misclassified.
+        _seed_template(dashboard_tools)
+        app_multiline_mixed = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const sd = '2026-01';\n"
+            "  const regions = ['NA', 'EU'];\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', {\n"
+            "    month_floor: sd,\n"
+            "    regions,\n"
+            "  });\n"
+            "  return React.createElement('pre', null, JSON.stringify(data?.rows ?? []));\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_multiline_mixed})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+
+    def test_rejects_unknown_param_key(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app_extra_key = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  useQuerySql('queries/revenue_by_region', { month_floor: '2026-01', extra: 1 });\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app_extra_key})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "unknown" in (result.error or "")
+        assert "extra" in (result.error or "")
+
+    def test_rejects_dangling_slug(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        # No save_query_template — but app.jsx references one.
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": _VALID_APP_JSX})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "queries/revenue_by_region" in (result.error or "")
+
+    def test_rejects_missing_default_export(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        no_default = "import React from 'react';\nfunction App() { return null; }\n"
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": no_default})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "export default" in (result.error or "")
+
+    def test_rejects_disallowed_bare_import(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        bad_app = (
+            "import React from 'react';\n"
+            "import _ from 'lodash';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  return null;\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": bad_app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "lodash" in (result.error or "")
+
+    def test_rejects_empty_render_dir(self, dashboard_tools: DashboardArtifactTools):
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "no .jsx" in (result.error or "")
+
+
+# ----------------------------------------------------------------------------- #
+# validate_render — <ChartCard> static checks                                   #
+# ----------------------------------------------------------------------------- #
+
+
+_CHART_CARD_APP_JSX = """\
+import React from 'react';
+import { useDatusArtifact, ChartCard } from '@datus/web-artifact';
+
+export default function App() {
+  const { useQuerySql } = useDatusArtifact();
+  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });
+  return (
+    <ChartCard
+      chartId="revenue_by_region"
+      sqlId="queries/revenue_by_region"
+      chartType="bar"
+      title="Revenue"
+      data={data}
+    >
+      <pre />
+    </ChartCard>
+  );
+}
+"""
+
+
+class TestValidateRenderChartCard:
+    """Static validation around the runtime-provided ``<ChartCard>``."""
+
+    @pytest.mark.parametrize("extra,success", [("revenue_by_region", 1), ("missing", 0)])
+    def test_validates_additional_declared_sources(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path, extra, success
+    ):
+        _seed_template(dashboard_tools)
+        source = _CHART_CARD_APP_JSX.replace('chartType="bar"', f'chartType="bar" queryIds={{["queries/{extra}"]}}')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": source})
+        result = dashboard_tools.validate_render()
+        assert result.success == success, result.error
+        assert ("queryIds" in (result.error or "")) == (not success)
+
+    def test_chart_card_happy_path_emits_cards_registry(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        _seed_template(dashboard_tools)
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": _CHART_CARD_APP_JSX})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["cards"] == [
+            {"chart_id": "revenue_by_region", "jsx_path": "render/app.jsx", "kind": "chart"}
+        ]
+        # ChartCard's sqlId joins the query-ref set even when the validator
+        # has already seen the same slug from useQuerySql.
+        assert "queries/revenue_by_region" in result.result["query_refs"]
+
+    def test_chart_card_missing_required_prop_is_rejected(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        _seed_template(dashboard_tools)
+        # chartId omitted on purpose — validator must surface it.
+        app = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact, ChartCard } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  return (\n"
+            '    <ChartCard sqlId="queries/revenue_by_region" chartType="bar" data={data}>\n'
+            "      <pre />\n"
+            "    </ChartCard>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "missing required" in (result.error or "")
+        assert "chartId" in (result.error or "")
+
+    def test_chart_card_invalid_chart_type_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app = _CHART_CARD_APP_JSX.replace('chartType="bar"', 'chartType="donut"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "'donut'" in (result.error or "")
+        assert "chartType" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        "chart_type",
+        ["radial-bar", "treemap", "funnel", "gauge", "heatmap", "waterfall"],
+    )
+    def test_chart_card_extended_chart_types_accepted(
+        self,
+        dashboard_tools: DashboardArtifactTools,
+        project_root: Path,
+        chart_type: str,
+    ):
+        """The BI-extended chart types (3 recharts-native + 3 custom-rendered) validate cleanly."""
+        _seed_template(dashboard_tools)
+        app = _CHART_CARD_APP_JSX.replace('chartType="bar"', f'chartType="{chart_type}"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+
+    def test_chart_card_invalid_chart_id_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        # Mixed case / hyphen violates `^[a-z0-9_]{1,64}$`.
+        app = _CHART_CARD_APP_JSX.replace('chartId="revenue_by_region"', 'chartId="Revenue-1"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "Revenue-1" in (result.error or "")
+
+    def test_chart_card_dangling_sql_id_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        # ChartCard references a sqlId never produced by save_query_template.
+        # useQuerySql still uses the saved one so the import / params checks pass.
+        app = _CHART_CARD_APP_JSX.replace(
+            'sqlId="queries/revenue_by_region"',
+            'sqlId="queries/orphaned_slug"',
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "orphaned_slug" in (result.error or "")
+        assert "save_query_template" in (result.error or "")
+
+    def test_chart_card_duplicate_chart_id_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        # Two files declaring the same chartId — duplicate must be caught
+        # across the whole render/ tree, not just within one file.
+        second_file = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact, ChartCard } from '@datus/web-artifact';\n"
+            "export function SecondCard() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  return (\n"
+            '    <ChartCard chartId="revenue_by_region" sqlId="queries/revenue_by_region" '
+            'chartType="line" data={data}>\n'
+            "      <pre />\n"
+            "    </ChartCard>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(
+            project_root,
+            dashboard_tools.dashboard_slug,
+            {"app.jsx": _CHART_CARD_APP_JSX, "second.jsx": second_file},
+        )
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "duplicates" in (result.error or "")
+        assert "revenue_by_region" in (result.error or "")
+
+    def test_chart_card_attr_value_with_angle_bracket_not_truncated(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        """A JSX expression containing ``>`` must not truncate the attribute scan.
+
+        ``titleRight={<span>a > b</span>}`` previously caused the opening-tag
+        regex to stop at the first inner ``>``; required props sitting AFTER
+        the offending attribute would then look "missing".
+        """
+        _seed_template(dashboard_tools)
+        app = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact, ChartCard } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  return (\n"
+            "    <ChartCard\n"
+            "      titleRight={<span>a > b</span>}\n"
+            '      chartId="revenue_by_region"\n'
+            '      sqlId="queries/revenue_by_region"\n'
+            '      chartType="bar"\n'
+            "      data={data}\n"
+            "    >\n"
+            "      <pre />\n"
+            "    </ChartCard>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+
+    def test_chart_card_nested_object_literal_not_confused_for_spread(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        """``style={{...defaults}}`` is a nested object spread, not a JSX prop spread.
+
+        The spread-detection regex must only fire on top-level
+        ``{...rest}`` attributes — the chartId / sqlId / chartType
+        right next to the nested literal are perfectly visible to the
+        static check.
+        """
+        _seed_template(dashboard_tools)
+        app = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact, ChartCard } from '@datus/web-artifact';\n"
+            "const defaults = { padding: 4 };\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  return (\n"
+            "    <ChartCard\n"
+            "      style={{...defaults, background: '#fff'}}\n"
+            '      chartId="revenue_by_region"\n'
+            '      sqlId="queries/revenue_by_region"\n'
+            '      chartType="bar"\n'
+            "      data={data}\n"
+            "    >\n"
+            "      <pre />\n"
+            "    </ChartCard>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        warnings = result.result.get("warnings", [])
+        # Crucially: NO "spread props" warning when only nested literal spread is present.
+        assert not any("spread props" in w for w in warnings)
+
+    def test_chart_card_spread_props_require_static_declarations(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        _seed_template(dashboard_tools)
+        # Hidden source props must be expanded before finalization so the
+        # content block can be linked without runtime inference.
+        app = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact, ChartCard } from '@datus/web-artifact';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  const cardProps = {\n"
+            "    chartId: 'revenue_by_region',\n"
+            "    sqlId: 'queries/revenue_by_region',\n"
+            "    chartType: 'bar',\n"
+            "  };\n"
+            "  return (\n"
+            "    <ChartCard {...cardProps} data={data}>\n"
+            "      <pre />\n"
+            "    </ChartCard>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "spread props" in result.error
+        assert "call site" in result.error
+
+
+# ----------------------------------------------------------------------------- #
+# validate_render — <BlockHandle> static checks                                   #
+# ----------------------------------------------------------------------------- #
+
+
+def _edit_handle_app(handle_attrs: str) -> str:
+    """App whose KPI tile is wrapped in an ``<BlockHandle>`` with ``handle_attrs``."""
+    return (
+        "import React from 'react';\n"
+        "import { useDatusArtifact, BlockHandle } from '@datus/web-artifact';\n"
+        "export default function App() {\n"
+        "  const { useQuerySql } = useDatusArtifact();\n"
+        "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+        "  return (\n"
+        f"    <BlockHandle {handle_attrs}>\n"
+        "      <div>{data?.rows?.length}</div>\n"
+        "    </BlockHandle>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+class TestValidateRenderBlockHandle:
+    """Static validation around the runtime-provided ``<BlockHandle>``."""
+
+    def test_edit_handle_happy_path_lands_in_cards_registry(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app(
+            'handleId="kpi_total_revenue" name="Total revenue" kind="kpi" sqlId="queries/revenue_by_region"'
+        )
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["cards"] == [
+            {"chart_id": "kpi_total_revenue", "jsx_path": "render/app.jsx", "kind": "kpi"}
+        ]
+
+    def test_edit_handle_without_sql_id_is_accepted(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        """A static callout has no query behind it — sqlId is optional."""
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="insight_panel" name="Auto insights" kind="note"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["cards"] == [{"chart_id": "insight_panel", "jsx_path": "render/app.jsx", "kind": "note"}]
+
+    def test_edit_handle_defaults_to_note_kind(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="filter_strip" name="Filters"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 1, result.error
+        assert result.result["cards"][0]["kind"] == "note"
+
+    def test_edit_handle_missing_name_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="kpi_total_revenue" kind="kpi"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "missing required" in (result.error or "")
+        assert "name" in (result.error or "")
+
+    def test_edit_handle_invalid_handle_id_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="KPI-Total" name="Total revenue" kind="kpi"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "KPI-Total" in (result.error or "")
+
+    def test_edit_handle_chart_kind_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        """``kind="chart"`` belongs to ChartCard, which owns the actions menu."""
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="revenue_block" name="Revenue" kind="chart"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "'chart'" in (result.error or "")
+        assert "ChartCard" in (result.error or "")
+
+    def test_edit_handle_dangling_sql_id_rejected(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        _seed_template(dashboard_tools)
+        app = _edit_handle_app('handleId="kpi_total_revenue" name="Total revenue" sqlId="queries/orphaned_slug"')
+        _write_render(project_root, dashboard_tools.dashboard_slug, {"app.jsx": app})
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "orphaned_slug" in (result.error or "")
+        assert "save_query_template" in (result.error or "")
+
+    def test_edit_handle_id_collides_with_chart_id(self, dashboard_tools: DashboardArtifactTools, project_root: Path):
+        """handleId and chartId share one namespace — a collision is an error."""
+        _seed_template(dashboard_tools)
+        second = (
+            "import React from 'react';\n"
+            "import { BlockHandle } from '@datus/web-artifact';\n"
+            "export function Tile() {\n"
+            "  return (\n"
+            '    <BlockHandle handleId="revenue_by_region" name="Total revenue" kind="kpi">\n'
+            "      <div />\n"
+            "    </BlockHandle>\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(
+            project_root,
+            dashboard_tools.dashboard_slug,
+            {"app.jsx": _CHART_CARD_APP_JSX, "tile.jsx": second},
+        )
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "duplicates" in (result.error or "")
+        assert "revenue_by_region" in (result.error or "")
+
+    def test_edit_handle_forwarded_props_require_static_declaration(
+        self, dashboard_tools: DashboardArtifactTools, project_root: Path
+    ):
+        """A shared KPI-card wrapper forwards handleId / name from its props.
+
+        Finalization must reject the missing static identity/source and give
+        the model a concrete repair direction instead of returning success.
+        """
+        _seed_template(dashboard_tools)
+        shared = (
+            "import React from 'react';\n"
+            "import { BlockHandle } from '@datus/web-artifact';\n"
+            "export function KpiCard({ handleId, label, value, sqlId, params }) {\n"
+            "  return (\n"
+            '    <BlockHandle handleId={handleId} name={label} kind="kpi" sqlId={sqlId} params={params}>\n'
+            "      <div>{value}</div>\n"
+            "    </BlockHandle>\n"
+            "  );\n"
+            "}\n"
+        )
+        app = (
+            "import React from 'react';\n"
+            "import { useDatusArtifact } from '@datus/web-artifact';\n"
+            "import { KpiCard } from './shared/kpi-card';\n"
+            "export default function App() {\n"
+            "  const { useQuerySql } = useDatusArtifact();\n"
+            "  const { data } = useQuerySql('queries/revenue_by_region', { month_floor: '2026-01' });\n"
+            "  const r = data?.rows?.[0] ?? {};\n"
+            "  return (\n"
+            '    <KpiCard handleId="kpi_total_revenue" label="Total revenue" value={r.revenue} '
+            "sqlId=\"queries/revenue_by_region\" params={{ month_floor: '2026-01' }} />\n"
+            "  );\n"
+            "}\n"
+        )
+        _write_render(
+            project_root,
+            dashboard_tools.dashboard_slug,
+            {"app.jsx": app, "shared/kpi-card.jsx": shared},
+        )
+        result = dashboard_tools.validate_render()
+        assert result.success == 0
+        assert "string-literal handleId" in result.error
+        assert "call site" in result.error
+        assert "sqlId" in result.error
+
+
+# ----------------------------------------------------------------------------- #
+# DashboardFilesystemFuncTool deny / allow rules                                #
+# ----------------------------------------------------------------------------- #
+
+
+class TestDashboardFilesystemFuncTool:
+    def test_write_queries_rejected(self, project_root: Path):
+        (project_root / "dashboards" / "x" / "queries").mkdir(parents=True)
+        fs = DashboardFilesystemFuncTool(root_path=str(project_root))
+        result = fs.write_file("dashboards/x/queries/q.sql.j2", "-- @datus-params x:string\nSELECT :x")
+        assert result.success == 0
+        assert "save_query_template" in (result.error or "")
+
+    def test_write_render_jsx_allowed(self, project_root: Path):
+        (project_root / "dashboards" / "x" / "render").mkdir(parents=True)
+        fs = DashboardFilesystemFuncTool(root_path=str(project_root))
+        result = fs.write_file("dashboards/x/render/app.jsx", "export default () => null;\n")
+        assert result.success == 1
+        assert (project_root / "dashboards" / "x" / "render" / "app.jsx").is_file()
+
+    def test_write_render_json_rejected(self, project_root: Path):
+        (project_root / "dashboards" / "x" / "render").mkdir(parents=True)
+        fs = DashboardFilesystemFuncTool(root_path=str(project_root))
+        result = fs.write_file("dashboards/x/render/data.json", '{"x": 1}')
+        assert result.success == 0
+        assert ".jsx" in (result.error or "")
+
+    def test_edit_queries_rejected(self, project_root: Path):
+        (project_root / "dashboards" / "x" / "queries").mkdir(parents=True)
+        existing = project_root / "dashboards" / "x" / "queries" / "q.sql.j2"
+        existing.write_text("-- @datus-params x:string\nSELECT :x")
+        fs = DashboardFilesystemFuncTool(root_path=str(project_root))
+        result = fs.edit_file("dashboards/x/queries/q.sql.j2", ":x", ":x AS v")
+        assert result.success == 0
+        assert "save_query_template" in (result.error or "")
+
+    def test_delete_queries_rejected(self, project_root: Path):
+        (project_root / "dashboards" / "x" / "queries").mkdir(parents=True)
+        target = project_root / "dashboards" / "x" / "queries" / "q.params.json"
+        target.write_text("{}")
+        fs = DashboardFilesystemFuncTool(root_path=str(project_root))
+        result = fs.delete_file("dashboards/x/queries/q.params.json")
+        assert result.success == 0
+        assert target.exists()

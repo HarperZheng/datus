@@ -1,0 +1,235 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Unit tests for ``datus.validation.target_extractor``."""
+
+from __future__ import annotations
+
+import pytest
+
+from datus.tools.db_tools import connector_registry
+from datus.validation.report import TableTarget
+from datus.validation.target_extractor import extract_ddl_target, extract_dml_target
+
+
+@pytest.fixture(autouse=True)
+def _register_test_capabilities():
+    """Register capability sets for dialects referenced by these tests.
+
+    The validation layer consults ``connector_registry.support_catalog`` to
+    decide whether a three-part identifier should populate ``catalog``.
+    Unit-test harnesses only load sqlite / duckdb connectors by default, so
+    we register bare capability records for the engines exercised here —
+    matching the pattern used in ``test_sql_utils.py`` and
+    ``test_dashboard_assembler.py``.
+
+    ``connector_registry`` holds three class-level dicts that
+    ``register_handlers`` can mutate: ``_capabilities``, ``_uri_builders``,
+    and ``_context_resolvers``. Snapshot all three and restore on teardown
+    so future ``register_handlers`` calls (or changes to the method itself)
+    can't leak into unrelated tests via execution order.
+    """
+    snapshot_attrs = ("_connectors", "_metadata", "_capabilities", "_uri_builders", "_context_resolvers")
+    snapshots = {
+        attr: {k: (set(v) if isinstance(v, set) else v) for k, v in getattr(connector_registry, attr).items()}
+        for attr in snapshot_attrs
+    }
+    connector_registry.register_handlers("starrocks", capabilities={"catalog", "database"})
+    connector_registry.register_handlers("postgres", capabilities={"database", "schema"})
+    connector_registry.register_handlers("snowflake", capabilities={"database", "schema"})
+    try:
+        yield
+    finally:
+        for attr, saved in snapshots.items():
+            live = getattr(connector_registry, attr)
+            live.clear()
+            live.update(saved)
+
+
+class TestExtractDDLTarget:
+    def test_basic_create_table(self):
+        t = extract_ddl_target("CREATE TABLE staging.users (id INT)", "main")
+        # No active database and the SQL names no database → database is empty, NOT the
+        # datasource name "main" (which is not a physical database).
+        assert t == TableTarget(datasource="main", database="", db_schema="staging", table="users")
+
+    def test_if_not_exists(self):
+        t = extract_ddl_target("CREATE TABLE IF NOT EXISTS orders (id INT)", "main")
+        assert t == TableTarget(datasource="main", database="", table="orders")
+
+    def test_create_or_replace(self):
+        t = extract_ddl_target("CREATE OR REPLACE TABLE analytics.revenue (m TEXT)", "prod")
+        assert t == TableTarget(datasource="prod", database="", db_schema="analytics", table="revenue")
+
+    def test_temporary(self):
+        t = extract_ddl_target("CREATE TEMPORARY TABLE tmp_foo (x INT)", "db1")
+        assert t == TableTarget(datasource="db1", database="", table="tmp_foo")
+
+    def test_ctas(self):
+        t = extract_ddl_target(
+            "CREATE TABLE analytics.revenue_monthly AS SELECT * FROM staging.sales",
+            "db1",
+        )
+        assert t == TableTarget(datasource="db1", database="", db_schema="analytics", table="revenue_monthly")
+
+    def test_quoted_identifier(self):
+        t = extract_ddl_target('CREATE TABLE "My Schema"."My Table" (x INT)', "db1")
+        assert t == TableTarget(datasource="db1", database="", db_schema="My Schema", table="My Table")
+
+    def test_three_part_identifier_default_dialect(self):
+        """Empty dialect defaults to catalog-tier semantics (the safer bet —
+        misreading a StarRocks three-part identifier as db.schema.table made
+        validator flag real tables as missing). Leading component becomes
+        ``catalog``, middle becomes ``database``, ``db_schema`` stays None."""
+        t = extract_ddl_target("CREATE TABLE mydb.myschema.mytable (x INT)", "default_db")
+        assert t == TableTarget(catalog="mydb", datasource="default_db", database="myschema", table="mytable")
+
+    def test_three_part_identifier_starrocks_has_catalog(self):
+        """On StarRocks ``default_catalog.analytics.stats`` is
+        ``catalog.database.table`` (no schema tier). The middle component
+        must land on ``database``, not on ``schema`` — otherwise builtin
+        ``describe_table`` would query the wrong namespace and report the
+        table as missing (reviewer P2-A)."""
+        t = extract_ddl_target(
+            "CREATE TABLE default_catalog.analytics.stats (id INT)",
+            "default_db",
+            dialect="starrocks",
+        )
+        assert t == TableTarget(
+            catalog="default_catalog",
+            datasource="default_db",
+            database="analytics",
+            table="stats",
+        )
+
+    def test_three_part_identifier_postgres_no_catalog(self):
+        """On Postgres the three-part form is ``db.schema.table`` — the
+        leading component is the database, NOT a catalog. Catalog stays
+        unset so validator prompts don't render a spurious ``Catalog:``
+        line."""
+        t = extract_ddl_target(
+            "CREATE TABLE mydb.public.users (id INT)",
+            "default_db",
+            dialect="postgres",
+        )
+        assert t == TableTarget(datasource="default_db", database="mydb", db_schema="public", table="users")
+
+    def test_postgresql_alias_uses_sqlglot_postgres_dialect(self):
+        """Config uses ``postgresql`` while sqlglot calls the dialect
+        ``postgres``. Target extraction normalizes the name so a successfully
+        executed DDL does not get reported as failed after execution."""
+        t = extract_ddl_target(
+            "CREATE TABLE mydb.public.users (id INT)",
+            "default_db",
+            dialect="postgresql",
+        )
+        assert t == TableTarget(datasource="default_db", database="mydb", db_schema="public", table="users")
+
+    def test_three_part_identifier_snowflake_no_catalog(self):
+        """On Snowflake the three-part form is ``database.schema.table``."""
+        t = extract_ddl_target(
+            "CREATE TABLE SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.CUSTOMER (id INT)",
+            "my_snowflake",
+            dialect="snowflake",
+        )
+        assert t == TableTarget(
+            datasource="my_snowflake",
+            database="SNOWFLAKE_SAMPLE_DATA",
+            db_schema="TPCH_SF1",
+            table="CUSTOMER",
+        )
+
+    def test_adapter_identifier_parser_controls_two_and_three_part_names(self, monkeypatch):
+        def parser(identifier):
+            parts = identifier.split(".")
+            return {
+                "catalog_name": "",
+                "database_name": parts[0] if len(parts) > 1 else "",
+                "schema_name": parts[1] if len(parts) == 3 else "",
+                "table_name": parts[-1],
+            }
+
+        connector_registry.register_handlers("flexdb", capabilities={"database", "schema"})
+        monkeypatch.setattr(
+            connector_registry,
+            "get_parser_dialect",
+            lambda dialect: "hive" if dialect == "flexdb" else None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            connector_registry,
+            "get_identifier_parser",
+            lambda dialect: parser if dialect == "flexdb" else None,
+            raising=False,
+        )
+
+        two_level = extract_ddl_target(
+            "CREATE TABLE project_a.orders (id BIGINT)",
+            "source",
+            dialect="flexdb",
+        )
+        three_level = extract_ddl_target(
+            "CREATE TABLE project_a.analytics.orders (id BIGINT)",
+            "source",
+            dialect="flexdb",
+        )
+
+        assert two_level == TableTarget(datasource="source", database="project_a", table="orders")
+        assert three_level == TableTarget(
+            datasource="source",
+            database="project_a",
+            db_schema="analytics",
+            table="orders",
+        )
+
+    def test_two_part_identifier_catalog_is_none(self):
+        """Two-part ``schema.table`` leaves catalog unset."""
+        t = extract_ddl_target("CREATE TABLE analytics.users (x INT)", "db1")
+        assert t == TableTarget(datasource="db1", database="", db_schema="analytics", table="users")
+
+    def test_one_part_identifier_catalog_is_none(self):
+        """Bare table name leaves catalog unset."""
+        t = extract_ddl_target("CREATE TABLE users (x INT)", "db1")
+        assert t == TableTarget(datasource="db1", database="", table="users")
+
+    def test_drop_table_returns_none(self):
+        assert extract_ddl_target("DROP TABLE foo", "db1") is None
+
+    def test_alter_table_returns_none(self):
+        assert extract_ddl_target("ALTER TABLE foo ADD COLUMN x INT", "db1") is None
+
+    def test_create_schema_returns_none(self):
+        assert extract_ddl_target("CREATE SCHEMA foo", "db1") is None
+
+    def test_create_view_returns_none(self):
+        """Views aren't targets we can run row-count checks against."""
+        assert extract_ddl_target("CREATE VIEW v AS SELECT 1", "db1") is None
+
+    def test_parser_error_returns_none(self):
+        assert extract_ddl_target("not valid sql at all", "db1") is None
+
+    def test_empty_returns_none(self):
+        assert extract_ddl_target("", "db1") is None
+        assert extract_ddl_target("   ", "db1") is None
+
+
+class TestExtractDMLTarget:
+    def test_insert(self):
+        t = extract_dml_target("INSERT INTO staging.users (id) VALUES (1)", "main")
+        assert t == TableTarget(datasource="main", database="", db_schema="staging", table="users")
+
+    def test_update(self):
+        t = extract_dml_target("UPDATE orders SET status = 'done' WHERE id = 1", "db")
+        assert t == TableTarget(datasource="db", database="", table="orders")
+
+    def test_delete(self):
+        t = extract_dml_target("DELETE FROM orders WHERE id = 1", "db")
+        assert t == TableTarget(datasource="db", database="", table="orders")
+
+    def test_select_returns_none(self):
+        """SELECT is not a mutating tool — no target."""
+        assert extract_dml_target("SELECT * FROM t", "db") is None
+
+    def test_parser_error_returns_none(self):
+        assert extract_dml_target("invalid", "db") is None

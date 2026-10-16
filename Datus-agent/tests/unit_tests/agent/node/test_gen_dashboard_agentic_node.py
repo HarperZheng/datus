@@ -1,0 +1,1339 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Unit tests for GenDashboardAgenticNode.
+
+Tests cover:
+- Node creation with/without bi_platform config
+- Tools setup (BI tools only, no DB tools exposed)
+- Auto-detect single platform from dashboard_config
+- Max turns configuration
+- Node name
+- Graceful handling when no BI config present
+
+Design principle: NO mock except LLM + datus_bi_core (optional package).
+- Real AgentConfig (from conftest `real_agent_config`)
+- Real SQLite database (california_schools.sqlite)
+- Mock datus_bi_core (optional dependency, not available in CI)
+- The ONLY LLM mock: LLMBaseModel.create_model -> MockLLMModel (via `mock_llm_create`)
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from datus.configuration.agent_config import DashboardConfig, DatasetDbConfig
+from datus.tools.skill_tools.skill_config import SkillConfig
+
+# ---- Minimal stubs for datus_bi_core (so tests run without the package) ----
+
+
+class _AuthParam:
+    def __init__(self, **kwargs):
+        pass
+
+
+class _DashboardInfo:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def model_dump(self):
+        return self.__dict__
+
+
+class _ChartInfo:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def model_dump(self):
+        return self.__dict__
+
+
+class _DatasetInfo:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def model_dump(self):
+        return self.__dict__
+
+
+class _ChartDataResult:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def model_dump(self):
+        return self.__dict__
+
+
+class MockDashboardWriteMixin:
+    pass
+
+
+class MockChartWriteMixin:
+    pass
+
+
+class MockDatasetWriteMixin:
+    pass
+
+
+class FullMockAdapter(MockDashboardWriteMixin, MockChartWriteMixin, MockDatasetWriteMixin):
+    """Mock adapter implementing all mixins."""
+
+    supports_chart_data = True
+
+    def list_dashboards(self, search="", page_size=20):
+        return [_DashboardInfo(id=1, name="Test Dashboard")]
+
+    def get_dashboard_info(self, dashboard_id):
+        return _DashboardInfo(id=dashboard_id, name="Test", description="", chart_ids=[])
+
+    def list_charts(self, dashboard_id):
+        return [_ChartInfo(id=1, name="Chart 1", chart_type="bar")]
+
+    def list_datasets(self, dashboard_id=""):
+        return [_DatasetInfo(id=1, name="orders", dialect="postgresql")]
+
+    def get_chart(self, chart_id, dashboard_id=None):
+        return _ChartInfo(id=chart_id, name="Test Chart", chart_type="bar")
+
+    def get_chart_data(self, chart_id, dashboard_id=None, limit=None):
+        rows = [{"category": "A", "value": 10}]
+        return _ChartDataResult(
+            chart_id=chart_id,
+            columns=["category", "value"],
+            rows=rows,
+            row_count=len(rows),
+            sql="SELECT category, value FROM orders",
+            extra={},
+        )
+
+    def create_dashboard(self, spec):
+        return _DashboardInfo(id=10, name=spec.title)
+
+    def update_dashboard(self, dashboard_id, spec):
+        return _DashboardInfo(id=dashboard_id, name=spec.title)
+
+    def delete_dashboard(self, dashboard_id):
+        return True
+
+    def create_chart(self, spec, dashboard_id=None):
+        return _ChartInfo(id=5, name=spec.title, chart_type=spec.chart_type)
+
+    def update_chart(self, chart_id, spec):
+        return _ChartInfo(id=chart_id, name=spec.title, chart_type=spec.chart_type)
+
+    def delete_chart(self, chart_id):
+        return True
+
+    def add_chart_to_dashboard(self, dashboard_id, chart_id):
+        return True
+
+    def create_dataset(self, spec):
+        return _DatasetInfo(id=3, name=spec.name, dialect="postgresql")
+
+    def delete_dataset(self, dataset_id):
+        return True
+
+    def list_bi_databases(self):
+        return [{"id": 1, "name": "PostgreSQL"}]
+
+
+class ReadOnlyMockAdapter:
+    """Mock adapter with only read operations (no write mixins)."""
+
+    supports_chart_data = False
+
+    def list_dashboards(self, search="", page_size=20):
+        return []
+
+    def get_dashboard_info(self, dashboard_id):
+        return _DashboardInfo(id=dashboard_id, name="Read Only")
+
+    def list_charts(self, dashboard_id):
+        return []
+
+    def get_chart(self, chart_id, dashboard_id=None):
+        return None
+
+    def list_datasets(self, dashboard_id=""):
+        return []
+
+
+# ---- Build a mock datus_bi_core module ----
+
+_bi_core_mock = MagicMock()
+_bi_core_mock.AuthParam = _AuthParam
+_bi_core_mock.DashboardWriteMixin = MockDashboardWriteMixin
+_bi_core_mock.ChartWriteMixin = MockChartWriteMixin
+_bi_core_mock.DatasetWriteMixin = MockDatasetWriteMixin
+_bi_core_mock.adapter_registry = MagicMock()
+
+
+class _MockChartSpec:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _MockDatasetSpec:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _MockDashboardSpec:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+_bi_core_mock.models.ChartSpec = _MockChartSpec
+_bi_core_mock.models.DatasetSpec = _MockDatasetSpec
+_bi_core_mock.models.DashboardSpec = _MockDashboardSpec
+
+_BI_MODULES_PATCH = {
+    "datus_bi_core": _bi_core_mock,
+    "datus_bi_core.models": _bi_core_mock.models,
+}
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_SKILLS_DIR = _REPO_ROOT / "datus" / "resources" / "skills"
+
+
+# ---- Helper: add dashboard config to agent_config ----
+
+
+def _add_dashboard_config(agent_config, platform="superset"):
+    """Add dashboard config and gen_dashboard agentic node config to an AgentConfig."""
+    agent_config.dashboard_config[platform] = DashboardConfig(
+        platform=platform,
+        api_base_url="http://localhost:8088",
+        username="admin",
+        password="admin",
+        extra={"provider": "db"},
+    )
+    agent_config.agentic_nodes["gen_dashboard"] = {
+        "system_prompt": "gen_dashboard",
+        "bi_platform": platform,
+        "max_turns": 25,
+    }
+    # Make adapter_registry.get() return FullMockAdapter
+    _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+
+
+# ---------------------------------------------------------------------------
+# Initialization Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardAgenticNodeInit:
+    """Tests for GenDashboardAgenticNode initialization."""
+
+    def test_node_name(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.NODE_NAME == "gen_dashboard"
+            assert node.get_node_name() == "gen_dashboard"
+
+    def test_inherits_agentic_node(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.agentic_node import AgenticNode
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert isinstance(node, AgenticNode)
+
+    def test_node_id(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.id == "gen_dashboard_node"
+
+    def test_scope_is_preserved(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow", scope="team-a")
+            assert node.scope == "team-a"
+
+    def test_max_turns_from_config(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.max_turns == 25
+
+    def test_max_turns_default(self, real_agent_config, mock_llm_create):
+        """Default max_turns is 50 when gen_dashboard not in agentic_nodes."""
+        # Add dashboard config but no gen_dashboard agentic node
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+        )
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.max_turns == 50
+
+
+# ---------------------------------------------------------------------------
+# Tool Setup Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardToolSetup:
+    """Tests for tool setup — BI tools only, no DB tools exposed."""
+
+    def test_has_bi_tools_with_full_adapter(self, real_agent_config, mock_llm_create):
+        """Full adapter should expose all BI tools (read + write)."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+
+            # Read tools (always present)
+            assert "list_dashboards" in tool_names
+            assert "get_dashboard" in tool_names
+            assert "list_charts" in tool_names
+            assert "get_chart" in tool_names
+            assert "get_chart_data" in tool_names
+            assert "list_datasets" in tool_names
+
+            # Write tools (from full adapter mixins)
+            assert "create_dashboard" in tool_names
+            assert "create_chart" in tool_names
+            assert "create_dataset" in tool_names
+
+    def test_no_db_tools_exposed(self, real_agent_config, mock_llm_create):
+        """DB and subagent tools should NOT be in tools list."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+
+            assert "list_tables" not in tool_names
+            assert "describe_table" not in tool_names
+            assert "read_query" not in tool_names
+            assert "get_table_ddl" not in tool_names
+            assert "task" not in tool_names
+
+    def test_no_filesystem_tools(self, real_agent_config, mock_llm_create):
+        """Filesystem tools should NOT be in tools list."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+
+            assert "read_file" not in tool_names
+            assert "write_file" not in tool_names
+
+    def test_read_only_adapter_fewer_tools(self, real_agent_config, mock_llm_create):
+        """Read-only adapter should only expose read tools."""
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+        )
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 25,
+        }
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: ReadOnlyMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+
+            # Read tools present
+            assert "list_dashboards" in tool_names
+            assert "get_dashboard" in tool_names
+            assert "get_chart" in tool_names
+
+            # Write tools absent
+            assert "create_dashboard" not in tool_names
+            assert "create_chart" not in tool_names
+            assert "create_dataset" not in tool_names
+
+    def test_no_bi_config_no_bi_tools(self, real_agent_config, mock_llm_create):
+        """Without BI config, node should have 0 BI tools (graceful no-op)."""
+        # No dashboard_config, no bi_platform — just the default real_agent_config
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+
+            assert "list_dashboards" not in tool_names
+            assert "create_dashboard" not in tool_names
+
+    def test_import_error_yields_no_tools(self, real_agent_config, mock_llm_create):
+        """When datus_bi_core import fails, node should have no BI tools."""
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+        )
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 25,
+        }
+        # Setting sys.modules["datus_bi_core"] = None causes import to raise ImportError
+        with patch.dict(sys.modules, {"datus_bi_core": None}):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert "list_dashboards" not in [t.name for t in node.tools]
+
+
+# ---------------------------------------------------------------------------
+# Permission Hook Wiring Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardPermissionWiring:
+    """Without proper wiring ``bi_tools.delete_*`` DENY rules silently leak."""
+
+    def test_tool_registry_registers_bi_tools(self, real_agent_config, mock_llm_create):
+        """Every BI tool must land in the ``bi_tools`` category.
+
+        Falling back to the ``tools`` catch-all would prevent
+        ``bi_tools.delete_*`` DENY rules in the ``normal`` profile from
+        matching ``delete_chart`` / ``delete_dataset`` — the exact bug that
+        leaked destructive calls to Superset in production.
+        """
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node._populate_tool_registry()
+            registry = node.tool_registry.to_dict()
+            for name in ("delete_chart", "delete_dataset", "delete_dashboard"):
+                assert registry.get(name) == "bi_tools"
+
+    def test_compose_hooks_yields_permission_hooks(self, real_agent_config, mock_llm_create):
+        """``generate_with_tools_stream`` must receive a real hook, not None.
+
+        A ``None`` hook means the permission_manager never intercepts tool
+        calls — rules defined in the profile are effectively ignored.
+
+        Workflow mode now also wires the token-usage hook (multi-turn history is
+        enabled for all modes), so ``_compose_hooks`` may return a
+        ``CompositeHooks`` bundle. Validate the permission gate on the node.
+        """
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+            from datus.tools.permission.permission_hooks import CompositeHooks, PermissionHooks
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            hooks = node._compose_hooks()
+            # Workflow mode wires permission + compact + token_usage hooks, so the
+            # result must be a CompositeHooks bundle, and the permission gate must
+            # be a real PermissionHooks (not None, not some other hook type).
+            assert isinstance(hooks, CompositeHooks)
+            assert isinstance(node.permission_hooks, PermissionHooks)
+
+    def test_tool_registry_routes_delete_chart_to_bi_tools(self, real_agent_config, mock_llm_create):
+        """After ``_ensure_permission_hooks`` runs, registry must classify ``delete_chart``.
+
+        ``PermissionHooks._get_category_and_pattern`` looks up tool names in
+        the registry; without this category mapping all BI tools fall into
+        the generic ``tools`` bucket and profile rules under ``bi_tools``
+        can never match.
+        """
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node._ensure_permission_hooks()
+            assert node.tool_registry.get("delete_chart") == "bi_tools"
+            assert node.tool_registry.get("delete_dataset") == "bi_tools"
+            assert node.tool_registry.get("list_dashboards") == "bi_tools"
+
+    def test_no_denied_tools_injected_into_prompt(self, real_agent_config, mock_llm_create):
+        """The prompt must NOT list DENY'd tool names.
+
+        An earlier iteration injected a ``<denied_tools>`` block that spelled
+        out ``delete_chart`` / ``delete_dataset`` — that's leaky prompt
+        engineering and duplicates work the permission layer should do at
+        runtime. Keep the system prompt profile-agnostic.
+        """
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        real_agent_config.active_profile_name = "normal"
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._finalize_system_prompt("base prompt")
+            assert "<denied_tools>" not in prompt
+            assert "bi_tools.delete_chart" not in prompt
+
+    def test_template_does_not_instruct_ask_user_before_delete(self, real_agent_config, mock_llm_create):
+        """Permission profile owns destructive confirmation — the template
+        should NOT tell the LLM to ``ask_user`` before every delete.
+
+        When both layers ask, users see two prompts for the same operation
+        (LLM ``ask_user`` confirmation + permission ASK) — or in ``normal``
+        they confirm via ``ask_user`` only for the delete to hard-fail
+        afterwards. Remove the rule entirely.
+        """
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+            assert "Always confirm with the user before deleting" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Auto-detect Platform Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardAutoDetect:
+    """Tests for auto-detecting bi_platform from dashboard_config."""
+
+    def test_auto_detect_single_platform(self, real_agent_config, mock_llm_create):
+        """When only one platform in dashboard_config and no explicit bi_platform, auto-detect it."""
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+        )
+        # agentic_nodes.gen_dashboard WITHOUT bi_platform
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "max_turns": 25,
+        }
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            tool_names = [tool.name for tool in node.tools]
+            # Should have BI tools via auto-detection
+            assert "list_dashboards" in tool_names
+
+    def test_multiple_platforms_without_explicit_yields_no_tools(self, real_agent_config, mock_llm_create):
+        """When multiple platforms configured and no explicit bi_platform, no tools should be set up."""
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+        )
+        real_agent_config.dashboard_config["grafana"] = DashboardConfig(
+            platform="grafana",
+            api_base_url="http://localhost:3000",
+            username="admin",
+            password="admin",
+        )
+        real_agent_config.agentic_nodes["gen_dashboard"] = {"system_prompt": "gen_dashboard", "max_turns": 25}
+        # No bi_platform set
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert "list_dashboards" not in [t.name for t in node.tools]
+
+    def test_explicit_platform_no_matching_config_yields_no_tools(self, real_agent_config, mock_llm_create):
+        """When bi_platform is explicitly set but no matching dashboard_config entry, no tools should be set up."""
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "grafana",
+            "max_turns": 25,
+        }
+        # dashboard_config has no "grafana"
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert "list_dashboards" not in [t.name for t in node.tools]
+
+
+# ---------------------------------------------------------------------------
+# Registration Coverage Tests (node.py, node_type.py, sub_agent_task_tool.py)
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardRegistration:
+    """Tests covering the registration code paths in existing files."""
+
+    def test_node_type_input(self):
+        """NodeType.type_input should return GenDashboardNodeInput for TYPE_GEN_DASHBOARD."""
+        from datus.configuration.node_type import NodeType
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+
+        result = NodeType.type_input(NodeType.TYPE_GEN_DASHBOARD, {"user_message": "test"})
+        assert isinstance(result, GenDashboardNodeInput)
+        assert result.user_message == "test"
+
+    def test_node_type_input_optional(self):
+        """NodeType.type_input with ignore_require_check should accept empty input."""
+        from datus.configuration.node_type import NodeType
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+
+        result = NodeType.type_input(NodeType.TYPE_GEN_DASHBOARD, {}, ignore_require_check=True)
+        assert isinstance(result, GenDashboardNodeInput)
+        assert result.database is None
+
+    def test_sub_agent_build_node_input(self, real_agent_config, mock_llm_create):
+        """SubAgentTaskTool._build_node_input should return GenDashboardNodeInput."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+            from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+            from datus.tools.func_tool.sub_agent_task_tool import SubAgentTaskTool
+
+            tool = SubAgentTaskTool(agent_config=real_agent_config)
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            result = tool._build_node_input(node, "List all dashboards")
+            assert isinstance(result, GenDashboardNodeInput)
+            assert result.user_message == "List all dashboards"
+            # ``database`` is a physical-database context field, not a datasource slot; the
+            # builder leaves it unset rather than mislabeling it with current_datasource.
+            assert result.database is None
+
+
+# ---------------------------------------------------------------------------
+# execute_stream Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardExecuteStream:
+    """Tests for execute_stream method."""
+
+    @pytest.mark.asyncio
+    async def test_execute_stream_raises_without_input(self, real_agent_config, mock_llm_create):
+        """execute_stream should raise DatusException when self.input is None."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+            from datus.utils.exceptions import DatusException
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.input is None
+
+            with pytest.raises(DatusException):
+                async for _ in node.execute_stream():
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_execute_stream_happy_path(self, real_agent_config, mock_llm_create):
+        """execute_stream should yield actions and produce a successful result."""
+        from datus.schemas.action_history import ActionHistoryManager, ActionRole, ActionStatus
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+        from tests.unit_tests.mock_llm_model import build_simple_response
+
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node.input = GenDashboardNodeInput(user_message="List dashboards")
+
+            mock_llm_create.reset(responses=[build_simple_response("Here are your dashboards: ...")])
+
+            ahm = ActionHistoryManager()
+            actions = []
+            async for action in node.execute_stream(ahm):
+                actions.append(action)
+
+            assert len(actions) >= 2  # At least user action + final action
+            # First action is user input
+            assert actions[0].role == ActionRole.USER
+            # Last action should be success
+            assert actions[-1].status == ActionStatus.SUCCESS
+            assert actions[-1].action_type == "gen_dashboard_response"
+
+    @pytest.mark.asyncio
+    async def test_execute_stream_error_handling(self, real_agent_config, mock_llm_create):
+        """execute_stream should yield error action on exception."""
+        from datus.schemas.action_history import ActionHistoryManager, ActionStatus
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node.input = GenDashboardNodeInput(user_message="Create dashboard")
+
+            # Force an error in the model
+            mock_llm_create.reset(responses=[])
+            with patch.object(node.model, "generate_with_tools_stream", side_effect=RuntimeError("LLM unavailable")):
+                ahm = ActionHistoryManager()
+                actions = []
+                async for action in node.execute_stream(ahm):
+                    actions.append(action)
+
+                assert actions[-1].status == ActionStatus.FAILED
+                assert actions[-1].action_type == "error"
+
+    @pytest.mark.asyncio
+    async def test_execute_stream_propagates_execution_interrupted(self, real_agent_config, mock_llm_create):
+        """execute_stream should propagate ExecutionInterrupted without catching it."""
+        from datus.cli.execution_state import ExecutionInterrupted
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node.input = GenDashboardNodeInput(user_message="Create dashboard")
+            with patch.object(node.model, "generate_with_tools_stream", side_effect=ExecutionInterrupted()):
+                with pytest.raises(ExecutionInterrupted):
+                    async for _ in node.execute_stream():
+                        pass
+
+
+@pytest.mark.acceptance
+@pytest.mark.llm_harness
+class TestGenDashboardProductFlowAcceptance:
+    """Deterministic coverage for BI dashboard write workflow wiring."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_creates_dashboard_dataset_and_chart(self, real_agent_config, mock_llm_create):
+        from datus.schemas.action_history import ActionHistoryManager, ActionStatus
+        from datus.schemas.gen_dashboard_agentic_node_models import GenDashboardNodeInput
+        from tests.unit_tests.mock_llm_model import MockToolCall, build_tool_then_response
+
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            node.input = GenDashboardNodeInput(
+                user_message="Create a SAT score dashboard with one reading score chart.",
+                database="california_schools",
+            )
+            mock_llm_create.reset(
+                responses=[
+                    build_tool_then_response(
+                        tool_calls=[
+                            MockToolCall(
+                                "create_dashboard",
+                                {
+                                    "title": "SAT Score Dashboard",
+                                    "description": "School SAT score summary",
+                                },
+                            ),
+                            MockToolCall(
+                                "create_dataset",
+                                {
+                                    "name": "satscores_dataset",
+                                    "database_id": "1",
+                                    "sql": "SELECT cds, AvgScrRead FROM satscores",
+                                },
+                            ),
+                            MockToolCall(
+                                "create_chart",
+                                {
+                                    "chart_type": "bar",
+                                    "title": "Average Reading Score",
+                                    "dataset_id": "3",
+                                    "metrics": "AVG(AvgScrRead)",
+                                    "dimensions": "cds",
+                                    "dashboard_id": "10",
+                                },
+                            ),
+                        ],
+                        content="Created the SAT score dashboard with a reading score chart.",
+                    )
+                ]
+            )
+
+            ahm = ActionHistoryManager()
+            actions = []
+            async for action in node.execute_stream(ahm):
+                actions.append(action)
+
+        executed_tools = [item["tool"] for item in mock_llm_create.tool_results if item["executed"]]
+        assert executed_tools == ["create_dashboard", "create_dataset", "create_chart"]
+        result_by_tool = {item["tool"]: item["output"]["result"] for item in mock_llm_create.tool_results}
+        assert result_by_tool["create_dashboard"]["id"] == 10
+        assert result_by_tool["create_dataset"]["id"] == 3
+        assert result_by_tool["create_chart"]["id"] == 5
+        assert actions[-1].status == ActionStatus.SUCCESS
+        assert actions[-1].output["success"] is True
+        assert "reading score chart" in actions[-1].output["response"]
+
+
+# ---------------------------------------------------------------------------
+# Template Context Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenDashboardTemplateContext:
+    """Tests for _prepare_template_context and _get_system_prompt."""
+
+    def test_context_with_full_adapter(self, real_agent_config, mock_llm_create):
+        """Full adapter should set all has_*_write flags to True and report the platform."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            ctx = node._prepare_template_context()
+            assert ctx["has_dashboard_write"] is True
+            assert ctx["has_chart_write"] is True
+            assert ctx["has_dataset_write"] is True
+            assert ctx["bi_platform"] == "superset"
+
+    def test_context_without_bi_tools(self, real_agent_config, mock_llm_create):
+        """Without BI config, all has_*_write flags should be False."""
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            ctx = node._prepare_template_context()
+            assert ctx["has_dashboard_write"] is False
+            assert ctx["has_chart_write"] is False
+            assert ctx["has_dataset_write"] is False
+            assert ctx["has_bi_tools"] is False
+            # No platform resolved → no attempt to build adapter → no error captured.
+            assert ctx["bi_setup_error"] is None
+
+    def test_bi_setup_error_captured_on_adapter_failure(self, real_agent_config, mock_llm_create):
+        """Adapter construction failure (e.g. version mismatch) is captured, not swallowed."""
+        _add_dashboard_config(real_agent_config)
+
+        def _raise_boom(**kwargs):
+            raise RuntimeError("version mismatch: PaginatedResult not exported")
+
+        _bi_core_mock.adapter_registry.get.return_value = _raise_boom
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.bi_func_tool is None
+            assert "superset" in node._bi_setup_error
+            assert "version mismatch" in node._bi_setup_error
+
+            ctx = node._prepare_template_context()
+            assert ctx["has_bi_tools"] is False
+            assert ctx["bi_setup_error"] == node._bi_setup_error
+
+    def test_bi_setup_error_captured_on_import_error(self, real_agent_config, mock_llm_create):
+        """ImportError also captures a user-facing error message."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, {"datus_bi_core": None}):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.bi_func_tool is None
+            assert "not installed" in node._bi_setup_error
+            assert "superset" in node._bi_setup_error
+
+    def test_system_prompt_warns_when_bi_setup_failed(self, real_agent_config, mock_llm_create):
+        """Rendered prompt surfaces the failure so the LLM can tell the user."""
+        _add_dashboard_config(real_agent_config)
+
+        def _raise_boom(**kwargs):
+            raise RuntimeError("adapter construction blew up")
+
+        _bi_core_mock.adapter_registry.get.return_value = _raise_boom
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+            assert "BI Platform Unavailable" in prompt
+            assert "adapter construction blew up" in prompt
+            # Should NOT tell the model to load bi-validation when no skills are loaded.
+            assert "Post-Creation Validation" not in prompt
+
+    def test_system_prompt_omits_validation_when_readonly(self, real_agent_config, mock_llm_create):
+        """Read-only adapter (no write tools) → Post-Creation Validation section is suppressed."""
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: ReadOnlyMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+            assert "Post-Creation Validation" not in prompt
+            # bi-validation must not be hard-referenced outside <available_skills>.
+            # It may still appear as an example inside the removed block — so guard
+            # specifically against the old mandatory wording.
+            assert 'load_skill(skill_name="bi-validation")' not in prompt
+
+    def test_system_prompt_omits_write_query_references(self, real_agent_config, mock_llm_create):
+        """write_query no longer exists as a tool. The prompt must not mention
+        it as either mandatory or optional."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+            assert "write_query" not in prompt
+            assert "ad_hoc_materialization" not in prompt
+
+
+class TestGenDashboardPromptBoundary:
+    """``gen_dashboard`` only builds BI assets over existing serving data."""
+
+    def test_system_prompt_advertises_existing_data_boundary(self, real_agent_config, mock_llm_create):
+        real_agent_config.dashboard_config["superset"] = DashboardConfig(
+            platform="superset",
+            api_base_url="http://localhost:8088",
+            username="admin",
+            password="admin",
+            dataset_db=DatasetDbConfig(datasource_ref="california_schools"),
+        )
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 25,
+        }
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+
+        assert "Workflow" in prompt
+        assert "already exists in a BI-registered database" in prompt
+        assert "never dispatches data-preparation subagents" in prompt
+        assert "dashboard-build-pipeline" not in prompt
+        assert "task(gen_job" not in prompt
+
+    def test_system_prompt_keeps_bi_database_name_rule(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+
+        assert "bi_database_name" in prompt
+
+    def test_system_prompt_guides_dashboard_composition(self, real_agent_config, mock_llm_create):
+        _add_dashboard_config(real_agent_config)
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            prompt = node._get_system_prompt(template_context=node._prepare_template_context())
+
+        assert "Dashboard Composition Guide" in prompt
+        assert "KPI overview" in prompt
+        assert "Time trend" in prompt
+        assert "Breakdown / ranking" in prompt
+        assert "Do not use a fixed chart count" in prompt
+        assert "as many charts as the business" in prompt
+        assert "same question" in prompt
+
+
+class TestPlatformSkillTrim:
+    """The per-platform skills (superset-dashboard, grafana-dashboard) must no
+    longer tell the model to use ``write_query`` — data movement is outside
+    ``gen_dashboard``'s scope now."""
+
+    def _skill_body(self, name):
+        import pathlib
+
+        project_root = pathlib.Path(__file__).resolve().parents[4]
+        return (project_root / "datus" / "resources" / "skills" / name / "SKILL.md").read_text()
+
+    def test_superset_dashboard_skill_has_no_write_query_step(self):
+        body = self._skill_body("superset-dashboard")
+        assert "write_query" not in body
+
+    def test_grafana_dashboard_skill_has_no_write_query_step(self):
+        body = self._skill_body("grafana-dashboard")
+        assert "write_query" not in body
+
+    def test_superset_dashboard_skill_guides_chart_organization(self):
+        body = self._skill_body("superset-dashboard")
+        assert "Dashboard design defaults" in body
+        assert "Plan Dashboard Layout Before Creating Charts" in body
+        assert "Before calling `create_dashboard`, `create_chart`, or" in body
+        assert "Row grouping" in body
+        assert "Create charts in this visual order" in body
+        assert "top 10-15 values" in body
+        assert "Avoid one chart per column" in body
+        assert "Do not use a fixed chart count" in body
+
+    def test_grafana_dashboard_skill_guides_panel_organization(self):
+        body = self._skill_body("grafana-dashboard")
+        assert "Plan Dashboard Layout Before Creating Panels" in body
+        assert "Before calling `create_dashboard` or `create_chart`" in body
+        assert "Row grouping" in body
+        assert "creation order" in body
+        assert "KPI overview" in body
+        assert "top 10-15 values" in body
+        assert "Avoid one panel per column" in body
+        assert "Do not use a fixed panel" in body
+
+
+class TestGenDashboardSkillContext:
+    """Tests for gen_dashboard skill exposure and prompt finalization."""
+
+    def test_superset_node_exposes_platform_skill_but_hides_validator(self, real_agent_config, mock_llm_create):
+        """Superset nodes expose the platform workflow skill in the main agent prompt,
+        but the validator (``bi-validation`` has ``kind: validator``) is hidden
+        from the main agent and consumed by ValidationHook instead."""
+        _add_dashboard_config(real_agent_config)
+        real_agent_config.skills_config = SkillConfig(directories=[str(_SKILLS_DIR)])
+
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+
+            assert node.node_config["skills"] == "superset-dashboard"
+
+            prompt = node._finalize_system_prompt("base prompt")
+            tool_names = [tool.name for tool in node.tools]
+
+            assert "load_skill" in tool_names
+            assert "<available_skills>" in prompt
+            assert 'skill name="superset-dashboard"' in prompt
+            # Validator is hidden from the main agent (but still reachable via
+            # ``registry.get_validators`` for ValidationHook).
+            assert 'skill name="bi-validation"' not in prompt
+            assert 'skill name="grafana-dashboard"' not in prompt
+
+            # Validator is discoverable for ValidationHook.
+            registry = node.skill_manager.registry
+            validator_names = [s.name for s in registry.get_validators("gen_dashboard")]
+            assert "bi-validation" in validator_names
+
+    def test_grafana_node_exposes_platform_skill_but_hides_validator(self, real_agent_config, mock_llm_create):
+        """Grafana nodes expose the platform workflow skill but filter the validator."""
+        real_agent_config.dashboard_config["grafana"] = DashboardConfig(
+            platform="grafana",
+            api_base_url="http://localhost:3000",
+            api_key="test-api-key",
+        )
+        real_agent_config.agentic_nodes["gen_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "grafana",
+            "max_turns": 25,
+        }
+        real_agent_config.skills_config = SkillConfig(directories=[str(_SKILLS_DIR)])
+        _bi_core_mock.adapter_registry.get.return_value = lambda **kwargs: FullMockAdapter()
+
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+
+            assert node.node_config["skills"] == "grafana-dashboard"
+
+            prompt = node._finalize_system_prompt("base prompt")
+            assert 'skill name="grafana-dashboard"' in prompt
+            # Validator hidden from the main agent.
+            assert 'skill name="bi-validation"' not in prompt
+            assert 'skill name="superset-dashboard"' not in prompt
+
+    def test_existing_skill_filters_are_preserved_when_dashboard_skills_are_injected(
+        self, real_agent_config, mock_llm_create
+    ):
+        """Platform-specific dashboard skills should be appended instead of replacing existing filters."""
+        _add_dashboard_config(real_agent_config)
+        real_agent_config.agentic_nodes["gen_dashboard"]["skills"] = "tenant-*, custom-skill"
+        real_agent_config.skills_config = SkillConfig(directories=[str(_SKILLS_DIR)])
+
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+
+            assert node.node_config["skills"] == "tenant-*, custom-skill, superset-dashboard"
+
+
+# ---------------------------------------------------------------------------
+# Custom node_name Tests (P2-2: alias subagent config lookup)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ci
+class TestGenDashboardCustomNodeName:
+    """Tests for custom node_name support (e.g. my_dashboard: {node_class: gen_dashboard})."""
+
+    def test_default_node_name(self, real_agent_config, mock_llm_create):
+        """Without node_name, get_node_name() returns NODE_NAME."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            assert node.get_node_name() == "gen_dashboard"
+
+    def test_custom_node_name(self, real_agent_config, mock_llm_create):
+        """With node_name, get_node_name() returns the custom name."""
+        _add_dashboard_config(real_agent_config)
+        # Add custom alias config
+        real_agent_config.agentic_nodes["my_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 15,
+        }
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(
+                agent_config=real_agent_config, execution_mode="workflow", node_name="my_dashboard"
+            )
+            assert node.get_node_name() == "my_dashboard"
+            assert node.max_turns == 15
+
+    def test_custom_node_name_reads_own_config(self, real_agent_config, mock_llm_create):
+        """Custom node_name should read its own agentic_nodes config, not the builtin one."""
+        _add_dashboard_config(real_agent_config)  # gen_dashboard max_turns=25
+        real_agent_config.agentic_nodes["analytics_dash"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 50,
+        }
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(
+                agent_config=real_agent_config, execution_mode="workflow", node_name="analytics_dash"
+            )
+            assert node.max_turns == 50  # from analytics_dash, not gen_dashboard's 25
+
+    def test_alias_system_prompt_template_name(self, real_agent_config, mock_llm_create):
+        """Alias config should be able to choose its own prompt template."""
+        _add_dashboard_config(real_agent_config)
+        real_agent_config.agentic_nodes["sales_dashboard"] = {
+            "system_prompt": "gen_dashboard",
+            "bi_platform": "superset",
+            "max_turns": 15,
+        }
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            with patch("datus.prompts.prompt_manager.get_prompt_manager") as mock_pm:
+                mock_pm.return_value.render_template.return_value = "test prompt"
+                node = GenDashboardAgenticNode(
+                    agent_config=real_agent_config, execution_mode="workflow", node_name="sales_dashboard"
+                )
+                node._get_system_prompt()
+                call_kwargs = mock_pm.return_value.render_template.call_args.kwargs
+                assert call_kwargs["template_name"] == "gen_dashboard_system"
+
+                mock_pm.return_value.render_template.reset_mock()
+                real_agent_config.agentic_nodes["sales_dashboard"].pop("system_prompt")
+                node = GenDashboardAgenticNode(
+                    agent_config=real_agent_config, execution_mode="workflow", node_name="sales_dashboard"
+                )
+                node._get_system_prompt()
+                call_kwargs = mock_pm.return_value.render_template.call_args.kwargs
+                assert call_kwargs["template_name"] == "sales_dashboard_system"
+
+
+# ---------------------------------------------------------------------------
+# prompt_version passthrough Tests (P3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ci
+class TestGenDashboardPromptVersion:
+    """Tests for prompt_version passthrough from input to _get_system_prompt."""
+
+    def test_prompt_version_from_input(self, real_agent_config, mock_llm_create):
+        """Input prompt_version should override node_config prompt_version."""
+        _add_dashboard_config(real_agent_config)
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            with patch("datus.prompts.prompt_manager.get_prompt_manager") as mock_pm:
+                mock_pm.return_value.render_template.return_value = "test prompt"
+                node._get_system_prompt(prompt_version="2.0")
+                call_kwargs = mock_pm.return_value.render_template.call_args
+                version = call_kwargs.kwargs.get("version")
+                assert version == "2.0", f"Expected version '2.0', got '{version}'"
+
+    def test_prompt_version_fallback_to_config(self, real_agent_config, mock_llm_create):
+        """Without input prompt_version, should use node_config value."""
+        _add_dashboard_config(real_agent_config)
+        real_agent_config.agentic_nodes["gen_dashboard"]["prompt_version"] = "1.5"
+        with patch.dict(sys.modules, _BI_MODULES_PATCH):
+            from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+            node = GenDashboardAgenticNode(agent_config=real_agent_config, execution_mode="workflow")
+            with patch("datus.prompts.prompt_manager.get_prompt_manager") as mock_pm:
+                mock_pm.return_value.render_template.return_value = "test prompt"
+                node._get_system_prompt(prompt_version=None)
+                call_kwargs = mock_pm.return_value.render_template.call_args
+                version = call_kwargs.kwargs.get("version")
+                assert version == "1.5", f"Expected version '1.5', got '{version}'"
+
+
+# ---------------------------------------------------------------------------
+# Partial Resource Collection Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCollectCreatedResources:
+    """Tests for GenDashboardAgenticNode._collect_created_resources."""
+
+    @staticmethod
+    def _make_action(action_type, status, output=None):
+        from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+
+        return ActionHistory.create_action(
+            role=ActionRole.ASSISTANT,
+            action_type=action_type,
+            messages="",
+            input_data={},
+            output_data=output,
+            status=ActionStatus.SUCCESS if status == "success" else ActionStatus.FAILED,
+        )
+
+    def test_collects_dashboards_charts_datasets(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+        from datus.schemas.action_history import ActionHistoryManager
+
+        ahm = ActionHistoryManager()
+        ahm.add_action(self._make_action("create_dashboard", "success", {"result": {"id": 43, "name": "My Dashboard"}}))
+        ahm.add_action(self._make_action("create_chart", "success", {"result": {"id": 718, "name": "Chart A"}}))
+        ahm.add_action(self._make_action("create_chart", "success", {"result": {"id": 719, "name": "Chart B"}}))
+        ahm.add_action(self._make_action("create_dataset", "success", {"result": {"id": 103, "name": "ds1"}}))
+
+        result = GenDashboardAgenticNode._collect_created_resources(ahm)
+
+        assert len(result["dashboards"]) == 1
+        assert result["dashboards"][0]["id"] == 43
+        assert len(result["charts"]) == 2
+        assert len(result["datasets"]) == 1
+
+    def test_skips_failed_actions(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+        from datus.schemas.action_history import ActionHistoryManager
+
+        ahm = ActionHistoryManager()
+        ahm.add_action(self._make_action("create_dashboard", "success", {"result": {"id": 43, "name": "OK"}}))
+        ahm.add_action(self._make_action("create_chart", "failed", {"result": {"id": 999, "name": "Failed"}}))
+
+        result = GenDashboardAgenticNode._collect_created_resources(ahm)
+
+        assert len(result.get("dashboards", [])) == 1
+        assert "charts" not in result  # failed chart excluded, empty list stripped
+
+    def test_returns_empty_dict_when_nothing_created(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+        from datus.schemas.action_history import ActionHistoryManager
+
+        ahm = ActionHistoryManager()
+        ahm.add_action(self._make_action("list_dashboards", "success", {"result": []}))
+
+        result = GenDashboardAgenticNode._collect_created_resources(ahm)
+
+        assert result == {}
+
+    def test_handles_missing_id_in_result(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+        from datus.schemas.action_history import ActionHistoryManager
+
+        ahm = ActionHistoryManager()
+        ahm.add_action(self._make_action("create_chart", "success", {"result": {"name": "No ID"}}))
+
+        result = GenDashboardAgenticNode._collect_created_resources(ahm)
+
+        assert result == {}  # no id means not collected
+
+
+class TestSanitizeError:
+    """``_sanitize_error`` redacts credentials before the error reaches the prompt.
+
+    ``_bi_setup_error`` is rendered into the system prompt, so anything
+    that slips past this sanitizer leaks credentials into the LLM context.
+    """
+
+    def test_redacts_user_pass_in_url(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(Exception("failed at https://admin:s3cret@bi.example.com/login"))
+        assert "s3cret" not in msg
+        assert "<redacted>@" in msg
+
+    def test_redacts_key_value_query_string(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(
+            Exception("connect fail password=hunter2 other=ok api_key=ABC123")
+        )
+        assert "hunter2" not in msg
+        assert "ABC123" not in msg
+        assert "other=ok" in msg
+
+    def test_redacts_json_dict_style_password(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(Exception('body={"username": "alice", "password": "s3cret"}'))
+        assert "s3cret" not in msg
+        assert "alice" in msg
+
+    def test_redacts_bearer_authorization_header(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(Exception("401 with Authorization: Bearer eyJhbGciOi-leaked"))
+        assert "eyJhbGciOi-leaked" not in msg
+        assert "<redacted>" in msg.lower()
+
+    def test_redacts_basic_authorization_header(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(Exception("authorization: Basic dXNlcjpwYXNz"))
+        assert "dXNlcjpwYXNz" not in msg
+
+    def test_truncates_very_long_error_message(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        msg = GenDashboardAgenticNode._sanitize_error(Exception("x" * 500))
+        assert msg.endswith("...")
+        # ``Exception: `` prefix (~12 chars) + 300 body chars + ``...``.
+        assert len(msg) <= 320
+
+    def test_preserves_type_name_for_empty_message(self):
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        assert GenDashboardAgenticNode._sanitize_error(RuntimeError("")) == "RuntimeError"

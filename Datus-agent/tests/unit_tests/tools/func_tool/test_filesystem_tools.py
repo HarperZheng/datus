@@ -1,0 +1,1103 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+
+"""Unit tests for datus/tools/func_tool/filesystem_tools.py"""
+
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from datus.tools.func_tool.filesystem_tools import FilesystemConfig, FilesystemFuncTool
+from datus.tools.func_tool.fs_path_policy import PathAllowlist, PathZone
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_tool(root_path: str, *, current_node: str = "test_node") -> FilesystemFuncTool:
+    return FilesystemFuncTool(root_path=root_path, current_node=current_node)
+
+
+# ---------------------------------------------------------------------------
+# FilesystemConfig
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemConfig:
+    def test_default_root_path(self, tmp_path, monkeypatch):
+        # Production call sites always pass an explicit ``root_path`` via
+        # ``_make_filesystem_tool``; the ``os.getcwd()`` fallback only kicks
+        # in for direct construction (tests, scripts). We chdir so the
+        # assertion is deterministic regardless of where pytest was invoked.
+        monkeypatch.chdir(tmp_path)
+        cfg = FilesystemConfig()
+        assert cfg.root_path == str(tmp_path)
+
+    def test_explicit_root_path(self, tmp_path):
+        cfg = FilesystemConfig(root_path=str(tmp_path))
+        assert cfg.root_path == str(tmp_path)
+
+    def test_default_max_file_size(self):
+        cfg = FilesystemConfig()
+        assert cfg.max_file_size == 200 * 1024
+
+    def test_custom_max_file_size(self):
+        cfg = FilesystemConfig(max_file_size=1024)
+        assert cfg.max_file_size == 1024
+
+
+class TestMutationCallback:
+    def test_callback_internal_type_error_is_not_retried(self, tmp_path):
+        callback = Mock(side_effect=TypeError("callback failed"))
+        tool = FilesystemFuncTool(root_path=str(tmp_path), mutation_callback=callback)
+        target = tmp_path / "model.yml"
+
+        with pytest.raises(TypeError, match="callback failed"):
+            tool._notify_mutation(target)
+
+        callback.assert_called_once_with(target)
+
+    def test_zero_argument_callback_is_invoked_once(self, tmp_path):
+        calls = []
+
+        def callback():
+            calls.append("called")
+
+        tool = FilesystemFuncTool(root_path=str(tmp_path), mutation_callback=callback)
+        tool._notify_mutation(tmp_path / "model.yml")
+
+        assert calls == ["called"]
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - _get_safe_path
+# ---------------------------------------------------------------------------
+
+
+class TestGetSafePath:
+    """``_get_safe_path`` is the deprecated shim over ``classify_path``. It
+    returns ``None`` for EXTERNAL/HIDDEN zones so legacy callers continue to
+    see the original "out-of-sandbox" reject behavior.
+    """
+
+    def test_valid_relative_path(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool._get_safe_path("subdir/file.txt")
+        assert str(result).startswith(str(tmp_path.resolve()))
+
+    def test_path_traversal_returns_none(self, tmp_path):
+        # Escape via `..` lands in EXTERNAL → shim returns None for parity
+        # with the pre-refactor contract. The tool itself would allow the
+        # read (hook is responsible for the user prompt), but this shim
+        # exists only for the handful of external callers.
+        tool = _make_tool(str(tmp_path))
+        assert tool._get_safe_path("../../etc/passwd") is None
+
+    def test_dot_path_returns_root(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool._get_safe_path(".")
+        assert result == tmp_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - extension-agnostic access
+# ---------------------------------------------------------------------------
+
+
+class TestAnyExtensionIsAccessible:
+    """No operation gates on the file extension. Real repositories carry shell
+    scripts, Terraform, notebooks and extension-less dotfiles, and the agent
+    must be able to read back anything it can write.
+
+    The one exception is ``read_file`` on binary tabular formats, which is
+    redirected rather than refused — see :class:`TestTabularFilesRedirect`.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        ["deploy.sh", "main.tf", "app.scala", "pyproject.toml", "notebook.ipynb", "Dockerfile", ".env"],
+    )
+    def test_read_edit_delete_roundtrip(self, tmp_path, name):
+        tool = _make_tool(str(tmp_path))
+
+        assert tool.write_file(name, "token here\n").success == 1
+
+        read = tool.read_file(name)
+        assert read.success == 1
+        assert read.result == "token here\n"
+
+        assert tool.edit_file(name, "token", "value").success == 1
+        assert (tmp_path / name).read_text() == "value here\n"
+
+        assert tool.delete_file(name).success == 1
+        assert not (tmp_path / name).exists()
+
+    def test_grep_matches_non_source_extensions(self, tmp_path):
+        (tmp_path / "deploy.sh").write_text("export TARGET=prod\n")
+        (tmp_path / "main.tf").write_text('variable "TARGET" {}\n')
+        tool = _make_tool(str(tmp_path))
+
+        result = tool.grep("TARGET")
+
+        assert result.success == 1
+        files = {m["file"] for m in result.result["matches"]}
+        assert files == {"deploy.sh", "main.tf"}
+
+    def test_binary_read_still_rejected(self, tmp_path):
+        """Undecodable content is rejected by the UTF-8 guard, not by a
+        suffix whitelist — so the rejection follows the bytes, not the name."""
+        (tmp_path / "payload.bin").write_bytes(b"\xff\xfe\x00\x01")
+        tool = _make_tool(str(tmp_path))
+
+        result = tool.read_file("payload.bin")
+
+        assert result.success == 0
+        assert "binary" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - read_file
+# ---------------------------------------------------------------------------
+
+
+class TestReadFile:
+    def test_read_existing_file(self, tmp_path):
+        f = tmp_path / "hello.txt"
+        f.write_text("hello world")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("hello.txt")
+        assert result.success == 1
+        assert result.result == "hello world"
+
+    def test_read_nonexistent_file(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("nonexistent.txt")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+
+    def test_read_directory_as_file(self, tmp_path):
+        subdir = tmp_path / "mydir"
+        subdir.mkdir()
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("mydir")
+        assert result.success == 0
+        assert "not a file" in result.error.lower()
+
+    def test_read_file_too_large(self, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("x" * 100)
+        tool = _make_tool(str(tmp_path))
+        tool.config.max_file_size = 10
+        result = tool.read_file("big.txt")
+        assert result.success == 0
+        assert "too large" in result.error.lower()
+
+    def test_read_large_file_with_limit_succeeds(self, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line{i}" for i in range(1, 101)))
+        tool = _make_tool(str(tmp_path))
+        tool.config.max_file_size = 20
+        result = tool.read_file("big.txt", offset=1, limit=1)
+        assert result.success == 1
+        assert result.result == "1: line1"
+
+    def test_read_slice_too_large(self, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line{i}" for i in range(1, 101)))
+        tool = _make_tool(str(tmp_path))
+        tool.config.max_file_size = 20
+        result = tool.read_file("big.txt", offset=1, limit=50)
+        assert result.success == 0
+        assert "too large" in result.error.lower()
+
+    def test_read_file_unicode_error(self, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_bytes(b"\xff\xfe\x00\x01")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("data.txt")
+        assert result.success == 0
+
+    def test_read_file_path_traversal_classified_external(self, tmp_path):
+        """``../`` escape lands in EXTERNAL. The tool does not hard-reject
+        (the permission hook is responsible for asking the user), but the
+        zone classifier must flag it so the hook can see it.
+        """
+        tool = _make_tool(str(tmp_path))
+        resolved = tool._classify("../../etc/passwd")
+        assert resolved.zone == PathZone.EXTERNAL
+
+    def test_read_file_with_offset_and_limit(self, tmp_path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3\nline4\nline5")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("lines.txt", offset=2, limit=2)
+        assert result.success == 1
+        assert "2: line2" in result.result
+        assert "3: line3" in result.result
+        assert "line1" not in result.result
+        assert "line4" not in result.result
+
+    def test_read_file_with_offset_only(self, tmp_path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("lines.txt", offset=2)
+        assert result.success == 1
+        assert "2: line2" in result.result
+        assert "3: line3" in result.result
+        assert "1: line1" not in result.result
+
+    def test_read_file_with_limit_only(self, tmp_path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("lines.txt", limit=2)
+        assert result.success == 1
+        assert "1: line1" in result.result
+        assert "2: line2" in result.result
+        assert "line3" not in result.result
+
+    def test_read_file_no_offset_limit_returns_full(self, tmp_path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3")
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("lines.txt")
+        assert result.success == 1
+        assert result.result == "line1\nline2\nline3"
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - write_file
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFile:
+    def test_write_new_file(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.write_file("newfile.txt", "some content")
+        assert result.success == 1
+        assert (tmp_path / "newfile.txt").read_text() == "some content"
+
+    def test_write_creates_parent_dirs(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.write_file("subdir/nested/file.txt", "data")
+        assert result.success == 1
+        assert (tmp_path / "subdir" / "nested" / "file.txt").exists()
+
+    def test_write_arbitrary_extension(self, tmp_path):
+        """write_file accepts any text artifact regardless of extension."""
+        tool = _make_tool(str(tmp_path))
+        result = tool.write_file("infra/deploy.sh", "#!/bin/sh\necho hi\n")
+        assert result.success == 1
+        assert (tmp_path / "infra" / "deploy.sh").read_text() == "#!/bin/sh\necho hi\n"
+
+    def test_write_path_traversal_classified_external(self, tmp_path):
+        """Write with ``../`` escape also classifies EXTERNAL — gating lives
+        in the permission hook, not in the tool."""
+        tool = _make_tool(str(tmp_path))
+        resolved = tool._classify("../../evil.txt")
+        assert resolved.zone == PathZone.EXTERNAL
+
+    def test_write_overwrites_existing(self, tmp_path):
+        f = tmp_path / "existing.txt"
+        f.write_text("old content")
+        tool = _make_tool(str(tmp_path))
+        result = tool.write_file("existing.txt", "new content")
+        assert result.success == 1
+        assert f.read_text() == "new content"
+
+
+class TestMemoryHiddenFromFilesystem:
+    """The ``.datus/memory/**`` subtree is owned exclusively by the dedicated
+    add_memory/edit_memory tools, so generic filesystem tools must see it as
+    HIDDEN — reads, writes and edits all return a not-found error and never
+    touch the file."""
+
+    def _make_tool(self, root: Path) -> FilesystemFuncTool:
+        (root / ".datus" / "memory" / "chat").mkdir(parents=True)
+        (root / ".datus" / "memory" / "chat" / "MEMORY.md").write_text("- a fact\n", encoding="utf-8")
+        return FilesystemFuncTool(root_path=str(root), current_node="chat")
+
+    def test_read_memory_returns_not_found(self, tmp_path):
+        tool = self._make_tool(tmp_path)
+        result = tool.read_file(".datus/memory/chat/MEMORY.md")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+
+    def test_write_memory_returns_not_found_and_does_not_write(self, tmp_path):
+        tool = self._make_tool(tmp_path)
+        result = tool.write_file(".datus/memory/chat/MEMORY.md", "tampered")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+        # The original content survived the rejected write.
+        assert (tmp_path / ".datus" / "memory" / "chat" / "MEMORY.md").read_text() == "- a fact\n"
+
+    def test_edit_memory_returns_not_found(self, tmp_path):
+        tool = self._make_tool(tmp_path)
+        result = tool.edit_file(".datus/memory/chat/MEMORY.md", "a fact", "tampered")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+
+    def test_write_to_own_node_memory_also_hidden(self, tmp_path):
+        # Even the node's own memory subtree is HIDDEN to the filesystem tool.
+        tool = self._make_tool(tmp_path)
+        result = tool.write_file(".datus/memory/chat/extra.md", "x")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+        assert not (tmp_path / ".datus" / "memory" / "chat" / "extra.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - edit_file
+# ---------------------------------------------------------------------------
+
+
+class TestEditFile:
+    def test_edit_success(self, tmp_path):
+        f = tmp_path / "code.py"
+        f.write_text("hello world\nfoo bar")
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("code.py", "hello world", "goodbye world")
+        assert result.success == 1
+        assert "goodbye world" in f.read_text()
+
+    def test_edit_text_not_found(self, tmp_path):
+        f = tmp_path / "code.py"
+        f.write_text("foo bar")
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("code.py", "nonexistent", "x")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+
+    def test_edit_multiple_matches_rejected(self, tmp_path):
+        f = tmp_path / "code.py"
+        f.write_text("hello hello hello")
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("code.py", "hello", "bye")
+        assert result.success == 0
+        assert "3 times" in result.error
+
+    def test_edit_empty_old_string_rejected(self, tmp_path):
+        f = tmp_path / "code.py"
+        f.write_text("content")
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("code.py", "", "x")
+        assert result.success == 0
+        assert "empty" in result.error.lower()
+
+    def test_edit_file_not_found(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("missing.py", "x", "y")
+        assert result.success == 0
+
+    def test_edit_binary_file_rejected(self, tmp_path):
+        f = tmp_path / "payload.bin"
+        f.write_bytes(b"\xff\xfe\x00\x01")
+        tool = _make_tool(str(tmp_path))
+        result = tool.edit_file("payload.bin", "x", "y")
+        assert result.success == 0
+        assert "binary" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - glob
+# ---------------------------------------------------------------------------
+
+
+class TestGlobSearch:
+    def test_glob_finds_py_files(self, tmp_path):
+        (tmp_path / "a.py").write_text("code")
+        (tmp_path / "b.txt").write_text("text")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "c.py").write_text("more code")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.py")
+        assert result.success == 1
+        py_files = [Path(p).name for p in result.result["files"]]
+        assert "a.py" in py_files
+
+    def test_glob_with_globstar(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "deep.py").write_text("x")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("**/*.py")
+        assert result.success == 1
+        names = [Path(p).name for p in result.result["files"]]
+        assert "deep.py" in names
+
+    def test_glob_nonexistent_directory(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.py", "nonexistent")
+        assert result.success == 0
+
+    def test_glob_file_as_directory(self, tmp_path):
+        (tmp_path / "file.txt").write_text("x")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.py", "file.txt")
+        assert result.success == 0
+
+    def test_glob_ignores_git_directory(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "config").write_text("git config")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("code")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("**/*")
+        assert result.success == 1
+        paths = [Path(p).name for p in result.result["files"]]
+        assert "main.py" in paths
+        assert "config" not in paths
+
+    def test_glob_empty_results(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.xyz_nonexistent")
+        assert result.success == 1
+        assert result.result["files"] == []
+        assert result.result["truncated"] is False
+
+    def test_glob_excludes_gitignore_patterns(self, tmp_path):
+        (tmp_path / ".gitignore").write_text("*.log\nbuild/\n__pycache__\n")
+        (tmp_path / "real.py").write_text("code")
+        (tmp_path / "debug.log").write_text("log data")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "output.py").write_text("built")
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "__pycache__" / "cached.py").write_text("bytecode")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*")
+        assert result.success == 1
+        names = [Path(p).name for p in result.result["files"]]
+        assert "real.py" in names
+        assert "debug.log" not in names
+        assert "output.py" not in names
+        assert "cached.py" not in names
+
+    def test_glob_with_path_param(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "file.py").write_text("x")
+        (tmp_path / "other.py").write_text("y")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.py", "sub")
+        assert result.success == 1
+        names = [Path(p).name for p in result.result["files"]]
+        assert "file.py" in names
+        assert "other.py" not in names
+
+    def test_glob_path_like_pattern_searches_explicit_seed(self, tmp_path):
+        (tmp_path / ".gitignore").write_text("subject/\n")
+        metrics_dir = tmp_path / "subject" / "semantic_models" / "starrocks" / "metrics"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "v_udata_ac_info_metrics.yml").write_text("metric: {}\n")
+
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("subject/semantic_models/starrocks/metrics/*.yml")
+
+        assert result.success == 1
+        assert result.result["files"] == ["subject/semantic_models/starrocks/metrics/v_udata_ac_info_metrics.yml"]
+
+    def test_glob_truncation(self, tmp_path):
+        """Results are truncated when exceeding max_results (200)."""
+        for i in range(5):
+            (tmp_path / f"file_{i}.py").write_text(f"code {i}")
+        tool = _make_tool(str(tmp_path))
+        result = tool.glob("*.py")
+        assert result.success == 1
+        assert result.result["truncated"] is False
+        assert len(result.result["files"]) == 5
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - grep
+# ---------------------------------------------------------------------------
+
+
+class TestGrep:
+    def test_grep_finds_pattern(self, tmp_path):
+        (tmp_path / "hello.py").write_text("def hello():\n    return 'world'\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("hello")
+        assert result.success == 1
+        assert len(result.result["matches"]) >= 1
+        assert result.result["matches"][0]["content"] == "def hello():"
+
+    def test_grep_regex_pattern(self, tmp_path):
+        (tmp_path / "code.py").write_text("foo123\nbar456\nfoo789\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep(r"foo\d+")
+        assert result.success == 1
+        assert len(result.result["matches"]) == 2
+
+    def test_grep_case_insensitive(self, tmp_path):
+        (tmp_path / "data.txt").write_text("Hello\nhello\nHELLO\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("hello", case_sensitive=False)
+        assert result.success == 1
+        assert len(result.result["matches"]) == 3
+
+    def test_grep_case_sensitive_default(self, tmp_path):
+        (tmp_path / "data.txt").write_text("Hello\nhello\nHELLO\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("hello")
+        assert result.success == 1
+        assert len(result.result["matches"]) == 1
+
+    def test_grep_with_include_filter(self, tmp_path):
+        (tmp_path / "code.py").write_text("target line\n")
+        (tmp_path / "data.txt").write_text("target line\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("target", include="*.py")
+        assert result.success == 1
+        files = [m["file"] for m in result.result["matches"]]
+        assert any("code.py" in f for f in files)
+        assert not any("data.txt" in f for f in files)
+
+    def test_grep_skips_binary_files(self, tmp_path):
+        (tmp_path / "binary.txt").write_bytes(b"\xff\xfe\x00\x01target\x00")
+        (tmp_path / "text.txt").write_text("target line\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("target")
+        assert result.success == 1
+        files = [m["file"] for m in result.result["matches"]]
+        assert any("text.txt" in f for f in files)
+
+    def test_grep_invalid_regex(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("[invalid")
+        assert result.success == 0
+        assert "invalid regex" in result.error.lower()
+
+    def test_grep_nonexistent_directory(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("pattern", "nonexistent")
+        assert result.success == 0
+
+    def test_grep_returns_line_numbers(self, tmp_path):
+        (tmp_path / "code.py").write_text("line1\ntarget\nline3\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("target")
+        assert result.success == 1
+        assert result.result["matches"][0]["line"] == 2
+
+    def test_grep_respects_gitignore(self, tmp_path):
+        (tmp_path / ".gitignore").write_text("*.log\n")
+        (tmp_path / "code.py").write_text("target\n")
+        (tmp_path / "debug.log").write_text("target\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("target")
+        assert result.success == 1
+        files = [m["file"] for m in result.result["matches"]]
+        assert any("code.py" in f for f in files)
+        assert not any("debug.log" in f for f in files)
+
+    def test_grep_truncation(self, tmp_path):
+        (tmp_path / "big.txt").write_text("\n".join([f"match line {i}" for i in range(150)]))
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("match")
+        assert result.success == 1
+        assert result.result["truncated"] is True
+        assert len(result.result["matches"]) == 100
+
+    def test_grep_single_file(self, tmp_path):
+        f = tmp_path / "target.py"
+        f.write_text("hello world\nno match\nhello again\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("hello", "target.py")
+        assert result.success == 1
+        assert len(result.result["matches"]) == 2
+        assert result.result["matches"][0]["line"] == 1
+        assert result.result["matches"][1]["line"] == 3
+
+    def test_grep_single_file_no_match(self, tmp_path):
+        f = tmp_path / "empty.py"
+        f.write_text("nothing here\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("missing", "empty.py")
+        assert result.success == 1
+        assert result.result["matches"] == []
+
+    def test_grep_file_not_dir_error_gone(self, tmp_path):
+        f = tmp_path / "code.sql"
+        f.write_text("SELECT 1\n")
+        tool = _make_tool(str(tmp_path))
+        result = tool.grep("SELECT", "code.sql")
+        assert result.success == 1
+        assert len(result.result["matches"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# FilesystemFuncTool - available_tools
+# ---------------------------------------------------------------------------
+
+
+class TestAvailableTools:
+    def test_available_tools_returns_expected_set(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        tools = tool.available_tools()
+        names = [t.name for t in tools]
+        assert set(names) == {
+            "read_file",
+            "read_image",
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "glob",
+            "grep",
+        }
+
+    def test_available_tools_count(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        assert len(tool.available_tools()) == 7
+
+
+# ---------------------------------------------------------------------------
+# Zone-based visibility contract: .datus/ invisible except skills/memory
+# whitelist; absolute-path reads allowed at the tool layer (permission hook
+# is responsible for prompting the user outside the project).
+# ---------------------------------------------------------------------------
+
+
+class TestPathZones:
+    """Covers the four classification zones on read/write/edit/glob."""
+
+    def test_internal_relative_path_allowed(self, tmp_path):
+        (tmp_path / "hello.md").write_text("hi")
+        tool = _make_tool(str(tmp_path))
+        resolved = tool._classify("hello.md")
+        assert resolved.zone == PathZone.INTERNAL
+        assert tool.read_file("hello.md").result == "hi"
+
+    def test_hidden_dot_datus_invisible_on_read(self, tmp_path):
+        secret = tmp_path / ".datus" / "sessions" / "x.db"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("secret")
+        tool = _make_tool(str(tmp_path))
+        resolved = tool._classify(".datus/sessions/x.db")
+        assert resolved.zone == PathZone.HIDDEN
+        result = tool.read_file(".datus/sessions/x.db")
+        # Same "File not found" whether the file exists or not.
+        assert result.success == 0
+        assert "file not found" in (result.error or "").lower()
+
+    def test_hidden_dot_datus_invisible_on_write(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        result = tool.write_file(".datus/sessions/new.md", "payload")
+        assert result.success == 0
+        assert "file not found" in (result.error or "").lower()
+        assert not (tmp_path / ".datus" / "sessions" / "new.md").exists()
+
+    def test_whitelist_project_skills_readable_and_writable(self, tmp_path):
+        tool = _make_tool(str(tmp_path))
+        resolved = tool._classify(".datus/skills/my_skill/SKILL.md")
+        assert resolved.zone == PathZone.WHITELIST
+        assert tool.write_file(".datus/skills/my_skill/SKILL.md", "# skill\n").success == 1
+        assert tool.read_file(".datus/skills/my_skill/SKILL.md").result == "# skill\n"
+
+    def test_all_memory_subtrees_hidden(self, tmp_path):
+        # Memory is owned by the dedicated memory tools; every memory path is
+        # HIDDEN to the filesystem tool regardless of current_node.
+        tool = _make_tool(str(tmp_path), current_node="gen_sql")
+        assert tool._classify(".datus/memory/gen_sql/MEMORY.md").zone == PathZone.HIDDEN
+        assert tool._classify(".datus/memory/chat/MEMORY.md").zone == PathZone.HIDDEN
+
+    def test_current_node_none_memory_hidden(self, tmp_path):
+        tool = FilesystemFuncTool(root_path=str(tmp_path), current_node=None)
+        zone = tool._classify(".datus/memory/anything/MEMORY.md").zone
+        assert zone == PathZone.HIDDEN
+
+    def test_external_absolute_allowed_at_tool_layer(self, tmp_path):
+        """Without a hook, the tool allows EXTERNAL reads. This documents the
+        contract: the hook owns user confirmation, the tool owns visibility.
+        """
+        outside = tmp_path.parent / "outside.md"
+        try:
+            outside.write_text("out-of-project")
+            # Fresh project root is an empty subdir so absolute access is external.
+            project = tmp_path / "proj"
+            project.mkdir()
+            tool = _make_tool(str(project))
+            zone = tool._classify(str(outside)).zone
+            assert zone == PathZone.EXTERNAL
+            assert tool.read_file(str(outside)).result == "out-of-project"
+        finally:
+            if outside.exists():
+                outside.unlink()
+
+    def test_glob_prunes_hidden_subtree(self, tmp_path):
+        (tmp_path / "keep.md").write_text("visible")
+        skill_dir = tmp_path / ".datus" / "skills" / "foo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("skill")
+        hidden = tmp_path / ".datus" / "sessions"
+        hidden.mkdir(parents=True)
+        (hidden / "a.md").write_text("hidden")
+        tool = _make_tool(str(tmp_path))
+        names = {Path(p).name for p in tool.glob("**/*.md").result["files"]}
+        assert "keep.md" in names
+        assert "SKILL.md" in names
+        assert "a.md" not in names
+
+    def test_strict_rejects_external_read(self, tmp_path):
+        """Strict mode fails closed on EXTERNAL: reads never touch the host fs.
+
+        Used by API / gateway where there's no broker to ask the user. We do
+        not fall through to an ``exists()`` probe either, so a missing
+        external path and an existing one produce the same rejection.
+        """
+        outside = tmp_path.parent / "strict_outside.md"
+        outside.write_text("secret")
+        project = tmp_path / "proj"
+        project.mkdir()
+        tool = FilesystemFuncTool(root_path=str(project), current_node="chat", strict=True)
+        try:
+            result = tool.read_file(str(outside))
+            assert result.success == 0
+            assert "not allowed in strict mode" in (result.error or "").lower()
+            assert str(outside) in (result.error or "")
+        finally:
+            if outside.exists():
+                outside.unlink()
+
+    def test_strict_rejects_external_write(self, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+        target = tmp_path / "elsewhere.md"
+        tool = FilesystemFuncTool(root_path=str(project), current_node="chat", strict=True)
+        result = tool.write_file(str(target), "payload")
+        assert result.success == 0
+        assert "not allowed in strict mode" in (result.error or "").lower()
+        assert not target.exists()
+
+    def test_strict_rejects_external_glob(self, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "x.md").write_text("x")
+        project = tmp_path / "proj"
+        project.mkdir()
+        tool = FilesystemFuncTool(root_path=str(project), current_node="chat", strict=True)
+        result = tool.glob("*.md", str(other))
+        assert result.success == 0
+        assert "not allowed in strict mode" in (result.error or "").lower()
+
+    def test_strict_rejection_names_the_reachable_roots(self, tmp_path):
+        """Seeding a walk at the *parent* of the project root and the DAGs folder.
+
+        Observed in a SaaS session: the model wrote a DAG through the proxied
+        (workspace-anchored) fs path, then globbed the workspace root looking for
+        it and got a bare rejection, so it kept probing. Naming both roots is what
+        lets it retarget instead.
+        """
+        workspace = tmp_path / "ws"
+        project = workspace / "proj" / "files"
+        project.mkdir(parents=True)
+        dags = workspace / "proj" / "dags"
+        dags.mkdir()
+        tool = FilesystemFuncTool(
+            root_path=str(project),
+            current_node="chat",
+            strict=True,
+            path_allowlist=PathAllowlist.from_dict({"allow_write": [str(dags)]}),
+        )
+        result = tool.glob("**/*.py", str(workspace))
+        assert result.success == 0
+        assert str(workspace.resolve()) in (result.error or "")
+        assert str(project.resolve()) in (result.error or "")
+        assert str(dags.resolve()) in (result.error or "")
+
+    def test_strict_allows_internal_and_whitelist(self, tmp_path):
+        """Strict mode must NOT break project-internal / whitelist access —
+        otherwise the API surface could not read its own files."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "hello.md").write_text("hi")
+        tool = FilesystemFuncTool(root_path=str(project), current_node="chat", strict=True)
+        assert tool.read_file("hello.md").result == "hi"
+        assert tool.write_file(".datus/skills/x/SKILL.md", "# skill\n").success == 1
+
+    def test_strict_allows_write_into_allowlisted_root(self, tmp_path):
+        """The DAGs-folder case: strict mode + a configured ``allow_write`` root.
+
+        A deployment mounts a shared directory (Airflow DAGs folder) next to the
+        project workspace; the agent must be able to author files there without
+        the whole surface losing its fail-closed default.
+        """
+        project = tmp_path / "proj"
+        project.mkdir()
+        dags = tmp_path / "services" / "airflow" / "dags" / "ws1" / "proj1"
+        dags.mkdir(parents=True)
+        tool = FilesystemFuncTool(
+            root_path=str(project),
+            current_node="chat",
+            strict=True,
+            path_allowlist=PathAllowlist.from_dict({"allow_write": [str(dags)]}),
+        )
+        target = dags / "daily_job.py"
+        assert tool.write_file(str(target), "print('dag')\n").success == 1
+        assert target.read_text() == "print('dag')\n"
+        # Round-trip through the other mutating/reading ops on the same root.
+        assert tool.read_file(str(target)).result == "print('dag')\n"
+        assert tool.edit_file(str(target), "dag", "dag2").success == 1
+        assert tool.delete_file(str(target)).success == 1
+
+    def test_strict_allowlisted_read_root_rejects_write(self, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "ref.sql").write_text("select 1")
+        tool = FilesystemFuncTool(
+            root_path=str(project),
+            current_node="chat",
+            strict=True,
+            path_allowlist=PathAllowlist.from_dict({"allow_read": [str(shared)]}),
+        )
+        assert tool.read_file(str(shared / "ref.sql")).result == "select 1"
+        result = tool.write_file(str(shared / "ref.sql"), "select 2")
+        assert result.success == 0
+        assert "read-only" in (result.error or "").lower()
+        assert (shared / "ref.sql").read_text() == "select 1"
+
+    def test_strict_still_rejects_paths_outside_allowlist(self, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+        dags = tmp_path / "dags"
+        dags.mkdir()
+        tool = FilesystemFuncTool(
+            root_path=str(project),
+            current_node="chat",
+            strict=True,
+            path_allowlist=PathAllowlist.from_dict({"allow_write": [str(dags)]}),
+        )
+        target = tmp_path / "elsewhere.md"
+        result = tool.write_file(str(target), "payload")
+        assert result.success == 0
+        assert "not allowed in strict mode" in (result.error or "").lower()
+        assert not target.exists()
+
+    def test_glob_seeded_at_allowlisted_root_lists_files(self, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+        dags = tmp_path / "dags"
+        dags.mkdir()
+        (dags / "a_dag.py").write_text("a")
+        (dags / "b_dag.py").write_text("b")
+        tool = FilesystemFuncTool(
+            root_path=str(project),
+            current_node="chat",
+            strict=True,
+            path_allowlist=PathAllowlist.from_dict({"allow_write": [str(dags)]}),
+        )
+        result = tool.glob("*_dag.py", str(dags))
+        assert result.success == 1
+        # Seed is WHITELIST (not EXTERNAL), and reported paths stay absolute
+        # because they cannot be expressed relative to the project root.
+        assert result.result.get("external") is None
+        assert {Path(p).name for p in result.result["files"]} == {"a_dag.py", "b_dag.py"}
+
+    def test_glob_external_seed_returns_absolute_paths(self, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "x.md").write_text("body")
+        project = tmp_path / "proj"
+        project.mkdir()
+        tool = _make_tool(str(project))
+        result = tool.glob("*.md", str(other))
+        assert result.success == 1
+        assert result.result.get("external") is True
+        files = result.result["files"]
+        assert files
+        assert all(Path(p).is_absolute() for p in files)
+
+
+class TestTabularFilesRedirect:
+    """``read_file`` on a spreadsheet points at the tool that can actually read it.
+
+    Left to the generic UTF-8 path these fail with "Cannot read binary file",
+    which says the read failed but not what to do instead; in practice the model
+    then retries through bash. The redirect turns a dead end into a one-turn
+    correction.
+    """
+
+    @pytest.mark.parametrize("name", ["book.xlsx", "book.xlsm", "book.xls", "data.parquet"])
+    def test_binary_tabular_read_names_the_alternative(self, tmp_path, name):
+        (tmp_path / name).write_bytes(b"PK\x03\x04binary-ish")
+        tool = _make_tool(str(tmp_path))
+
+        result = tool.read_file(name)
+
+        assert result.success == 0
+        assert "load_file_as_table" in result.error
+
+    @pytest.mark.parametrize("name", ["book.xlsb", "sheet.ods"])
+    def test_formats_nothing_can_read_say_so_in_one_turn(self, tmp_path, name):
+        """Pointing these at load_file_as_table would only spend a round trip to
+        arrive at the same answer, since it rejects them too."""
+        (tmp_path / name).write_bytes(b"PK\x03\x04")
+        tool = _make_tool(str(tmp_path))
+
+        result = tool.read_file(name)
+
+        assert result.success == 0
+        assert "load_file_as_table" not in result.error
+        # Name both conversion targets: the message's whole job is telling the
+        # user what to re-save as, so "mentions one of them" is not the contract.
+        assert ".xlsx" in result.error
+        assert ".csv" in result.error
+
+    def test_extension_match_is_case_insensitive(self, tmp_path):
+        (tmp_path / "BOOK.XLSX").write_bytes(b"PK\x03\x04")
+        tool = _make_tool(str(tmp_path))
+        assert "load_file_as_table" in tool.read_file("BOOK.XLSX").error
+
+    @pytest.mark.parametrize("name", ["data.csv", "data.tsv"])
+    def test_text_tabular_formats_still_read_normally(self, tmp_path, name):
+        """CSV is text: read_file genuinely works and a small one is cheapest to just read."""
+        (tmp_path / name).write_text("a,b\n1,2\n")
+        tool = _make_tool(str(tmp_path))
+
+        result = tool.read_file(name)
+
+        assert result.success == 1
+        assert "1,2" in result.result
+
+    def test_missing_file_still_reports_not_found(self, tmp_path):
+        """Existence is checked first; a redirect for a file that isn't there would mislead."""
+        tool = _make_tool(str(tmp_path))
+        result = tool.read_file("absent.xlsx")
+        assert result.success == 0
+        assert "not found" in result.error.lower()
+        assert "load_file_as_table" not in result.error
+
+    def test_writing_a_spreadsheet_path_is_still_allowed(self, tmp_path):
+        """Only reads are redirected — the write side has no extension gate."""
+        tool = _make_tool(str(tmp_path))
+        assert tool.write_file("out.xlsx", "not really a spreadsheet").success == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrent mutation of one file
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentMutationsDoNotLoseUpdates:
+    """Two tool calls editing one file must not silently discard one of the edits.
+
+    The agent framework dispatches tool calls with ``asyncio.gather``, and a measured production
+    run issued two ``edit_file`` calls against ``data/gen.py`` with identical millisecond
+    timestamps. ``edit_file`` was a lock-free read -> replace -> write: both read the original,
+    the second write won, and **both returned "File edited successfully"**. The run then spent
+    five turns and a full regeneration cycle working out why the file still held the old value.
+    """
+
+    def _tool(self, tmp_path):
+        return _make_tool(str(tmp_path))
+
+    def test_parallel_edits_to_one_file_all_land(self, tmp_path):
+        import threading
+
+        tool = self._tool(tmp_path)
+        target = tmp_path / "gen.py"
+        # Zero-padded so no marker is a substring of another: edit_file requires a unique match.
+        markers = [f"SLOT_{i:02d}" for i in range(12)]
+        target.write_text("\n".join(markers), encoding="utf-8")
+
+        results, errors = [], []
+        start = threading.Barrier(len(markers))
+
+        def edit(marker):
+            try:
+                start.wait(timeout=10)
+                results.append(tool.edit_file("gen.py", marker, f"{marker}_DONE"))
+            except Exception as e:  # noqa: BLE001 - surfaced by the assertion below
+                errors.append(e)
+
+        threads = [threading.Thread(target=edit, args=(m,)) for m in markers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, errors
+        assert all(r.success == 1 for r in results), [r.error for r in results]
+        # Every edit that reported success has to be in the file. This is the whole contract:
+        # the old code passed the success assertion above and failed this one.
+        content = target.read_text(encoding="utf-8")
+        missing = [m for m in markers if f"{m}_DONE" not in content]
+        assert not missing, f"reported success but the change is not on disk: {missing}"
+
+    def test_an_edit_waits_for_a_semantic_artifact_writer(self, tmp_path):
+        """The two writer paths must exclude each other, not merely share a name.
+
+        `MetricFilesystemFuncTool` subclasses `FilesystemFuncTool`, so one object serves both the
+        semantic-artifact writes (which take the lock under their own name) and the generic
+        `edit_file` it inherits. Separate registries would leave them free to interleave on one
+        file. Asserted through behaviour - the edit must not complete while the artifact lock is
+        held - rather than by comparing the two names for identity.
+        """
+        import threading
+
+        from datus.storage.semantic_model.artifact_file import semantic_artifact_lock
+
+        tool = self._tool(tmp_path)
+        target = tmp_path / "model.yml"
+        target.write_text("version: 1", encoding="utf-8")
+
+        order = []
+        holder_is_in = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_the_artifact_lock():
+            with semantic_artifact_lock(target):
+                holder_is_in.set()
+                release_holder.wait(timeout=10)
+                order.append("released")
+
+        def try_to_edit():
+            holder_is_in.wait(timeout=10)
+            tool.edit_file("model.yml", "version: 1", "version: 2")
+            order.append("edited")
+
+        holder = threading.Thread(target=hold_the_artifact_lock)
+        editor = threading.Thread(target=try_to_edit)
+        holder.start()
+        editor.start()
+
+        editor.join(timeout=0.5)
+        assert editor.is_alive(), "edit_file ran while the artifact lock was held"
+
+        release_holder.set()
+        holder.join(timeout=10)
+        editor.join(timeout=10)
+
+        assert order == ["released", "edited"]
+        assert target.read_text(encoding="utf-8") == "version: 2"
+
+    def test_the_lock_registry_does_not_grow_for_the_life_of_the_process(self, tmp_path):
+        """A sandbox pod edits many files over many sessions; one lock per path forever adds up."""
+        import gc
+
+        from datus.storage.semantic_model import artifact_file
+
+        tool = self._tool(tmp_path)
+        for i in range(50):
+            name = f"f{i}.txt"
+            (tmp_path / name).write_text("x", encoding="utf-8")
+            assert tool.edit_file(name, "x", "y").success == 1
+
+        gc.collect()
+
+        # Nothing holds these locks any more, so the registry must have let them go.
+        assert len(artifact_file._ARTIFACT_LOCKS) == 0, dict(artifact_file._ARTIFACT_LOCKS)
+
+    def test_a_lock_survives_while_it_is_held(self, tmp_path):
+        """Pruning must not hand two threads different locks for one path."""
+        import gc
+
+        from datus.storage.semantic_model import artifact_file
+        from datus.storage.semantic_model.artifact_file import path_mutation_lock
+
+        target = tmp_path / "held.txt"
+        with path_mutation_lock(target):
+            gc.collect()
+            assert str(target.resolve()) in artifact_file._ARTIFACT_LOCKS

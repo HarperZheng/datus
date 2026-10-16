@@ -1,0 +1,364 @@
+# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
+site_name: Datus Docs
+site_url: !ENV [DOCS_SITE_URL, "https://docs.datus.ai/"]
+copyright: "© 2025 Datus AI"
+nav:
+  - Home:
+    - Overview: index.md
+    - Getting Started:
+      - Choose Your Path: getting_started/index.md
+      - Install and First Query: getting_started/Quickstart.md
+      - Build a Context-Rich Agent: getting_started/contextual_data_engineering.md
+      - Scenario Tutorials:
+        - End-to-End Data Engineering: getting_started/data_engineering_quickstart.md
+        - Turn a Dashboard into a Copilot: getting_started/dashboard_copilot.md
+    - CLI:
+      - Introduction: cli/introduction.md
+      - Chat Command: cli/chat_command.md
+      - Context Command: cli/context_command.md
+      - Execution Command: cli/execution_command.md
+      - MCP Extensions: cli/mcp_extensions.md
+      - SQL Execution: cli/sql_execution.md
+      - Skill Command: cli/skill_command.md
+      - Package Command: cli/package_command.md
+      - Reference: cli/reference.md
+      - Plan Mode: cli/plan_mode.md
+      - Other Commands: cli/other_commands.md
+    - Subagent:
+      - Introduction: subagent/introduction.md
+      - Built-in subagents: subagent/builtin_subagents.md
+      - Customized subagents: subagent/customized_subagent.md
+      - Semantic Modeling: subagent/semantic_modeling.md
+      - Ask Metrics: subagent/ask_metrics.md
+      - Generate SQL Summary: subagent/gen_sql_summary.md
+      - Table Generation: subagent/gen_table.md
+      - Data Pipeline (ETL + Migration): subagent/gen_job.md
+      - HTML Report Generation: subagent/gen_visual_report.md
+      - HTML Dashboard Generation: subagent/gen_visual_dashboard.md
+    - Skills:
+      - Introduction: skills/introduction.md
+      - Built-in Skills:
+        - Init: skills/init.md
+        - Build KB: skills/build_kb.md
+        - Dashboard Bootstrap: skills/dashboard_bootstrap.md
+        - Storage Classify: skills/storage_classify.md
+        - Extract Knowledge: skills/extract_knowledge.md
+        - Memory Organization: skills/memory_organization.md
+        - Session Summarize: skills/session_summarize.md
+    - Plugin:
+      - Introduction: plugin/introduction.md
+      - Development: plugin/development.md
+      - Plugin List:
+        - Airflow: plugin/airflow.md
+        - S3: plugin/s3.md
+        - EKS: plugin/eks.md
+        - K8s: plugin/k8s.md
+        - Flink: plugin/flink.md
+    - Chatbot: web_chatbot/introduction.md
+    - IM Gateway:
+      - Introduction: gateway/introduction.md
+      - Slack: gateway/slack.md
+      - Feishu: gateway/feishu.md
+    - Knowledge Base:
+      - Introduction: knowledge_base/introduction.md
+      - Platform Documentation: knowledge_base/platform_doc.md
+      - Metadata: knowledge_base/metadata.md
+      - Metadata Full-text Search: knowledge_base/metadata_fts.md
+      - Semantic Models: knowledge_base/semantic_model.md
+      - Metrics: knowledge_base/metrics.md
+      - Reference SQL: knowledge_base/reference_sql.md
+      - Reference Template: knowledge_base/reference_template.md
+    - Workflow:
+      - Introduction: workflow/introduction.md
+      - Nodes: workflow/nodes.md
+      - Orchestration: workflow/orchestration.md
+      - API: workflow/api.md
+    - REST API:
+      - Introduction: API/introduction.md
+      - Deployment: API/deployment.md
+      - Chat: API/chat.md
+      - Knowledge Base API: API/knowledge_base.md
+      - Debugging: API/debugging.md
+    - Configuration:
+      - Introduction: configuration/introduction.md
+      - Agent: configuration/agent.md
+      - Context Compaction: configuration/compact.md
+      - Workflow: configuration/workflow.md
+      - Benchmark: configuration/benchmark.md
+      - SQL Policy: configuration/sql_policy.md
+      - Web Tools: configuration/web_tool.md
+      - Image Reading: configuration/image_tool.md
+      - Datasources:
+        - Overview: configuration/datasources.md
+        - SQLite: configuration/datasources/sqlite.md
+        - DuckDB: configuration/datasources/duckdb.md
+        - MySQL: configuration/datasources/mysql.md
+        - PostgreSQL: configuration/datasources/postgresql.md
+        - Greenplum: configuration/datasources/greenplum.md
+        - Amazon Redshift: configuration/datasources/redshift.md
+        - Snowflake: configuration/datasources/snowflake.md
+        - Google BigQuery: configuration/datasources/bigquery.md
+        - StarRocks: configuration/datasources/starrocks.md
+        - Apache Doris: configuration/datasources/doris.md
+        - TiDB: configuration/datasources/tidb.md
+        - ClickHouse: configuration/datasources/clickhouse.md
+        - Trino: configuration/datasources/trino.md
+        - Hive: configuration/datasources/hive.md
+        - Spark SQL: configuration/datasources/spark.md
+        - ClickZetta: configuration/datasources/clickzetta.md
+        - Hologres: configuration/datasources/hologres.md
+        - MaxCompute: configuration/datasources/maxcompute.md
+        - Oracle: configuration/datasources/oracle.md
+        - GaussDB / openGauss: configuration/datasources/gaussdb.md
+        - GaussDB(DWS): configuration/datasources/dws.md
+      - Storage: configuration/storage.md
+      - Nodes: configuration/nodes.md
+    - Semantic Engine: semantic/dosi_engine.md
+    - Adapters:
+      - Database Adapters: adapters/db_adapters.md
+      - BI Adapters: adapters/bi_adapters.md
+      - Scheduler Adapters: adapters/scheduler_adapters.md
+    - Benchmark:
+      - Introduction: benchmark/benchmark_manual.md
+    - Integration:
+      - MCP: integration/mcp.md
+      - Validation: integration/validation.md
+      - Auto Memory: integration/memory.md
+    - Training:
+      - LLM Trace Usage: training/llm_trace_usage.md
+    - Develop:
+      - Overview: develop/README.md
+      - Observability: develop/observability.md
+    - VSCode Extension: vscode_extension/introduction.md
+
+  - Release Notes: release_notes.md
+
+plugins:
+  - search:
+      lang: !ENV [DOCS_LOCALE, "en"]
+  - mike:
+      alias_type: redirect
+  - i18n:
+      build_only_locale: !ENV [DOCS_LOCALE, "en"]
+      fallback_to_default: false
+      languages:
+        - locale: en
+          name: English
+          default: true
+        - locale: zh
+          name: "中文"
+          nav_translations:
+            Home: 首页
+            Overview: 概览
+            Getting Started: 入门指南
+            Choose Your Path: 选择上手路径
+            Install and First Query: 安装并完成第一次提问
+            Build a Context-Rich Agent: 构建上下文增强 Agent
+            Scenario Tutorials: 场景教程
+            End-to-End Data Engineering: 端到端数据工程
+            Turn a Dashboard into a Copilot: 将 Dashboard 变成 Copilot
+            CLI: 命令行
+            Introduction: 介绍
+            Chat Command: 聊天命令
+            Context Command: 上下文命令
+            Execution Command: 执行命令
+            MCP Extensions: MCP 扩展
+            SQL Execution: SQL 执行
+            Skill Command: 技能命令
+            Package Command: 打包命令
+            Reference: 参考
+            Plan Mode: 计划模式
+            Other Commands: 其他命令
+            Subagent: Subagent
+            Built-in subagents: 内置 subagent
+            Customized subagents: 自定义 subagent
+            Semantic Modeling: 语义建模
+            Generate Metrics: 生成指标
+            Ask Metrics: 指标问答
+            Generate Semantic Model: 生成语义模型
+            Chatbot: chatbot
+            IM Gateway: IM 网关
+            Slack: Slack
+            Feishu: 飞书
+
+            Knowledge Base: 知识库
+            Platform Documentation: 平台文档
+            Metadata: 元数据
+            Metadata Full-text Search: 元数据全文检索
+            Semantic Models: 语义模型
+            Metrics: 指标
+            Reference SQL: Reference SQL
+            Reference Template: SQL模板
+            Workflow: 工作流
+            Nodes: 节点
+            Orchestration: 编排
+            API: API
+            REST API: REST API
+            Deployment: 部署
+            Chat: Chat
+            Knowledge Base API: 知识库 API
+            Configuration: 配置
+            Context Compaction: 上下文压缩
+            Image Reading: 读图
+            Datasources: 数据源
+            Databases: 数据库
+            Amazon Redshift: Amazon Redshift
+            Google BigQuery: Google BigQuery
+            Apache Doris: Apache Doris
+            Spark SQL: Spark SQL
+            GaussDB / openGauss: GaussDB / openGauss
+            GaussDB(DWS): GaussDB(DWS)
+            Adapters: 适配器
+            Database Adapters: 数据库适配器
+            Semantic Engine: 语义引擎
+            BI Adapters: BI 适配器
+            Scheduler Adapters: Scheduler 适配器
+            Benchmark: 基准测试
+            SQL Policy: SQL Policy
+            Integration: 集成
+            MCP: MCP
+            Skills: Skills
+            Built-in Skills: 内置 Skills
+            Init: 初始化
+            Build KB: 构建知识库
+            Storage Classify: 存储分类
+            Extract Knowledge: 知识提取
+            Memory Organization: 记忆整理
+            Session Summarize: 会话总结
+            Validation: 校验
+            Auto Memory: 自动记忆
+            Plugin: 插件
+            Plugin List: 插件列表
+            Development: 开发指南
+            Airflow: Airflow
+            S3: S3
+            EKS: EKS
+            K8s: K8s
+            Flink: Flink
+            Develop: 开发
+            Observability: 可观测性
+            VSCode Extension: VSCode 插件
+            Release Notes: 发布说明
+
+theme:
+  name: material
+  language: en
+  font: false
+  logo: assets/logo-light.png
+  favicon: assets/logo-light.png
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - navigation.footer
+    - navigation.tabs
+    # - navigation.tabs.sticky
+    - navigation.tracking
+    - navigation.indexes
+    - content.code.copy
+    - content.code.select
+    - content.action.edit
+    # - header.autohide
+repo_name: Datus-ai/Datus-agent
+repo_url: https://github.com/Datus-ai/Datus-agent
+edit_uri: !ENV [DOCS_EDIT_URI, "edit/main/docs/"]
+
+extra:
+  version:
+    provider: mike
+  # GA4 is loaded via docs/javascripts/analytics.js instead of the built-in
+  # Material analytics, so it only fires on docs.datus.ai (excludes localhost /
+  # 127.0.0.1 / *.github.io developer & preview traffic).
+  # analytics:
+  #   provider: google
+  #   property: G-8HMXHZDV7F
+
+  alternate:
+    - name: English
+      link: !ENV [DOCS_EN_BASE, "/"]
+      lang: en
+    - name: 中文
+      link: !ENV [DOCS_ZH_BASE, "/zh/"]
+      lang: zh
+
+  social:
+    - icon: material/web
+      link: https://www.datus.ai
+    - icon: fontawesome/brands/github
+      link: https://github.com/Datus-ai/Datus-agent
+    - icon: fontawesome/brands/slack
+      link: https://join.slack.com/t/datus-ai/shared_invite/zt-3g6h4fsdg-iOl5uNoz6A4GOc4xKKWUYg
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/datusai
+
+
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      # `underscore` keeps smart emphasis for _ / __ but makes * / ** classic,
+      # so `**bold**` renders even when flanked by CJK characters (no spaces).
+      smart_enable: underscore
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      repo_url_shorthand: true
+      user: Datus-ai
+      repo: Datus-agent
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      auto_append:
+        - includes/mkdocs.md
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/analytics.js

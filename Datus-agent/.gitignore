@@ -1,0 +1,76 @@
+.DS_Store
+/.env
+/.venv
+/.idea
+/.vscode
+/.cursor
+.pytest_cache
+.mypy_cache
+**/__pycache__
+/data
+/output*
+/tests/*.xlsx
+/tests/llm_find_tables
+/tests/data/datus_db_bird_school
+/tests/data/datus_db_bird_sqlite
+/tests/data/datus_db_ssb_sqlite
+/tests/data/datus_db_duckdb
+# Project-scoped LanceDB dirs created when tests run with DATUS_TEST_HOME pointing at a workspace
+/tests/data/*-.datus_test_data-workspace/
+/tests/data/sub_agents
+/tests/save
+/tests/sessions
+/tests/semantic_models
+sql_processing_errors.log
+/conf/agent.yml
+# DuckDB runtime artifacts
+*.duckdb.wal
+*.duckdb.tmp
+/save
+uv.toml
+/logs
+/tests/output
+before_reflection_*.yaml
+/.history
+/benchmark/bird
+/benchmark/spider2
+/benchmark/semantic_layer/gold
+/benchmark/semantic_layer/semantic_models
+/dist
+*.egg-info
+.claude
+/.omc
+
+# MkDocs build output
+/site
+
+# Coverage & CI output
+.coverage
+coverage.xml
+ci/htmlcov/
+ci/coverage.xml
+ci/test-results*.xml
+ci/merge-queue-results.json
+ci/diff-cover.json
+ci/diff-cover-report.*
+ci/pytest-coverage.txt
+ci/test-report.md
+ci/dir-cover.json
+ci/.coverage
+
+# Scratch/debug scripts
+test.py
+
+# Test evaluation output
+evaluation_details.json
+conf/agent.yml.bak
+.gstack/
+/quickstart/data_engineering/airflow/dags/*.py
+/.playwright-mcp/
+/.datus_test_data
+/subject/
+build/
+.datus/
+/build_scripts/cache/
+# Local `pip install --target` output / plugin build artifacts at the repo root.
+/plugins/

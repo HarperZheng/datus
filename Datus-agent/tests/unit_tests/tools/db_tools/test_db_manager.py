@@ -1,0 +1,894 @@
+"""Unit tests for db_manager.py — gen_uri, _resolve_connection_context, helpers, and DBManager."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from datus_db_core import BaseSqlConnector, DatusDbException
+from datus_db_core import ErrorCode as DbErrorCode
+
+from datus.tools.db_tools.config import DuckDBConfig, SQLiteConfig
+from datus.tools.db_tools.db_manager import (
+    DBManager,
+    _clean_str,
+    _normalize_dialect_name,
+    _port_or_none,
+    _resolve_connection_context,
+    _value_or_none,
+    db_config_name,
+    db_manager_instance,
+    gen_uri,
+    get_connection,
+    set_db_manager_factory,
+)
+from datus.utils.constants import DBType
+from datus.utils.exceptions import DatusException
+
+
+def _cfg(**kwargs):
+    defaults = dict(
+        type=None,
+        host=None,
+        port=None,
+        username=None,
+        password=None,
+        database=None,
+        schema=None,
+        catalog=None,
+        uri=None,
+        extra=None,
+        path_pattern=None,
+    )
+    defaults.update(kwargs)
+    ns = SimpleNamespace(**defaults)
+    ns.to_dict = lambda: {k: v for k, v in defaults.items()}
+    return ns
+
+
+# ---------------------------------------------------------------------------
+# _normalize_dialect_name
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeDialectName:
+    def test_string_lower(self):
+        assert _normalize_dialect_name("MySQL") == "mysql"
+
+    def test_postgres_alias(self):
+        assert _normalize_dialect_name("postgres") == "postgresql"
+
+    def test_none(self):
+        assert _normalize_dialect_name(None) == ""
+
+    def test_dbtype_enum(self):
+        assert _normalize_dialect_name(DBType.SQLITE) == "sqlite"
+
+    def test_dbtype_enum_duckdb(self):
+        assert _normalize_dialect_name(DBType.DUCKDB) == "duckdb"
+
+    def test_whitespace(self):
+        assert _normalize_dialect_name("  mysql  ") == "mysql"
+
+
+# ---------------------------------------------------------------------------
+# _clean_str / _value_or_none / _port_or_none
+# ---------------------------------------------------------------------------
+
+
+class TestCleanStr:
+    def test_none(self):
+        assert _clean_str(None) == ""
+
+    def test_string(self):
+        assert _clean_str("  hello  ") == "hello"
+
+    def test_int(self):
+        assert _clean_str(3306) == "3306"
+
+    def test_list_first_truthy(self):
+        assert _clean_str(["", "val"]) == "val"
+
+    def test_list_all_empty(self):
+        assert _clean_str([None, ""]) == ""
+
+    def test_set(self):
+        result = _clean_str({"only"})
+        assert result == "only"
+
+    def test_tuple(self):
+        assert _clean_str(("first",)) == "first"
+
+
+class TestValueOrNone:
+    def test_returns_value(self):
+        assert _value_or_none("abc") == "abc"
+
+    def test_returns_none_for_empty(self):
+        assert _value_or_none("") is None
+
+    def test_returns_none_for_none(self):
+        assert _value_or_none(None) is None
+
+
+class TestPortOrNone:
+    def test_valid_int(self):
+        assert _port_or_none(5432) == 5432
+
+    def test_valid_string(self):
+        assert _port_or_none("3306") == 3306
+
+    def test_none(self):
+        assert _port_or_none(None) is None
+
+    def test_invalid(self):
+        assert _port_or_none("abc") is None
+
+    def test_empty(self):
+        assert _port_or_none("") is None
+
+
+# ---------------------------------------------------------------------------
+# gen_uri
+# ---------------------------------------------------------------------------
+
+
+class TestGenUri:
+    def test_returns_uri_if_set(self):
+        cfg = _cfg(uri="sqlite:///test.db")
+        assert gen_uri(cfg) == "sqlite:///test.db"
+
+    def test_generic_fallback(self):
+        cfg = _cfg(type="mysql", host="localhost", port=3306, username="root", password="pass", database="mydb")
+        uri = gen_uri(cfg)
+        assert "mysql" in uri
+        assert "localhost" in uri
+
+    def test_delegates_to_registered_builder(self):
+        cfg = _cfg(type="bigquery", catalog="proj", database="ds")
+        uri = gen_uri(cfg)
+        assert "bigquery" in uri
+
+    def test_postgres_alias_in_uri(self):
+        cfg = _cfg(type="postgres", host="localhost", port=5432, username="u", password="p", database="db")
+        uri = gen_uri(cfg)
+        assert "postgresql" in uri
+
+    def test_builder_reraises_db_exception(self, monkeypatch):
+        """DatusDbException from a registered URI builder is re-raised as-is."""
+        import datus_db_core.registry as reg_mod
+
+        def _boom(_cfg):
+            raise DatusDbException(code=DbErrorCode.COMMON_CONFIG_ERROR, message="builder boom")
+
+        monkeypatch.setattr(reg_mod.ConnectorRegistry, "get_uri_builder", classmethod(lambda cls, dt: _boom))
+        cfg = _cfg(type="mysql", host="localhost", database="db")
+        with pytest.raises(DatusDbException, match="builder boom"):
+            gen_uri(cfg)
+
+    def test_builder_wraps_generic_exception(self, monkeypatch):
+        """Generic exception from a registered URI builder is wrapped in DatusException."""
+        import datus_db_core.registry as reg_mod
+
+        def _boom(_cfg):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(reg_mod.ConnectorRegistry, "get_uri_builder", classmethod(lambda cls, dt: _boom))
+        cfg = _cfg(type="mysql", host="localhost", database="db")
+        with pytest.raises(DatusException, match="URI builder failed"):
+            gen_uri(cfg)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_connection_context
+# ---------------------------------------------------------------------------
+
+
+class TestResolveConnectionContext:
+    def test_generic_fallback(self):
+        cfg = _cfg(type="mysql", catalog="", database="mydb", schema="")
+        uri = "mysql://root@localhost/mydb"
+        dialect, catalog, database, schema = _resolve_connection_context(cfg, uri)
+        assert dialect == "mysql"
+        assert database == "mydb"
+
+    def test_delegates_to_registered_resolver(self):
+        cfg = _cfg(type="bigquery", catalog="proj", database="ds", schema="")
+        uri = "bigquery://proj/ds"
+        dialect, catalog, database, schema = _resolve_connection_context(cfg, uri)
+        assert dialect == "bigquery"
+        assert catalog == "proj"
+
+    def test_invalid_uri_raises(self):
+        cfg = _cfg(type="mysql")
+        with pytest.raises(DatusException):
+            _resolve_connection_context(cfg, "not-a-valid-uri://[[[")
+
+    def test_catalog_from_config(self):
+        cfg = _cfg(type="mysql", catalog="my_catalog", database="mydb", schema="myschema")
+        uri = "mysql://root@localhost/mydb"
+        dialect, catalog, database, schema = _resolve_connection_context(cfg, uri)
+        assert catalog == "my_catalog"
+        assert schema == "myschema"
+
+    def test_resolver_reraises_db_exception(self, monkeypatch):
+        """DatusDbException from a registered context resolver is re-raised as-is."""
+        import datus_db_core.registry as reg_mod
+
+        def _boom(_cfg, _uri):
+            raise DatusDbException(code=DbErrorCode.COMMON_CONFIG_ERROR, message="resolver boom")
+
+        monkeypatch.setattr(reg_mod.ConnectorRegistry, "get_context_resolver", classmethod(lambda cls, dt: _boom))
+        cfg = _cfg(type="mysql", database="mydb")
+        with pytest.raises(DatusDbException, match="resolver boom"):
+            _resolve_connection_context(cfg, "mysql://root@localhost/mydb")
+
+    def test_resolver_wraps_generic_exception(self, monkeypatch):
+        """Generic exception from a registered context resolver is wrapped in DatusException."""
+        import datus_db_core.registry as reg_mod
+
+        def _boom(_cfg, _uri):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(reg_mod.ConnectorRegistry, "get_context_resolver", classmethod(lambda cls, dt: _boom))
+        cfg = _cfg(type="mysql", database="mydb")
+        with pytest.raises(DatusException, match="Context resolver failed"):
+            _resolve_connection_context(cfg, "mysql://root@localhost/mydb")
+
+
+# ---------------------------------------------------------------------------
+# get_connection
+# ---------------------------------------------------------------------------
+
+
+class TestGetConnection:
+    def test_returns_single_connector(self):
+        mock_conn = MagicMock(spec=BaseSqlConnector)
+        result = get_connection(mock_conn)
+        assert result is mock_conn
+
+    def test_returns_from_dict_single(self):
+        mock_conn = MagicMock()
+        result = get_connection({"db1": mock_conn})
+        assert result is mock_conn
+
+    def test_returns_first_when_no_logic_name(self):
+        c1, c2 = MagicMock(), MagicMock()
+        result = get_connection({"a": c1, "b": c2}, "")
+        assert result is c1
+
+    def test_returns_named(self):
+        c1, c2 = MagicMock(), MagicMock()
+        result = get_connection({"a": c1, "b": c2}, "b")
+        assert result is c2
+
+    def test_raises_for_missing_name(self):
+        c1 = MagicMock()
+        with pytest.raises(DatusException):
+            get_connection({"a": c1, "b": MagicMock()}, "c")
+
+
+# ---------------------------------------------------------------------------
+# db_config_name
+# ---------------------------------------------------------------------------
+
+
+class TestDbConfigName:
+    def test_sqlite(self):
+        result = db_config_name("ns", "sqlite", "myfile")
+        assert result == "ns::myfile"
+
+    def test_duckdb(self):
+        result = db_config_name("ns", "duckdb", "myfile")
+        assert result == "ns::myfile"
+
+    def test_other(self):
+        # The physical database name is honored for every dialect; the datasource name is
+        # never duplicated into the database slot (no more "ns::ns").
+        result = db_config_name("ns", "mysql", "mydb")
+        assert result == "ns::mydb"
+
+    def test_other_without_name_leaves_database_empty(self):
+        # No physical database given → empty second component, not the datasource name.
+        result = db_config_name("ns", "mysql")
+        assert result == "ns::"
+
+
+# ---------------------------------------------------------------------------
+# DBManager
+# ---------------------------------------------------------------------------
+
+
+class TestDBManager:
+    def test_context_manager(self):
+        mgr = DBManager({})
+        with mgr as m:
+            assert m is mgr
+
+    def test_missing_datasource_raises(self):
+        mgr = DBManager({})
+        with pytest.raises(DatusException):
+            mgr.get_conn("nonexistent")
+
+    def test_get_db_uris(self):
+        configs = {"ns": _cfg(type="sqlite", uri="sqlite:///test.db")}
+        mgr = DBManager(configs)
+        uris = mgr.get_db_uris("ns")
+        assert uris["ns"] == "sqlite:///test.db"
+
+    def test_get_conn_rebuilds_after_close(self):
+        configs = {"ns": _cfg(type="sqlite", uri="sqlite:///test.db")}
+        mgr = DBManager(configs)
+        with patch.object(mgr, "_build_conn", side_effect=lambda cfg: MagicMock()) as build:
+            first = mgr.get_conn("ns")
+            assert mgr.get_conn("ns") is first  # cached
+            mgr.close()
+            rebuilt = mgr.get_conn("ns")  # must not return the closed (popped) connector
+            assert rebuilt is not first
+            assert build.call_count == 2
+
+    def test_get_connections_returns_map_for_glob(self, tmp_path):
+        # A glob datasource exposes one connector per matched file, keyed by file/db name.
+        from datus.configuration.agent_config import DbConfig
+
+        (tmp_path / "a.sqlite").touch()
+        (tmp_path / "b.sqlite").touch()
+        pattern = str(tmp_path / "*.sqlite")
+        configs = {"ns": DbConfig(type=DBType.SQLITE, path_pattern=pattern)}
+        mgr = DBManager(configs)
+        with patch.object(mgr, "_build_conn", side_effect=lambda cfg: MagicMock()):
+            connections = mgr.get_connections("ns")
+        assert isinstance(connections, dict)
+        assert set(connections.keys()) == {"a", "b"}
+
+    def test_get_connections_unconfigured_database_not_set_to_datasource_name(self):
+        # Regression: a single (server) datasource with no ``database`` configured must not
+        # have the datasource name leak into the connection's database. get_db_uris keys the
+        # map on the datasource name as a display fallback, but that label must not be fed
+        # back as a database override.
+        from datus.configuration.agent_config import DbConfig
+
+        configs = {"mypg": DbConfig(type="postgresql", host="h", port="5432", uri="postgresql://h:5432/")}
+        mgr = DBManager(configs)
+        built = {}
+
+        def _capture(cfg):
+            built["database"] = cfg.database
+            return MagicMock()
+
+        with patch.object(mgr, "_build_conn", side_effect=_capture):
+            connections = mgr.get_connections("mypg")
+        # Display key still reflects the datasource label.
+        assert set(connections.keys()) == {"mypg"}
+        # But the connector is built without the datasource name as its database.
+        assert built["database"] == ""
+
+    def test_first_conn_with_name_returns_database_name_not_datasource(self):
+        # Regression: first_conn_with_name must return the resolved *database* name, never the
+        # datasource name. A server datasource with no configured database yields an empty name.
+        from datus.configuration.agent_config import DbConfig
+
+        mgr = DBManager({"mypg": DbConfig(type="postgresql", host="h", uri="postgresql://h/")})
+        connector = MagicMock()
+        connector.database_name = ""
+        with patch.object(mgr, "_build_conn", return_value=connector):
+            name, conn = mgr.first_conn_with_name("mypg")
+        assert name == ""  # not "mypg"
+        assert conn is connector
+
+    def test_first_conn_with_name_prefers_connector_derived_name(self):
+        # SQLite/DuckDB derive the database name from the file path on the connector, which
+        # cfg.database does not carry; first_conn_with_name must surface that real name.
+        from datus.configuration.agent_config import DbConfig
+
+        mgr = DBManager({"school": DbConfig(type="sqlite", uri="sqlite:///x/california_schools.sqlite")})
+        connector = MagicMock()
+        connector.database_name = "california_schools"
+        with patch.object(mgr, "_build_conn", return_value=connector):
+            name, _ = mgr.first_conn_with_name("school")
+        assert name == "california_schools"  # not "school"
+
+    def test_duckdb_config_includes_extra_runtime_options(self):
+        mgr = DBManager({})
+        cfg = _cfg(
+            type="duckdb",
+            uri="duckdb:///:memory:",
+            extra={
+                "read_only": "true",
+                "enable_external_access": "false",
+                "memory_limit": "2GB",
+                "iceberg": {
+                    "catalog_alias": "lake",
+                    "catalog_uri": "http://127.0.0.1:8181",
+                    "warehouse": "s3://warehouse/",
+                },
+            },
+        )
+
+        result = mgr._db_config_to_connection_config(cfg)
+
+        assert isinstance(result, DuckDBConfig)
+        assert result.db_path == ":memory:"
+        assert result.read_only is True
+        assert result.enable_external_access is False
+        assert result.memory_limit == "2GB"
+        assert result.iceberg == cfg.extra["iceberg"]
+
+    def test_sqlite_config_includes_read_only_extra_option(self):
+        mgr = DBManager({})
+        cfg = _cfg(type="sqlite", uri="sqlite:///test.db", extra={"read_only": "true"})
+
+        result = mgr._db_config_to_connection_config(cfg)
+
+        assert isinstance(result, SQLiteConfig)
+        assert result.db_path == "test.db"
+        assert result.read_only is True
+
+    def test_close_closes_connections(self):
+        mgr = DBManager({})
+        first = MagicMock()
+        second = MagicMock()
+        # _conn_dict is {datasource: {database: connector}}.
+        mgr._conn_dict["analytics"] = {"raw": first}
+        mgr._conn_dict["mart"] = {"main": second}
+
+        mgr.close()
+
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        # Closed connectors are evicted (not left as None) so a later get_conn() rebuilds them.
+        assert "raw" not in mgr._conn_dict["analytics"]
+        assert "main" not in mgr._conn_dict["mart"]
+
+    def test_get_conn_self_heals_when_entry_nulled(self):
+        # An external pool may null a datasource entry to mark its connectors
+        # closed on eviction. setdefault keeps the None, so the manager must
+        # rebuild rather than raise 'NoneType' object has no attribute 'get'.
+        configs = {"ns": _cfg(type="sqlite", uri="sqlite:///test.db")}
+        mgr = DBManager(configs)
+        with patch.object(mgr, "_build_conn", side_effect=lambda cfg: MagicMock()):
+            first = mgr.get_conn("ns")
+            mgr._conn_dict["ns"] = None  # external eviction landmine
+            rebuilt = mgr.get_conn("ns")
+        assert rebuilt is not first
+        assert isinstance(mgr._conn_dict["ns"], dict)
+
+    def test_close_skips_nulled_entry(self):
+        # A nulled datasource entry must not break close() with
+        # 'NoneType' object has no attribute 'items'.
+        mgr = DBManager({})
+        conn = MagicMock()
+        mgr._conn_dict["analytics"] = {"raw": conn}
+        mgr._conn_dict["mart"] = None
+
+        mgr.close()
+
+        conn.close.assert_called_once()
+        assert "raw" not in mgr._conn_dict["analytics"]  # live group still drained
+        assert mgr._conn_dict["mart"] is None  # nulled entry skipped, not crashed
+
+
+# ---------------------------------------------------------------------------
+# DBManager._db_config_to_connection_config — adapter branch (lines 269-309)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.ci
+class TestDbConfigToConnectionConfigAdapterBranch:
+    """Tests for the adapter (non-SQLite, non-DuckDB) branch of _db_config_to_connection_config."""
+
+    def _make_manager(self):
+        return DBManager({})
+
+    def test_adapter_returns_dict_not_connection_config(self):
+        """Non-SQLite/DuckDB type returns a plain dict, not a ConnectionConfig subclass."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="postgresql", host="localhost", port="5432", username="user", password="pass", database="mydb")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert isinstance(result, dict)
+
+    def test_adapter_excluded_fields_removed(self):
+        """Excluded fields (type, path_pattern, extra) are not in the result dict."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="postgresql",
+            host="localhost",
+            database="mydb",
+            path_pattern="/some/pattern",
+            extra=None,
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+        assert "type" not in result
+        assert "path_pattern" not in result
+        assert "extra" not in result
+
+    def test_adapter_port_converted_to_int(self):
+        """Port value provided as string is converted to int in the result."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="postgresql", host="localhost", port="5432", database="mydb")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result.get("port") == 5432
+        assert isinstance(result.get("port"), int)
+
+    def test_adapter_port_already_int_stays_int(self):
+        """Port value provided as int remains an int."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="mysql", host="localhost", port=3306, database="mydb")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result.get("port") == 3306
+        assert isinstance(result.get("port"), int)
+
+    def test_adapter_extra_fields_expanded(self):
+        """Extra dict fields are merged into the result config."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="snowflake",
+            host="acct.snowflakecomputing.com",
+            database="mydb",
+            extra={"warehouse": "COMPUTE_WH", "role": "ANALYST"},
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result.get("warehouse") == "COMPUTE_WH"
+        assert result.get("role") == "ANALYST"
+
+    def test_adapter_preserves_snowflake_key_pair_fields(self):
+        """Snowflake key-pair auth fields are passed to the external adapter."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="snowflake",
+            account="sf_account",
+            username="sf_user",
+            database="ANALYTICS",
+            warehouse="COMPUTE_WH",
+            role="ANALYST",
+            private_key_file="/tmp/rsa_key.p8",
+            private_key_file_pwd="1234",
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+
+        assert result["account"] == "sf_account"
+        assert result["warehouse"] == "COMPUTE_WH"
+        assert result["role"] == "ANALYST"
+        assert result["private_key_file"] == "/tmp/rsa_key.p8"
+        assert result["private_key_file_pwd"] == "1234"
+
+    def test_adapter_preserves_gaussdb_driver_and_tls_fields(self):
+        """GaussDB adapter options survive agent.yml parsing and manager conversion."""
+        from datus.configuration.agent_config import DbConfig
+
+        cfg = DbConfig.filter_kwargs(
+            DbConfig,
+            {
+                "type": "gaussdb",
+                "host": "gaussdb.example.com",
+                "port": "5432",
+                "username": "datus",
+                "password": "secret",
+                "database": "postgres",
+                "schema": "public",
+                "driver": "pg8000",
+                "sslmode": "verify-ca",
+                "sslrootcert": "/etc/datus/certs/gaussdb-ca.pem",
+            },
+        )
+
+        result = self._make_manager()._db_config_to_connection_config(cfg)
+
+        assert result["driver"] == "pg8000"
+        assert result["sslmode"] == "verify-ca"
+        assert result["sslrootcert"] == "/etc/datus/certs/gaussdb-ca.pem"
+
+    def test_adapter_none_values_removed(self):
+        """None-valued fields are excluded from the result dict."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="mysql", host="localhost", database="mydb", username=None, password=None)
+        result = mgr._db_config_to_connection_config(cfg)
+        assert "username" not in result
+        assert "password" not in result
+
+    def test_adapter_empty_string_values_removed(self):
+        """Empty-string-valued fields (after strip) are excluded from the result dict."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="mysql", host="localhost", database="mydb", schema="", catalog="  ")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert "schema" not in result
+        assert "catalog" not in result
+
+    def test_adapter_timeout_seconds_added(self):
+        """timeout_seconds is always added to the result dict for adapter configs."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="postgresql", host="localhost", database="mydb")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert "timeout_seconds" in result
+        assert isinstance(result["timeout_seconds"], int)
+
+    def test_adapter_extra_none_does_not_expand(self):
+        """When extra is None, no extra fields are added and no error is raised."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="mysql", host="localhost", database="mydb", extra=None)
+        result = mgr._db_config_to_connection_config(cfg)
+        assert isinstance(result, dict)
+        # extra key itself should not be present
+        assert "extra" not in result
+
+    def test_adapter_invalid_port_string_not_converted(self):
+        """Invalid port string that cannot be int-cast is left unchanged (no error)."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="postgresql", host="localhost", database="mydb", port="not_a_port")
+        # Should not raise
+        result = mgr._db_config_to_connection_config(cfg)
+        # Port stays as original value since conversion fails silently
+        assert "port" in result
+
+
+@pytest.mark.ci
+class TestDbManagerInstanceCaching:
+    """db_manager_instance (CLI mode) caches by datasource keys; the per-database
+    dimension lives inside DBManager.get_conn(datasource, database)."""
+
+    _previous_factory = None
+
+    def setup_method(self):
+        # Ensure CLI mode (no factory) and a clean cache for deterministic keys.
+        from datus.tools.db_tools import db_manager as dm
+
+        self._previous_factory = dm._factory
+        set_db_manager_factory(None)
+        dm._cli_cache.clear()
+
+    def teardown_method(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        set_db_manager_factory(self._previous_factory)
+        dm._cli_cache.clear()
+
+    def test_same_datasource_set_reuses_instance(self):
+        a = db_manager_instance({"ds": _cfg(type="sqlite", database="db_a")})
+        b = db_manager_instance({"ds": _cfg(type="sqlite", database="db_a")})
+        assert a is b
+
+    def test_same_datasource_keys_reuse_instance_regardless_of_database(self):
+        # database is no longer part of the cache key (it is a get_conn runtime param).
+        a = db_manager_instance({"ds": _cfg(type="sqlite", database="db_a")})
+        b = db_manager_instance({"ds": _cfg(type="sqlite", database="db_b")})
+        assert a is b
+
+    def test_different_datasource_keys_return_new_instance(self):
+        a = db_manager_instance({"ds_a": _cfg(type="sqlite", database="db")})
+        b = db_manager_instance({"ds_b": _cfg(type="sqlite", database="db")})
+        assert a is not b
+
+
+# ---------------------------------------------------------------------------
+# _auto_install_adapter single-flight
+# ---------------------------------------------------------------------------
+
+
+class TestAutoInstallAdapterSingleFlight:
+    def setup_method(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        dm._adapter_install_attempted.clear()
+        dm._adapter_install_active.clear()
+
+    def teardown_method(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        dm._adapter_install_attempted.clear()
+        dm._adapter_install_active.clear()
+
+    def test_concurrent_callers_spawn_one_install(self):
+        import threading
+
+        from datus.tools.db_tools import db_manager as dm
+
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def fake_run(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=3)
+            return SimpleNamespace(returncode=1, stderr="simulated failure")
+
+        def _install():
+            try:
+                dm._auto_install_adapter("faketype")
+            except Exception as exc:  # noqa: BLE001 - surfaced via the errors list
+                errors.append(exc)
+
+        with patch("subprocess.run", side_effect=fake_run) as mock_run:
+            first = threading.Thread(target=_install)
+            first.start()
+            assert entered.wait(timeout=1)
+            second = threading.Thread(target=_install)
+            second.start()
+            # Property: the second caller must wait on the first install, not
+            # race a duplicate pip process against the same environment.
+            second.join(timeout=0.3)
+            assert second.is_alive()
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+            assert not first.is_alive() and not second.is_alive(), "deadlock guard"
+
+        assert not errors
+        assert mock_run.call_count == 1
+
+    def test_failed_install_not_retried_within_process(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=1, stderr="no such package")) as mock_run:
+            dm._auto_install_adapter("faketype")
+            dm._auto_install_adapter("faketype")
+
+        assert mock_run.call_count == 1
+
+    def test_manual_install_takes_effect_without_new_subprocess(self):
+        # Property: the once-per-process memo guards only the pip subprocess.
+        # After a failed auto-install, a later attempt must still retry the
+        # cheap import + register so a manual `pip install datus-<type>` in
+        # the running session leaves the adapter genuinely usable — observable
+        # through the connector registry, which is what the REPL and
+        # _build_conn read — without spawning pip again.
+        from datus_db_core import connector_registry
+
+        from datus.tools.db_tools import db_manager as dm
+
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=1, stderr="no such package")) as mock_run:
+            dm._auto_install_adapter("faketype")
+        assert mock_run.call_count == 1
+        assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.FAILED
+
+        # The fake module registers a real (test-scoped) connector, like an
+        # actual datus_<type> package's register() would.
+        fake_module = SimpleNamespace(register=lambda: connector_registry.register("faketype", MagicMock))
+        try:
+            with (
+                patch("subprocess.run") as mock_run_again,
+                patch("importlib.import_module", return_value=fake_module),
+            ):
+                dm._auto_install_adapter("faketype")
+
+            mock_run_again.assert_not_called()
+            assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.REGISTERED
+        finally:
+            for attr in ("_connectors", "_factories", "_metadata", "_capabilities"):
+                getattr(connector_registry, attr, {}).pop("faketype", None)
+
+    def test_distinct_types_install_independently(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=1, stderr="no such package")) as mock_run:
+            dm._auto_install_adapter("faketype_a")
+            dm._auto_install_adapter("faketype_b")
+
+        assert mock_run.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# adapter_install_status
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterInstallStatus:
+    def setup_method(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        dm._adapter_install_attempted.clear()
+        dm._adapter_install_active.clear()
+
+    def teardown_method(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        dm._adapter_install_attempted.clear()
+        dm._adapter_install_active.clear()
+
+    def test_not_attempted_initially(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.NOT_ATTEMPTED
+
+    def test_failed_after_unsuccessful_install(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=1, stderr="no such package")):
+            dm._auto_install_adapter("faketype")
+
+        assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.FAILED
+
+    def test_installing_while_subprocess_runs_then_failed(self):
+        import threading
+
+        from datus.tools.db_tools import db_manager as dm
+
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def fake_run(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=3)
+            return SimpleNamespace(returncode=1, stderr="simulated failure")
+
+        def _install():
+            try:
+                dm._auto_install_adapter("faketype")
+            except Exception as exc:  # noqa: BLE001 - surfaced via the errors list
+                errors.append(exc)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            worker = threading.Thread(target=_install)
+            worker.start()
+            assert entered.wait(timeout=1)
+            assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.INSTALLING
+            release.set()
+            worker.join(timeout=2)
+            assert not worker.is_alive(), "deadlock guard"
+
+        assert not errors
+        assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.FAILED
+
+    def test_active_marker_cleared_when_install_raises(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        with patch("subprocess.run", side_effect=RuntimeError("boom")):
+            dm._auto_install_adapter("faketype")
+
+        # The finally block must clear the active marker so the state never
+        # sticks at INSTALLING after the subprocess is gone.
+        assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.FAILED
+
+    def test_dbmanager_method_delegates_to_process_state(self):
+        from datus.tools.db_tools import db_manager as dm
+
+        mgr = DBManager({})
+        assert mgr.adapter_install_status("faketype") is dm.AdapterInstallStatus.NOT_ATTEMPTED
+
+    def test_registered_wins_over_attempted_memo(self):
+        # Property: the status is self-contained — once the connector is
+        # registered (e.g. a concurrent caller's install just succeeded), the
+        # permanent "attempted" memo must not be read as a failure.
+        from datus.tools.db_tools import db_manager as dm
+
+        dm._adapter_install_attempted.add("faketype")
+        with patch("datus.tools.db_tools.db_manager.connector_registry.is_registered", return_value=True):
+            assert dm.adapter_install_status("faketype") is dm.AdapterInstallStatus.REGISTERED
+
+
+# ---------------------------------------------------------------------------
+# DBManager.missing_connector_type
+# ---------------------------------------------------------------------------
+
+
+class TestMissingConnectorType:
+    def test_registered_type_returns_none(self):
+        mgr = DBManager({"ds": _cfg(type="sqlite", database="db")})
+        assert mgr.missing_connector_type("ds") is None
+
+    def test_unregistered_type_returned(self):
+        mgr = DBManager({"ds": _cfg(type="nonexistent_db_xyz")})
+        assert mgr.missing_connector_type("ds") == "nonexistent_db_xyz"
+
+    def test_unknown_datasource_returns_none(self):
+        mgr = DBManager({})
+        assert mgr.missing_connector_type("nope") is None
+
+    def test_empty_type_returns_none(self):
+        mgr = DBManager({"ds": _cfg(type=None)})
+        assert mgr.missing_connector_type("ds") is None
+
+    def test_alias_normalized_before_registry_lookup(self):
+        mgr = DBManager({"ds": _cfg(type="postgres")})
+        with patch(
+            "datus.tools.db_tools.db_manager.connector_registry.is_registered", return_value=False
+        ) as mock_registered:
+            assert mgr.missing_connector_type("ds") == "postgresql"
+        mock_registered.assert_called_once_with("postgresql")
+
+    def test_probe_never_triggers_auto_install(self):
+        # Contract: the probe is metadata-only. The REPL calls it before the
+        # banner; a pip install here would reintroduce the silent startup hang.
+        mgr = DBManager({"ds": _cfg(type="nonexistent_db_xyz")})
+        with patch("datus.tools.db_tools.db_manager._auto_install_adapter") as mock_install:
+            mgr.missing_connector_type("ds")
+        mock_install.assert_not_called()

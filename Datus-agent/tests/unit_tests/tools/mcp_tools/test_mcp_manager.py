@@ -1,0 +1,798 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+
+"""Unit tests for datus/tools/mcp_tools/mcp_manager.py"""
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from datus.configuration.agent_config import ServicesConfig
+from datus.tools.mcp_tools.mcp_config import (
+    HTTPServerConfig,
+    MCPConfig,
+    MCPServerType,
+    SSEServerConfig,
+    STDIOServerConfig,
+    ToolFilterConfig,
+)
+from datus.tools.mcp_tools.mcp_manager import MCPManager, _validate_server_exists, create_static_tool_filter
+
+# ---------------------------------------------------------------------------
+# Helper: build a manager bypassing __init__ path manager calls
+# ---------------------------------------------------------------------------
+
+
+def _make_manager(tmp_path: Path) -> MCPManager:
+    """Create MCPManager with config in tmp_path, bypassing real path_manager."""
+    mock_path_manager = MagicMock()
+    config_file = tmp_path / "conf" / ".mcp.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    mock_path_manager.mcp_config_path.return_value = config_file
+    mock_path_manager.ensure_dirs.return_value = None
+
+    with patch("datus.utils.path_manager.get_path_manager", return_value=mock_path_manager):
+        manager = MCPManager()
+
+    return manager
+
+
+# ---------------------------------------------------------------------------
+# create_static_tool_filter
+# ---------------------------------------------------------------------------
+
+
+class TestCreateStaticToolFilter:
+    def test_creates_with_allowlist(self):
+        tf = create_static_tool_filter(allowed_tool_names=["read", "write"])
+        assert tf.allowed_tool_names == ["read", "write"]
+        assert tf.blocked_tool_names is None
+        assert tf.enabled is True
+
+    def test_creates_with_blocklist(self):
+        tf = create_static_tool_filter(blocked_tool_names=["delete"])
+        assert tf.blocked_tool_names == ["delete"]
+        assert tf.allowed_tool_names is None
+
+    def test_creates_disabled(self):
+        tf = create_static_tool_filter(enabled=False)
+        assert tf.enabled is False
+
+    def test_filter_is_toolfilterconfig(self):
+        tf = create_static_tool_filter()
+        assert isinstance(tf, ToolFilterConfig)
+
+
+# ---------------------------------------------------------------------------
+# _validate_server_exists
+# ---------------------------------------------------------------------------
+
+
+class TestValidateServerExists:
+    def test_server_exists(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="test", command="python"))
+        valid, msg, cfg = _validate_server_exists(manager, "test")
+        assert valid is True
+        assert msg == ""
+        assert cfg.name == "test"
+
+    def test_server_not_exists(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        valid, msg, cfg = _validate_server_exists(manager, "nonexistent")
+        assert valid is False
+        assert "not found" in msg
+        assert cfg is None
+
+
+class TestMCPManagerInit:
+    def test_init_uses_explicit_path_manager(self, tmp_path):
+        config_file = tmp_path / "conf" / ".mcp.json"
+        path_manager = MagicMock()
+        path_manager.mcp_config_path.return_value = config_file
+
+        manager = MCPManager(path_manager=path_manager)
+
+        path_manager.ensure_dirs.assert_called_once_with("conf")
+        assert manager.config_path == config_file
+
+    def test_init_uses_agent_config_path_manager(self, tmp_path):
+        config_file = tmp_path / "conf" / ".mcp.json"
+        path_manager = MagicMock()
+        path_manager.mcp_config_path.return_value = config_file
+        agent_config = SimpleNamespace(path_manager=path_manager)
+
+        manager = MCPManager(agent_config=agent_config)
+
+        path_manager.ensure_dirs.assert_called_once_with("conf")
+        assert manager.config_path == config_file
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - config CRUD
+# ---------------------------------------------------------------------------
+
+
+class TestMCPManagerCRUD:
+    def test_add_server_success(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        srv = STDIOServerConfig(name="my-srv", command="python")
+        success, msg = manager.add_server(srv)
+        assert success is True
+        assert "my-srv" in manager.config.servers
+
+    def test_add_server_duplicate_fails(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        srv = STDIOServerConfig(name="dup", command="python")
+        manager.add_server(srv)
+        success, msg = manager.add_server(srv)
+        assert success is False
+        assert "already exists" in msg
+
+    def test_remove_server_success(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        srv = STDIOServerConfig(name="to-remove", command="python")
+        manager.add_server(srv)
+        success, msg = manager.remove_server("to-remove")
+        assert success is True
+        assert "to-remove" not in manager.config.servers
+
+    def test_remove_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        success, msg = manager.remove_server("nonexistent")
+        assert success is False
+        assert "not found" in msg
+
+    def test_list_servers_empty(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        assert manager.list_servers() == []
+
+    def test_list_servers_all(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="s1", command="python"))
+        manager.config.add_server(SSEServerConfig(name="s2", url="http://example.com"))
+        servers = manager.list_servers()
+        assert len(servers) == 2
+
+    def test_list_servers_filtered(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="s1", command="python"))
+        manager.config.add_server(SSEServerConfig(name="s2", url="http://example.com"))
+        stdio_servers = manager.list_servers(server_type=MCPServerType.STDIO)
+        assert len(stdio_servers) == 1
+        assert stdio_servers[0].name == "s1"
+
+    def test_get_server_config_existing(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        srv = STDIOServerConfig(name="srv", command="echo")
+        manager.config.add_server(srv)
+        result = manager.get_server_config("srv")
+        assert result.name == "srv"
+
+    def test_get_server_config_missing(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        assert manager.get_server_config("missing") is None
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - save/load config
+# ---------------------------------------------------------------------------
+
+
+class TestMCPManagerPersistence:
+    def test_save_and_load_config(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="persist-srv", command="node"))
+        saved = manager.save_config()
+        assert saved is True
+        assert manager.config_path.exists()
+
+        # Load it back with a fresh manager pointing to same file
+        manager2 = _make_manager(tmp_path)
+        assert "persist-srv" in manager2.config.servers
+
+    def test_load_config_file_missing(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        # Remove config file
+        if manager.config_path.exists():
+            manager.config_path.unlink()
+        result = manager.load_config()
+        assert result is True
+
+    def test_load_config_empty_file(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config_path.parent.mkdir(parents=True, exist_ok=True)
+        manager.config_path.write_text("")
+        result = manager.load_config()
+        assert result is True
+
+    def test_load_config_invalid_format(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config_path.write_text(json.dumps({"otherKey": {}}))
+        result = manager.load_config()
+        assert result is True
+        assert manager.config.servers == {}
+
+    def test_save_config_failure(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        with patch("builtins.open", side_effect=PermissionError("denied")):
+            result = manager.save_config()
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - tool filter management
+# ---------------------------------------------------------------------------
+
+
+class TestMCPManagerToolFilter:
+    def test_set_tool_filter_success(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        tf = ToolFilterConfig(allowed_tool_names=["read"])
+        success, msg = manager.set_tool_filter("srv", tf)
+        assert success is True
+        assert manager.config.servers["srv"].tool_filter is tf
+
+    def test_set_tool_filter_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(allowed_tool_names=["read"])
+        success, msg = manager.set_tool_filter("nonexistent", tf)
+        assert success is False
+        assert "not found" in msg
+
+    def test_get_tool_filter_existing(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(allowed_tool_names=["write"])
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python", tool_filter=tf))
+        success, msg, result = manager.get_tool_filter("srv")
+        assert success is True
+        assert result is tf
+
+    def test_get_tool_filter_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        success, msg, result = manager.get_tool_filter("missing")
+        assert success is False
+        assert result is None
+
+    def test_get_tool_filter_no_filter_set(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        success, msg, result = manager.get_tool_filter("srv")
+        assert success is True
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - _create_server_instance
+# ---------------------------------------------------------------------------
+
+
+class TestCreateServerInstance:
+    def test_create_stdio_server(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        cfg = STDIOServerConfig(name="stdio", command="python", args=["-m", "app"])
+        with patch("datus.tools.mcp_tools.mcp_manager.SilentMCPServerStdio") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+            instance, details = manager._create_server_instance(cfg)
+        assert instance is mock_instance
+        assert details["command"] == "python"
+
+    def test_create_sse_server_missing_url(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        # Use _create_sse_server directly with empty url
+        instance, details = manager._create_sse_server({"url": None})
+        assert instance is None
+        assert "error" in details
+
+    def test_create_http_server_missing_url(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        instance, details = manager._create_http_server({"url": None})
+        assert instance is None
+        assert "error" in details
+
+    def test_create_sse_server_with_url(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        with patch("datus.tools.mcp_tools.mcp_manager.MCPServerSse") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerSseParams"):
+                instance, details = manager._create_sse_server({"url": "http://example.com"})
+        assert instance is mock_instance
+
+    def test_create_http_server_with_url(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttp") as mock_cls:
+            mock_instance = MagicMock()
+            mock_cls.return_value = mock_instance
+            with patch("datus.tools.mcp_tools.mcp_manager.MCPServerStreamableHttpParams"):
+                instance, details = manager._create_http_server({"url": "http://example.com"})
+        assert instance is mock_instance
+
+    def test_create_server_instance_unsupported_type(self, tmp_path, monkeypatch):
+        manager = _make_manager(tmp_path)
+        cfg = STDIOServerConfig(name="s", command="echo")
+        # Force cfg.type to an unexpected value to exercise the unsupported-type
+        # dispatch branch. monkeypatch restores automatically on test teardown.
+        # If pydantic locks the field, this assertion fails loudly rather than
+        # being silently turned into a skip (Meszaros: Lying Test).
+        monkeypatch.setattr(cfg, "type", "unsupported_type")
+        instance, _details = manager._create_server_instance(cfg)
+        assert instance is None
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - async operations (mocked server instances)
+# ---------------------------------------------------------------------------
+
+
+class TestMCPManagerAsync:
+    @pytest.mark.asyncio
+    async def test_check_connectivity_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        success, msg, details = await manager.check_connectivity("nonexistent")
+        assert success is False
+        assert "not found" in msg
+
+    @pytest.mark.asyncio
+    async def test_check_connectivity_instance_creation_fails(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "fail"})):
+            success, msg, details = await manager.check_connectivity("srv")
+        assert success is False
+        assert "fail" in msg
+
+    @pytest.mark.asyncio
+    async def test_list_tools_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        success, msg, tools = await manager.list_tools("nonexistent")
+        assert success is False
+        assert tools == []
+
+    @pytest.mark.asyncio
+    async def test_list_tools_instance_creation_fails(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "can't connect"})):
+            success, msg, tools = await manager.list_tools("srv")
+        assert success is False
+        assert tools == []
+
+    @pytest.mark.asyncio
+    async def test_check_connectivity_asks_for_the_unfiltered_surface(self, tmp_path):
+        """Connectivity reports a tool count, so it must see every tool."""
+        manager = _make_manager(tmp_path)
+        config = STDIOServerConfig(name="srv", command="python")
+        manager.config.add_server(config)
+
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "fail"})) as create:
+            await manager.check_connectivity("srv")
+
+        create.assert_called_once_with(config, with_tool_filter=False)
+
+    @pytest.mark.asyncio
+    async def test_list_tools_asks_for_the_unfiltered_surface(self, tmp_path):
+        """It filters afterwards, and `apply_filter=False` callers (the picker
+        UI) must be able to see a blocked tool — otherwise it could never be
+        re-enabled."""
+        manager = _make_manager(tmp_path)
+        config = STDIOServerConfig(name="srv", command="python")
+        manager.config.add_server(config)
+
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "fail"})) as create:
+            await manager.list_tools("srv")
+
+        create.assert_called_once_with(config, with_tool_filter=False)
+
+    @pytest.mark.asyncio
+    async def test_call_tool_keeps_the_filter_bound(self, tmp_path):
+        """Defence in depth: call_tool already refuses a blocked name, and the
+        instance stays filtered on top of that."""
+        manager = _make_manager(tmp_path)
+        config = STDIOServerConfig(name="srv", command="python")
+        manager.config.add_server(config)
+
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "fail"})) as create:
+            await manager.call_tool("srv", "some_tool", {})
+
+        create.assert_called_once_with(config)
+
+    @pytest.mark.asyncio
+    async def test_list_tools_success_with_filter(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(allowed_tool_names=["read"])
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python", tool_filter=tf))
+        mock_server = MagicMock()
+        with patch.object(manager, "_create_server_instance", return_value=(mock_server, {})):
+            with patch.object(
+                manager,
+                "_run_tools_operation_async",
+                return_value=(True, {"tools": [{"name": "read"}, {"name": "write"}]}),
+            ):
+                success, msg, tools = await manager.list_tools("srv", apply_filter=True)
+        assert success is True
+        # Only "read" passes filter
+        assert len(tools) == 1
+        assert tools[0]["name"] == "read"
+
+    @pytest.mark.asyncio
+    async def test_list_tools_no_filter_applied(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(allowed_tool_names=["read"])
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python", tool_filter=tf))
+        mock_server = MagicMock()
+        with patch.object(manager, "_create_server_instance", return_value=(mock_server, {})):
+            with patch.object(
+                manager,
+                "_run_tools_operation_async",
+                return_value=(True, {"tools": [{"name": "read"}, {"name": "write"}]}),
+            ):
+                success, msg, tools = await manager.list_tools("srv", apply_filter=False)
+        assert success is True
+        assert len(tools) == 2
+
+    @pytest.mark.asyncio
+    async def test_call_tool_server_not_found(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        success, msg, data = await manager.call_tool("nonexistent", "my_tool", {})
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_call_tool_blocked_by_filter(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(blocked_tool_names=["dangerous"])
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python", tool_filter=tf))
+        success, msg, data = await manager.call_tool("srv", "dangerous", {})
+        assert success is False
+        assert "blocked" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_tool_instance_creation_fails(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        with patch.object(manager, "_create_server_instance", return_value=(None, {"error": "no server"})):
+            success, msg, data = await manager.call_tool("srv", "my_tool", {})
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_call_tool_success(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        mock_server = MagicMock()
+        result_data = {"content": [{"type": "text", "text": "result"}], "isError": False}
+        with patch.object(manager, "_create_server_instance", return_value=(mock_server, {})):
+            with patch.object(manager, "_run_tools_operation_async", return_value=(True, result_data)):
+                success, msg, data = await manager.call_tool("srv", "my_tool", {"arg": "val"})
+        assert success is True
+        assert data == result_data
+
+    @pytest.mark.asyncio
+    async def test_list_filtered_tools_delegates(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.config.add_server(STDIOServerConfig(name="srv", command="python"))
+        mock_server = MagicMock()
+        with patch.object(manager, "_create_server_instance", return_value=(mock_server, {})):
+            with patch.object(manager, "_run_tools_operation_async", return_value=(True, {"tools": [{"name": "t1"}]})):
+                success, msg, tools = await manager.list_filtered_tools("srv")
+        assert success is True
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - _dispatch_operation and handlers
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchOperation:
+    @pytest.mark.asyncio
+    async def test_dispatch_unknown_operation(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        server_instance = MagicMock()
+        agent = MagicMock()
+        run_context = MagicMock()
+        success, data = await manager._dispatch_operation(server_instance, "srv", "unknown_op", agent, run_context)
+        assert success is False
+        assert "Unknown operation" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_handle_list_tools(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_tool = MagicMock()
+        mock_tool.name = "read_file"
+        mock_tool.description = "Read a file"
+        mock_tool.inputSchema = {"type": "object"}
+        server_instance = AsyncMock()
+        server_instance.list_tools.return_value = [mock_tool]
+        agent = MagicMock()
+        run_context = MagicMock()
+        success, data = await manager._handle_list_tools(server_instance, "srv", run_context, agent)
+        assert success is True
+        assert len(data["tools"]) == 1
+        assert data["tools"][0]["name"] == "read_file"
+
+    @pytest.mark.asyncio
+    async def test_handle_list_tools_empty(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        server_instance = AsyncMock()
+        server_instance.list_tools.return_value = []
+        agent = MagicMock()
+        run_context = MagicMock()
+        success, data = await manager._handle_list_tools(server_instance, "srv", run_context, agent)
+        assert success is True
+        assert data["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_handle_list_tools_with_model_dump_schema(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_tool = MagicMock()
+        mock_tool.name = "my_tool"
+        mock_tool.description = "desc"
+        # inputSchema has model_dump
+        schema_mock = MagicMock()
+        schema_mock.model_dump.return_value = {"type": "object", "properties": {}}
+        mock_tool.inputSchema = schema_mock
+        server_instance = AsyncMock()
+        server_instance.list_tools.return_value = [mock_tool]
+        success, data = await manager._handle_list_tools(server_instance, "srv", MagicMock(), MagicMock())
+        assert data["tools"][0]["inputSchema"] == {"type": "object", "properties": {}}
+
+    @pytest.mark.asyncio
+    async def test_handle_call_tool_no_name(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        server_instance = AsyncMock()
+        success, data = await manager._handle_call_tool(server_instance, "srv")
+        assert success is False
+        assert "required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_handle_call_tool_success(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_content = MagicMock()
+        mock_content.type = "text"
+        mock_content.text = "hello"
+        mock_result = MagicMock()
+        mock_result.isError = False
+        mock_result.content = [mock_content]
+        server_instance = AsyncMock()
+        server_instance.call_tool.return_value = mock_result
+        success, data = await manager._handle_call_tool(server_instance, "srv", tool_name="my_tool", arguments={"a": 1})
+        assert success is True
+        assert data["isError"] is False
+        assert data["content"][0]["text"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_handle_call_tool_data_content(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_content = MagicMock(spec=["type", "data"])
+        mock_content.type = "image"
+        mock_content.data = b"imagedata"
+        mock_result = MagicMock()
+        mock_result.isError = False
+        mock_result.content = [mock_content]
+        server_instance = AsyncMock()
+        server_instance.call_tool.return_value = mock_result
+        success, data = await manager._handle_call_tool(server_instance, "srv", tool_name="screenshot", arguments={})
+        assert success is True
+        assert data["content"][0]["data"] == b"imagedata"
+
+    @pytest.mark.asyncio
+    async def test_handle_connectivity_test(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_tool = MagicMock()
+        mock_tool.name = "tool1"
+        server_instance = AsyncMock()
+        server_instance.list_tools.return_value = [mock_tool]
+        agent = MagicMock()
+        run_context = MagicMock()
+        success, data = await manager._handle_connectivity_test(server_instance, "srv", run_context, agent)
+        assert success is True
+        assert data["connected"] is True
+        assert data["tool_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_connectivity_test_list_tools_fails(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        server_instance = AsyncMock()
+        server_instance.list_tools.side_effect = Exception("timeout")
+        agent = MagicMock()
+        run_context = MagicMock()
+        success, data = await manager._handle_connectivity_test(server_instance, "srv", run_context, agent)
+        assert success is True
+        assert data["tools_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_handle_connectivity_test_no_list_tools(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        # Server instance without list_tools attribute
+        server_instance = MagicMock(spec=[])
+        success, data = await manager._handle_connectivity_test(server_instance, "srv", MagicMock(), MagicMock())
+        assert success is True
+        assert data["tools_available"] is False
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - _cleanup_server_instance
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupServerInstance:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", ["cleanup", "disconnect", "close"])
+    async def test_cleanup_calls_available_method(self, tmp_path, method_name):
+        manager = _make_manager(tmp_path)
+        mock_srv = AsyncMock(spec=[method_name])
+        await manager._cleanup_server_instance(mock_srv)
+        getattr(mock_srv, method_name).assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_exception_suppressed(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        mock_srv = AsyncMock()
+        mock_srv.cleanup.side_effect = Exception("cleanup failed")
+        # Should not raise even when the underlying cleanup throws.
+        await manager._cleanup_server_instance(mock_srv)
+        # Verify cleanup was actually attempted (behavior, not just "no crash").
+        mock_srv.cleanup.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# MCPManager - cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestCleanup:
+    def test_cleanup_manager(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        manager.cleanup()
+        # cleanup() is a no-op finalizer; verify manager state remains intact
+        assert isinstance(manager.config, MCPConfig)
+        assert manager.config_path.name == ".mcp.json"
+
+
+# ---------------------------------------------------------------------------
+# Runtime tool filtering
+# ---------------------------------------------------------------------------
+
+
+class TestSdkToolFilter:
+    """The filter has to reach the SDK server instance, not just list_tools."""
+
+    def _http_config(self, tool_filter=None):
+        return HTTPServerConfig(name="srv", url="https://mcp.example.com/mcp", tool_filter=tool_filter)
+
+    def test_returns_none_without_filter(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        assert manager._sdk_tool_filter(self._http_config()) is None
+
+    def test_returns_none_when_disabled(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(enabled=False, allowed_tool_names=["a"])
+        assert manager._sdk_tool_filter(self._http_config(tf)) is None
+
+    def test_returns_none_when_nothing_listed(self, tmp_path):
+        """enabled=True with no names is "no restriction", not "allow nothing"."""
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(enabled=True)
+        assert manager._sdk_tool_filter(self._http_config(tf)) is None
+
+    def test_translates_to_the_sdk_shape(self, tmp_path):
+        """Must be the SDK's mapping — its own model would silently filter all."""
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(enabled=True, allowed_tool_names=["a"], blocked_tool_names=["b"])
+
+        result = manager._sdk_tool_filter(self._http_config(tf))
+
+        assert isinstance(result, dict)
+        assert result["allowed_tool_names"] == ["a"]
+        assert result["blocked_tool_names"] == ["b"]
+
+    def test_agent_facing_instance_carries_the_filter(self, tmp_path):
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(enabled=True, allowed_tool_names=["a"])
+
+        instance, _ = manager._create_server_instance(self._http_config(tf))
+
+        assert instance.tool_filter == {"allowed_tool_names": ["a"]}
+
+    def test_management_instance_sees_the_full_surface(self, tmp_path):
+        """list_tools/connectivity must report every tool, or a blocked one
+        could never be re-enabled from the UI."""
+        manager = _make_manager(tmp_path)
+        tf = ToolFilterConfig(enabled=True, allowed_tool_names=["a"])
+
+        instance, _ = manager._create_server_instance(self._http_config(tf), with_tool_filter=False)
+
+        assert instance.tool_filter is None
+
+
+# ---------------------------------------------------------------------------
+# In-memory servers supplied by the host (SaaS)
+# ---------------------------------------------------------------------------
+
+
+class TestServersFromAgentConfig:
+    """The host passes servers through AgentConfig; nothing touches the disk."""
+
+    SERVERS = {
+        "github": {
+            "type": "http",
+            "url": "https://api.example.com/mcp/",
+            "headers": {"Authorization": "Bearer tok"},
+        }
+    }
+
+    def _manager(self, tmp_path: Path, services) -> MCPManager:
+        mock_path_manager = MagicMock()
+        config_file = tmp_path / "conf" / ".mcp.json"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        mock_path_manager.mcp_config_path.return_value = config_file
+        mock_path_manager.ensure_dirs.return_value = None
+        agent_config = SimpleNamespace(services=services)
+
+        with patch("datus.utils.path_manager.get_path_manager", return_value=mock_path_manager):
+            return MCPManager(agent_config=agent_config)
+
+    def test_loads_servers_without_reading_the_file(self, tmp_path):
+        manager = self._manager(tmp_path, {"mcp_servers": self.SERVERS})
+
+        assert manager.externally_managed is True
+        assert [s.name for s in manager.list_servers()] == ["github"]
+        assert manager.get_server_config("github").headers == {"Authorization": "Bearer tok"}
+        # The file was never created, so credentials never hit the volume.
+        assert not (tmp_path / "conf" / ".mcp.json").exists()
+
+    def test_in_memory_servers_win_over_a_file(self, tmp_path):
+        config_file = tmp_path / "conf" / ".mcp.json"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps({"mcpServers": {"stale": {"type": "http", "url": "https://old"}}}))
+
+        manager = self._manager(tmp_path, {"mcp_servers": self.SERVERS})
+
+        assert [s.name for s in manager.list_servers()] == ["github"]
+
+    def test_empty_section_falls_back_to_the_file(self, tmp_path):
+        """An absent section means "this host doesn't manage MCP" — a CLI user's
+        own file must keep working."""
+        config_file = tmp_path / "conf" / ".mcp.json"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps({"mcpServers": {"local": {"type": "http", "url": "https://local"}}}))
+
+        manager = self._manager(tmp_path, {"mcp_servers": {}})
+
+        assert manager.externally_managed is False
+        assert [s.name for s in manager.list_servers()] == ["local"]
+
+    def test_loads_through_the_real_services_config(self, tmp_path):
+        """The production path is AgentConfig -> ServicesConfig dataclass, not a
+        plain dict. Cover it end to end: an untyped section is dropped by
+        `from_dict` and never reaches the manager, which is exactly how this
+        broke once — every dict-shaped test stayed green while the agent read
+        nothing."""
+        services = ServicesConfig.from_dict({"mcp_servers": self.SERVERS})
+        assert services.mcp_servers == self.SERVERS
+
+        manager = self._manager(tmp_path, services)
+
+        assert manager.externally_managed is True
+        assert [s.name for s in manager.list_servers()] == ["github"]
+        assert not (tmp_path / "conf" / ".mcp.json").exists()
+
+    def test_writes_are_refused(self, tmp_path):
+        manager = self._manager(tmp_path, {"mcp_servers": self.SERVERS})
+
+        added, add_msg = manager.add_server(HTTPServerConfig(name="another", url="https://y/mcp"))
+        removed, remove_msg = manager.remove_server("github")
+        filtered, filter_msg = manager.set_tool_filter(
+            "github", ToolFilterConfig(enabled=True, allowed_tool_names=["a"])
+        )
+
+        # Persisting would write a file nothing reads back, so the edit would
+        # look like it worked and quietly disappear on the next request.
+        assert (added, removed, filtered) == (False, False, False)
+        for msg in (add_msg, remove_msg, filter_msg):
+            assert "managed by the host" in msg
+        assert [s.name for s in manager.list_servers()] == ["github"]

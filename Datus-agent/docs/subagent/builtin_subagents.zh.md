@@ -1,0 +1,488 @@
+# 内置 Subagent
+
+## 概览
+
+**内置 Subagent**  是集成在 Datus Agent 系统中的专用 AI 助手。每个subagent专注于数据工程自动化的特定方面——分析 SQL、生成语义模型、将查询转换为可复用指标——共同构成从原始 SQL 到具备知识感知的数据产品的闭环工作流。
+
+本文档涵盖核心 subagent：
+
+1. **[gen_sql_summary](#gen_sql_summary)** — 总结和分类 SQL 查询
+2. **[semantic_modeling](semantic_modeling.zh.md)** — 创作 Dosi 语义模型和指标
+3. **[ask_metrics](ask_metrics.zh.md)** — 基于已有语义指标回答 KPI、趋势、分组指标和归因问题
+4. **[explore](#explore)** — 只读数据探索和上下文收集
+5. **[gen_sql](#gen_sql)** — 具备深度专业知识的专用 SQL 生成
+6. **[gen_report](#gen_report)** — 灵活的报告生成，支持可配置工具
+7. **[gen_table](gen_table.zh.md)** — 数据库建表（CTAS 或自然语言描述）
+8. **[gen_job](gen_job.zh.md)** — 数据管道执行（单库 ETL 和跨库迁移，含对数校验）
+9. **[gen_skill](#gen_skill)** — skill 创建与优化
+10. **[gen_visual_report](gen_visual_report.zh.md)** — 在 `reports/<slug>/` 下产出自包含的可视化报告
+
+Airflow 调度和外部 BI authoring 由主 agent 直接使用已安装 plugin 完成，
+不再属于内置或自定义 subagent。
+
+在 REPL 中可以直接描述任务，由主 agent 自动派发给合适的 subagent。如需为
+单条消息明确指定，可在请求末尾加 `@Agent <名称>`；`/agent <名称>` 用于切换
+后续消息使用的当前 agent。旧的 `/<subagent> <消息>` 形式不再支持。
+
+## 配置
+
+内置subagent开箱即用，最小化配置。大部分设置（工具、hooks、MCP 服务器、系统提示）都是内置的。你可以在 `agent.yml` 文件中自定义：
+
+```yaml
+agent:
+  agentic_nodes:
+    semantic_modeling:
+      model: claude     # 可选：默认使用已配置的模型
+      max_turns: 30     # 可选：默认为 30
+
+    ask_metrics:
+      model: claude     # 可选：默认使用已配置的模型
+      max_turns: 12     # 可选：默认为 12
+
+    gen_sql_summary:
+      model: deepseek   # 可选：默认使用已配置的模型
+      max_turns: 30     # 可选：默认为 30
+
+    explore:
+      model: haiku      # 推荐：较小模型适合工具调用任务
+      max_turns: 15     # 可选：默认为 15
+
+    gen_sql:
+      model: claude     # 可选：默认使用已配置的模型
+      max_turns: 30     # 可选：默认为 30
+
+    gen_report:
+      model: claude     # 可选：默认使用已配置的模型
+      max_turns: 30     # 可选：默认为 30
+      tools: "semantic_tools.*, context_search_tools.list_subject_tree"  # 可选：默认使用语义+上下文工具
+
+    gen_table:
+      max_turns: 20     # 可选：默认为 20
+
+    gen_job:
+      max_turns: 30     # 可选：默认为 30
+
+    gen_skill:
+      max_turns: 30     # 可选：默认为 30
+
+    gen_visual_report:
+      model: claude            # 可选：默认使用已配置的模型
+      max_turns: 30            # 可选：默认为 30
+      report_dist: ~/report_dist  # 可选：HTML 离线编译时使用的本地 dist 目录
+```
+
+**可选配置参数**：
+
+- `model`：使用的 AI 模型（如 `claude`、`deepseek`）。默认使用已配置的模型。
+- `max_turns`：最大对话轮数（默认：30）
+
+**内置配置**（无需设置）：
+- **工具**：根据 subagent 类型自动配置
+- **Hooks**：按工作流启用验证和知识库同步
+- **语义工具**：`semantic_modeling` 使用内置的 Dosi 校验和查询工具
+- **系统提示**：内置模板；未设置 `prompt_version` 时使用最新可用版本
+- **工作空间**：`~/.datus/data/{datasource}/` 及 subagent 特定子目录
+
+---
+
+## gen_sql_summary
+
+### 概览
+
+SQL 摘要功能帮助你分析、分类和编目 SQL 查询，用于知识复用。它自动生成结构化的 YAML 摘要，存储在可搜索的知识库中，便于将来查找和复用相似的查询。
+
+### 什么是 SQL 摘要？
+
+**SQL 摘要** 是一个结构化 YAML 文档，包含：
+
+- **查询文本**：完整的 SQL 查询
+- **业务上下文**：域、类别和标签
+- **语义摘要**：用于向量搜索的详细说明
+- **元数据**：名称、注释、文件路径
+
+### 快速开始
+
+直接描述需求，或在消息末尾指定 SQL 摘要生成 subagent：
+
+```text
+Analyze this SQL: SELECT SUM(revenue) FROM sales GROUP BY region. You can also add a description. @Agent gen_sql_summary
+```
+
+### 生成工作流
+
+```mermaid
+graph LR
+    A[用户提供 SQL + 描述] --> B[智能体分析查询]
+    B --> C[检索上下文]
+    C --> D[生成唯一 ID]
+    D --> E[创建 YAML]
+    E --> F[保存文件]
+    F --> G[同步到知识库]
+```
+
+**详细步骤**：
+
+1. **理解 SQL**：AI 分析你的查询结构和业务逻辑
+2. **获取上下文**：自动从知识库检索：
+   - 现有主题树（domain/layer1/layer2 组合）
+   - 类似的 SQL 摘要（最相似的前 5 个查询）用于分类参考
+3. **生成唯一 ID**：使用 `generate_sql_summary_id()` 工具，基于 SQL + 注释生成
+4. **创建唯一名称**：生成描述性名称（最多 20 个字符）
+5. **分类查询**：按照现有模式分配域、layer1、layer2 和标签
+6. **生成 YAML**：创建结构化摘要文档
+7. **保存文件**：使用 `write_file()` 工具将 YAML 写入工作空间
+8. **同步到知识库**：存储到 LanceDB 用于语义搜索
+
+### 同步行为
+
+在 interactive 模式下，YAML 文件写入成功后，generation hook 会自动把它同步到知识库。在 workflow/API 模式下，请使用对应的显式同步步骤或工具。
+
+### 主题树分类
+
+在 CLI 模式下通过问题中包含主题树来组织 SQL 摘要：
+
+**带主题树示例：**
+```text
+Analyze this SQL: SELECT SUM(revenue) FROM sales, subject_tree: sales/reporting/revenue_analysis. @Agent gen_sql_summary
+```
+
+**不带主题树示例：**
+```text
+Analyze this SQL: SELECT SUM(revenue) FROM sales. @Agent gen_sql_summary
+```
+
+未提供时，agent 会基于知识库中的现有主题树和相似查询自动建议分类。
+
+### YAML 结构
+
+生成的 SQL 摘要遵循以下结构：
+
+```yaml
+id: "abc123def456..."                      # 自动生成的 MD5 哈希
+name: "Revenue by Region"                  # 描述性名称（最多 20 个字符）
+sql: |                                     # 完整 SQL 查询
+  SELECT
+    region,
+    SUM(revenue) as total_revenue
+  FROM sales
+  GROUP BY region
+comment: "Calculate total revenue grouped by region"
+summary: "This query aggregates total revenue from the sales table, grouping results by geographic region. It uses SUM aggregation to calculate revenue totals for each region."
+filepath: "/Users/you/.datus/data/reference_sql/revenue_by_region.yml"
+domain: "Sales"                            # 业务域
+layer1: "Reporting"                        # 主要类别
+layer2: "Revenue Analysis"                 # 次要类别
+tags: "revenue, region, aggregation"       # 逗号分隔的标签
+```
+
+#### 字段说明
+
+| 字段 | 必需 | 描述 | 示例 |
+|-------|----------|-------------|---------|
+| `id` | 是 | 唯一哈希（自动生成） | `abc123def456...` |
+| `name` | 是 | 简短描述性名称（最多 20 个字符） | `Revenue by Region` |
+| `sql` | 是 | 完整 SQL 查询 | `SELECT ...` |
+| `comment` | 是 | 简短的单行描述 | 用户消息或生成的摘要 |
+| `summary` | 是 | 详细说明（用于搜索） | 全面的查询描述 |
+| `filepath` | 是 | 实际文件路径 | `/path/to/file.yml` |
+| `domain` | 是 | 业务域 | `Sales`、`Marketing`、`Finance` |
+| `layer1` | 是 | 主要类别 | `Reporting`、`Analytics`、`ETL` |
+| `layer2` | 是 | 次要类别 | `Revenue Analysis`、`Customer Insights` |
+| `tags` | 可选 | 逗号分隔的关键字 | `revenue, region, aggregation` |
+
+---
+
+## 语义建模
+
+Dosi 语义模型和指标由 [`semantic_modeling`](semantic_modeling.zh.md) 创作。
+
+## explore
+
+### 概览
+
+explore subagent 是一个轻量级只读助手，专为快速上下文收集设计。它帮助收集 schema 信息、数据采样和知识库上下文，为下游 SQL 生成提供支持——无论是聊天助手还是 gen_sql subagent。
+
+### 关键特性
+
+- **严格只读**：不会修改数据、文件或数据库记录。仅允许 SELECT 查询，且始终带 LIMIT。
+- **快速探索**：限制 15 轮对话，快速完成上下文收集。
+- **三方向探索**：
+  - **Schema+Sample**：发现表、列、类型、约束和采样数据
+  - **Knowledge**：搜索指标、参考 SQL、业务规则和领域知识
+  - **File**：浏览工作空间 SQL 文件和文档
+
+### 配置
+
+```yaml
+agent:
+  agentic_nodes:
+    explore:
+      model: haiku           # 推荐：使用较小模型（haiku、gpt-4o-mini）
+      max_turns: 15           # 可选：默认为 15
+```
+
+> **提示**：explore subagent 以工具调用为主，而非复杂推理。推荐使用较小、更快的模型（如 `haiku`、`gpt-4o-mini`），可降低成本并提升速度，同时不影响质量。
+
+### 可用工具
+
+| 工具类别 | 工具 | 用途 |
+|---------|------|------|
+| 数据库 | `list_databases`、`list_schemas`、`list_tables`、`search_table`、`describe_table`、`read_query` | Schema 发现和数据采样（只读） |
+| 上下文搜索 | `search_metrics`、`search_reference_sql`、`search_semantic_objects`、`list_subject_tree`、`get_reference_sql` | 知识库检索 |
+| 文件系统 | `read_file`、`glob`、`grep` | 只读文件浏览 |
+| 日期解析 | `get_current_date`、`parse_temporal_expressions` | 日期上下文 |
+
+### 输出格式
+
+explore subagent 返回简洁的结构化摘要，为其他 agent 消费而优化：
+
+- **Tables**：相关表及关键列、类型和备注
+- **Joins**：表之间的联接路径（每个关系一行）
+- **Data patterns**：非显而易见的数据模式（分隔符、编码、NULL 占比）
+- **Context**：找到的相关指标、参考 SQL 和业务规则
+- **Recommendation**：使用哪些表、如何联接及关键注意事项
+
+### 使用方式
+
+explore subagent 通常由聊天助手通过 `task(type="explore")` 自动调用。如需为单条消息明确指定，可在末尾加 `@Agent explore`：
+
+```text
+查找与客户收入相关的表和指标。@Agent explore
+```
+
+---
+
+## gen_sql
+
+### 概览
+
+gen_sql subagent 是一个专用 SQL 专家，生成经过优化和验证的 SQL 查询。它处理需要多步推理、复杂联接或领域特定逻辑的复杂 SQL 生成任务。
+
+### 关键特性
+
+- **深度 SQL 专业知识**：专注于编写复杂的生产级 SQL
+- **自动验证**：返回结果前验证 SQL 可执行性
+- **基于文件的输出**：对于复杂查询（50+ 行），将 SQL 输出到文件并提供预览
+- **修改支持**：修改现有查询时返回 unified diff 格式
+
+### 配置
+
+```yaml
+agent:
+  agentic_nodes:
+    gen_sql:
+      model: claude           # 可选：默认使用已配置的模型
+      max_turns: 30           # 可选：默认为 30
+```
+
+### 工作原理
+
+```mermaid
+graph LR
+    A[用户问题 + 上下文] --> B[分析需求]
+    B --> C[发现 Schema]
+    C --> D[搜索知识库]
+    D --> E[生成 SQL]
+    E --> F[验证可执行性]
+    F --> G[返回结果]
+```
+
+### 输出格式
+
+gen_sql subagent 以两种格式之一返回结果：
+
+**内联 SQL**（适用于较短查询）：
+```json
+{
+  "sql": "SELECT region, SUM(revenue) FROM sales GROUP BY region",
+  "response": "查询解释...",
+  "tokens_used": 1234
+}
+```
+
+**基于文件的 SQL**（适用于 50+ 行的复杂查询）：
+```json
+{
+  "sql_file_path": "/path/to/generated_query.sql",
+  "sql_preview": "查询的前几行...",
+  "response": "查询解释...",
+  "tokens_used": 5678
+}
+```
+
+### 使用方式
+
+gen_sql subagent 通常由聊天助手通过 `task(type="gen_sql")` 自动调用来处理复杂查询。如需为单条消息明确指定，可在末尾加 `@Agent gen_sql`：
+
+```text
+生成使用 cohort 分析计算客户生命周期价值的查询。@Agent gen_sql
+```
+
+---
+
+## gen_report
+
+### 概览
+
+gen_report subagent 是一个灵活的报告生成助手，结合语义工具、数据库工具和上下文搜索功能来生成结构化报告。它可以直接使用，也可以被特定领域的报告节点扩展（如归因分析）。
+
+### 关键特性
+
+- **可配置工具**：通过配置支持 `semantic_tools.*`、`db_tools.*` 和 `context_search_tools.*`
+- **灵活输出**：生成包含 SQL 查询和分析的结构化报告内容
+- **可扩展**：可以被子类化用于特定报告类型
+- **配置驱动**：工具设置和系统提示由 `agent.yml` 配置驱动
+
+### 配置
+
+```yaml
+agent:
+  agentic_nodes:
+    gen_report:
+      model: claude           # 可选：默认使用已配置的模型
+      max_turns: 30           # 可选：默认为 30
+      tools: "semantic_tools.*, db_tools.*, context_search_tools.list_subject_tree"  # 可选：自定义可用工具
+```
+
+**工具模式：**
+
+| 模式 | 描述 |
+|------|------|
+| `semantic_tools.*` | 所有语义工具（搜索指标、语义对象等） |
+| `db_tools.*` | 所有数据库工具（列出表、描述表、读取查询等） |
+| `context_search_tools.*` | 所有上下文搜索工具（搜索知识、参考 SQL 等） |
+| `semantic_tools.search_metrics` | 指定的语义工具方法 |
+| `context_search_tools.list_subject_tree` | 指定的上下文搜索方法 |
+
+默认工具（未配置时）：`semantic_tools.*, context_search_tools.list_subject_tree`
+
+### 工作原理
+
+```mermaid
+graph LR
+    A[用户问题 + 上下文] --> B[分析需求]
+    B --> C[搜索知识库]
+    C --> D[查询数据库]
+    D --> E[生成报告]
+    E --> F[返回结构化结果]
+```
+
+### 输出格式
+
+gen_report subagent 以结构化报告返回结果：
+
+```json
+{
+  "report": "包含分析的结构化报告内容...",
+  "response": "摘要说明...",
+  "tokens_used": 2345
+}
+```
+
+### 使用方式
+
+gen_report subagent 可以通过 `@Agent gen_report` 为单条消息明确指定，也可以由聊天助手通过 `task(type="gen_report")` 自动调用：
+
+```text
+分析上季度的收入趋势并提供洞察。@Agent gen_report
+```
+
+### 自定义报告 Subagent
+
+你可以在 `agent.yml` 中配置使用 gen_report 节点类的自定义 subagent：
+
+```yaml
+agent:
+  agentic_nodes:
+    attribution_report:
+      node_class: gen_report
+      tools: "semantic_tools.*, db_tools.*, context_search_tools.*"
+      max_turns: 30
+```
+
+然后输入 `分析活动 X 的转化归因。@Agent attribution_report`。
+
+---
+
+## gen_skill
+
+### 概览
+
+`gen_skill` subagent 用于引导用户创建或优化 Datus skill。它可以检查现有 skill、脚手架新的 skill 目录、编辑 `SKILL.md`、执行校验，并检索历史会话中的使用模式。
+
+### 关键特性
+
+- **交互式 skill 编写**：通过 `ask_user` 进行访谈式创建
+- **受控文件系统权限**：对工作区只读，对配置的 skills 目录可写
+- **skill 感知编辑**：修改前先加载已有 skill
+- **内置校验**：结束前可调用 `validate_skill` 检查结果
+
+### 配置
+
+```yaml
+agent:
+  agentic_nodes:
+    gen_skill:
+      model: claude
+      max_turns: 30
+```
+
+### 输出格式
+
+```json
+{
+  "response": "已创建一个用于财务仪表盘校验的新 skill。",
+  "skill_name": "finance-dashboard-validation",
+  "skill_path": "/path/to/skills/finance-dashboard-validation",
+  "tokens_used": 1980
+}
+```
+
+### 使用方式
+
+为单条消息明确指定：
+
+```text
+创建一个在发布前校验每日收入仪表盘的 skill。@Agent gen_skill
+```
+
+也可以由聊天 agent 通过 `task(type="gen_skill")` 自动委派。
+
+---
+
+## Plugin 平台操作
+
+Airflow 调度和 Superset 等外部 BI authoring 由主 agent 直接使用已安装 plugin
+及其内置 skill 完成，不能通过 `task()`、斜杠命令、agent API 或自定义 alias
+调用。
+
+旧 Node 实现暂时保留在代码中，仅用于兼容。迁移说明见
+[BI Dashboard 节点（旧版兼容）](gen_dashboard.zh.md)和
+[Scheduler 节点（旧版兼容）](scheduler.zh.md)。
+
+---
+
+## 总结
+
+| subagent | 用途 | 输出 | 存储位置 | 关键特性 |
+|----------|------|------|----------|----------|
+| `gen_sql_summary` | 总结和分类 SQL 查询 | YAML（SQL 摘要） | `/data/reference_sql` | 主题树分类、自动上下文检索 |
+| `semantic_modeling` | 创作语义模型和指标 | Dosi YAML | `/data/semantic_models` | 统一校验和完整 Knowledge Base 对账 |
+| `ask_metrics` | 回答已有指标问题 | Markdown 报告 | N/A | KPI 数值、趋势、分组结果、归因分析、不退回原始 SQL |
+| `explore` | 只读数据探索 | 结构化上下文 | N/A | 严格只读、低轮数、三方向探索 |
+| `gen_sql` | 生成优化 SQL | SQL 查询 / SQL 文件 | N/A | 深度 SQL 专长、自动验证、支持文件输出 |
+| `gen_report` | 灵活报告生成 | 结构化报告 | N/A | 工具可配置、可扩展、自定义报告 subagent |
+| `gen_table` | 交互式建表 | DDL + 执行结果 | 数据库 | DDL 确认、CTAS 或自然语言建表 |
+| `gen_job` | 数据管道作业（单库 ETL + 跨库传输） | 作业 / 传输结果 | 源库 + 目标库 | DDL/DML 执行、通过 MigrationTargetMixin 做跨方言类型映射、`transfer_query_result`、源目标不同库时做轻量对账校验 |
+| `gen_skill` | 创建或优化 skill | skill 路径 | skills 目录 | 交互式编写、校验、加载现有 skill |
+| `gen_visual_report` | 自包含的可视化报告（叙事文档，查询提前烘焙） | `reports/<slug>/`（可执行 SQL + 执行结果 + 报告组件） | 项目根目录 | 按模块独立修改、可基于 metric 或自定义 SQL 生成、CLI 模式直接在浏览器中打开 |
+
+**所有 subagent 的内置特性：**
+- 最小化配置（仅 `model` 和 `max_turns` 可选）
+- 自动工具设置、hooks 和 MCP 服务器集成
+- 内置系统提示，默认选择最新可用版本
+- 按工作流启用验证和知识库同步
+- 知识库集成用于语义搜索
+- 自动工作空间管理
+
+这些subagent共同自动化了 **数据工程知识管道** ——从 **数据探索 → 查询生成 → 模型定义 → 指标生成 → 业务知识捕获 → 可搜索的知识库**。

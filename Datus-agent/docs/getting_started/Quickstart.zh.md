@@ -1,0 +1,114 @@
+# 安装并完成第一次提问
+
+几分钟上手 Datus Agent：安装 → 配置 → 第一次提问。
+
+!!! tip "不确定下一步读哪篇？"
+    可先查看[选择上手路径](index.md)，按你的目标选择对应教程。
+
+## 1. 安装
+
+Linux x86_64/aarch64（glibc 2.28+）或 Apple Silicon macOS 一键安装（推荐）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install.sh | sh
+```
+
+脚本会自动 bootstrap `uv`，在 `~/.datus/venv` 下建独立 venv（缺 Python 3.12 时自动下载），并把 `datus`、`datus-cli`、`datus-api`、`datus-mcp`、`datus-pip` 等 shim 写入 `~/.local/bin`。内置 `dosi-engine` 目前只提供上述平台的 wheel。开新 shell（或 `source ~/.zshrc`）使 PATH 生效。
+
+??? note "其他安装方式"
+    **固定版本**（变量传给接收脚本的 shell，不是 `curl`）：
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install.sh | DATUS_VERSION=0.2.6 sh
+    ```
+
+    **从 GitHub 源安装**（拿 `main` 上未发布的改动，或任意 ref）：
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install-dev.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/datus-ai/datus-agent/main/install-dev.sh | DATUS_REF=feature/foo sh
+    ```
+
+    **自管 Python 环境**（需要 Python 3.12）：
+    ```bash
+    # Conda / virtualenv / uv 任选其一，激活后：
+    pip install datus-agent
+    ```
+
+    其他变量：`DATUS_HOME`、`DATUS_BIN_DIR`、`DATUS_FORCE=1`、`DATUS_NO_MODIFY_PATH=1`。后续往该 venv 安装其它 Python 包请用 `datus-pip install <package>`。
+
+    预发布版：`pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ datus-agent`。
+
+## 2. 配置与初始化
+
+启动 REPL：
+
+```bash
+datus
+```
+
+在 REPL 内依次运行 `/datasource`、`/model`、`/init` 三条斜杠命令。
+
+### Datasource
+
+运行 `/datasource`。TUI 引导你填写名称、类型（DuckDB、SQLite、MySQL、PostgreSQL、Snowflake、StarRocks 等）和连接信息，自动测试连通性并写入 `~/.datus/conf/agent.yml`。同一 TUI 也支持编辑 / 删除 / 设默认 / 自动安装缺失的适配器插件。运行时切换可直接 `/datasource <name>`。
+
+!!! tip "演示数据库"
+    Datus 自带预配置的 DuckDB 演示库 `~/.datus/sample/duckdb-demo.duckdb`。在 `/datasource` 选 `duckdb` 并指向该路径即可立即获得可用数据源。
+
+### Model
+
+运行 `/model`。TUI 列出全部 provider，选中后输入 API Key（自动识别常见环境变量）即可。也支持快捷写法 `/model openai/gpt-4.1`。
+
+常用 provider：
+
+| Provider | 默认模型 | 环境变量 |
+|---|---|---|
+| `openai` | `gpt-4.1` | `OPENAI_API_KEY` |
+| `deepseek` | `deepseek-v4-flash` | `DEEPSEEK_API_KEY` |
+| `claude` | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` |
+| `gemini` | `gemini-2.5-pro` | `GEMINI_API_KEY` |
+
+完整 provider 列表（含 Kimi / Qwen / GLM / MiniMax、Claude 订阅、Codex OAuth、Coding Plan 等）见 [Model 命令](../cli/other_commands.zh.md#model)。
+
+### Init（可选）
+
+`cd` 进入项目目录后启动 `datus`，运行 `/init` 会读取上一步保存的默认模型与数据源，扫描当前目录并生成项目级 `AGENTS.md`。需要换数据源时先 `/datasource <name>` 再 `/init`。
+
+## 3. 开始使用
+
+启动后会看到 banner 与绿色提示符 `>`。在空输入行按 **Tab**，可以依次切换三种输入模式：对话 `>` → `sql>` → `bash>`；按 **Esc** 或 **Ctrl+C** 返回对话模式：
+
+- **对话模式 `>`**（默认）—— 自然语言输入交给 Agent；`/help`、`/datasource`、`/model`、`/exit` 等斜杠命令在每种模式下都可使用。
+- **SQL 模式 `sql>`** —— 提示符和分隔线变为红色，并启用 SQL 语法高亮；输入内容会经过与 Agent 调用 `execute_sql` 相同的权限与 SQL policy 检查。只读查询直接执行，写入和 DDL 会先请求确认。使用 `\` + Enter 可以继续输入下一行。
+- **Bash 模式 `bash>`** —— 提示符变为黄色；输入内容通过与 Agent 相同的权限检查后作为 shell 命令执行。命中 `deny` 规则的命令会被阻止，其他未匹配规则的命令会请求确认。
+
+手动执行 SQL 或 Bash 时，命令行会立即显示并附带 `· running Ns` 状态；完成后会展示包含命令和结果的执行块。执行结果也会作为一轮上下文发送给模型，方便 Agent 接着分析，并随 session 保存，之后可通过 `/resume` 恢复。
+
+```text title="示例"
+> /tables
+> Detailed analysis of gold–Bitcoin correlation.
+                          # 在空输入行按 Tab，切换到 SQL 模式
+sql> desc gold_vs_bitcoin
+                          # 再按一次 Tab，切换到 Bash 模式
+bash> git status
+```
+
+自然语言提问后，Datus 实时流式展示思考、工具调用、SQL 与最终 markdown 报告，底部 pinned 行显示当前正在跑的工具：
+
+```text
+● Let me check the schema of gold_vs_bitcoin and run a correlation analysis.
+● describe_table({"table_name": "gold_vs_bitcoin"})  ✓ 3 columns (0.5s)
+● read_query({"sql": "SELECT CORR(gold, bitcoin) ..."}) ✓ 1 row (0.5s)
+○ Running read_query …
+```
+
+!!! tip "查看 trace 详情"
+    任何时候按 **Ctrl+O** 可打开上一轮对话的 inline trace（完整工具入参、SQL、原始输出），再次按下或 `q` 关闭。
+
+## 下一步
+
+- **[构建上下文增强 Agent](./contextual_data_engineering.zh.md)** —— 构建知识库，并验证上下文如何提升回答效果
+- **[端到端数据工程](./data_engineering_quickstart.zh.md)** —— 构建分层表、ETL、Airflow DAG 和 Superset Dashboard
+- **[将 Dashboard 变成 Copilot](./dashboard_copilot.zh.md)** —— 将已有 Superset Dashboard 转换成分析子代理
+- **[配置指南](../configuration/introduction.md)** —— 自有数据库与高级配置
+- **[CLI 参考](../cli/introduction.md)** —— 全部命令与选项
+- **[语义引擎](../semantic/dosi_engine.zh.md)** —— Dosi 配置与 Agent 集成

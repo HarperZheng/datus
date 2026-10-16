@@ -1,0 +1,465 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+
+"""Unit tests for datus/api/routes/config_routes.py."""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from datus.api.routes import config_routes
+from datus.api.routes.config_routes import (
+    ProbeDatasourceRequest,
+    ProbeModelRequest,
+    UpdateDatasourcesRequest,
+    UpdateModelsRequest,
+    get_agent_config_endpoint,
+    list_datasources_endpoint,
+    probe_datasource_connectivity_endpoint,
+    probe_model_connectivity_endpoint,
+    update_datasources_endpoint,
+    update_models_endpoint,
+)
+from datus.utils.exceptions import DatusException
+
+
+def _mock_svc(datasources, *, target="deepseek", current_datasource="starrocks", models=None, home="~/.datus"):
+    svc = MagicMock()
+    svc.agent_config.target = target
+    svc.agent_config.models = models if models is not None else {}
+    svc.agent_config.current_datasource = current_datasource
+    svc.agent_config.datasource_configs = datasources
+    svc.agent_config.home = home
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_returns_names_types_and_current():
+    svc = _mock_svc(
+        datasources={
+            "starrocks": SimpleNamespace(type="starrocks"),
+            "lake": SimpleNamespace(type="duckdb"),
+        },
+    )
+
+    result = await list_datasources_endpoint(svc)
+
+    assert result.success is True
+    assert result.data.current_datasource == "starrocks"
+    assert [(d.name, d.type, d.is_current) for d in result.data.datasources] == [
+        ("starrocks", "starrocks", True),
+        ("lake", "duckdb", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_carries_no_credentials():
+    """The reason this endpoint exists instead of reusing /config/agent.
+
+    A catalog UI lists the datasources on every project entry, for every member.
+    /config/agent answers that with each datasource's decrypted password and
+    credential-bearing uri; nothing here may carry them.
+    """
+    svc = _mock_svc(
+        datasources={
+            "starrocks": SimpleNamespace(
+                type="starrocks",
+                host="h1",
+                password="s3cret",
+                uri="starrocks://user:s3cret@h1:9030/db",
+                private_key_file_pwd="pk-pass",
+            )
+        },
+    )
+
+    result = await list_datasources_endpoint(svc)
+
+    serialized = result.data.model_dump_json()
+    for secret in ("s3cret", "pk-pass", "user:s3cret"):
+        assert secret not in serialized
+    assert set(result.data.datasources[0].model_dump()) == {
+        "name",
+        "type",
+        "is_current",
+        "catalog",
+        "database",
+        "db_schema",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_carries_configured_namespaces():
+    """A client opening a session must land on the configured schema, not the first one listed."""
+    svc = _mock_svc(
+        datasources={
+            "aviation": SimpleNamespace(type="postgresql", catalog="", database="app", schema="aviation"),
+            "sr": SimpleNamespace(type="starrocks", catalog="default_catalog", database="ods", schema=""),
+        },
+        current_datasource="aviation",
+    )
+
+    result = await list_datasources_endpoint(svc)
+
+    assert [(d.name, d.catalog, d.database, d.db_schema) for d in result.data.datasources] == [
+        ("aviation", None, "app", "aviation"),
+        ("sr", "default_catalog", "ods", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_ignores_non_string_namespaces():
+    """A pydantic-shaped config exposes ``schema`` as a bound method; it must not reach the wire."""
+    svc = _mock_svc(datasources={"pg": SimpleNamespace(type="postgresql", database="app", schema=lambda: None)})
+
+    result = await list_datasources_endpoint(svc)
+
+    assert result.data.datasources[0].database == "app"
+    assert result.data.datasources[0].db_schema is None
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_unwraps_an_enum_type():
+    """`DbConfig.type` is an enum at runtime; the wire form must be its value."""
+    svc = _mock_svc(datasources={"lake": SimpleNamespace(type=SimpleNamespace(value="duckdb"))})
+
+    result = await list_datasources_endpoint(svc)
+
+    assert result.data.datasources[0].type == "duckdb"
+
+
+@pytest.mark.asyncio
+async def test_list_datasources_skips_none_entries_and_survives_no_current():
+    svc = _mock_svc(
+        datasources={"lake": SimpleNamespace(type="duckdb"), "broken": None},
+        current_datasource="",
+    )
+
+    result = await list_datasources_endpoint(svc)
+
+    assert [d.name for d in result.data.datasources] == ["lake"]
+    assert result.data.current_datasource == ""
+    assert result.data.datasources[0].is_current is False
+
+
+@pytest.mark.asyncio
+async def test_get_agent_config_returns_datasources_flat():
+    """datasource_configs is a single-layer {ds: cfg} map, returned as-is."""
+    starrocks_cfg = {"type": "starrocks", "host": "h1"}
+    starrocks22_cfg = {"type": "starrocks", "host": "h2"}
+    svc = _mock_svc(
+        datasources={
+            "starrocks": starrocks_cfg,
+            "starrocks22": starrocks22_cfg,
+        },
+    )
+
+    result = await get_agent_config_endpoint(svc)
+
+    assert result.success is True
+    assert result.data["datasources"] == {
+        "starrocks": starrocks_cfg,
+        "starrocks22": starrocks22_cfg,
+    }
+    assert result.data["target"] == "deepseek"
+    assert result.data["current_datasource"] == "starrocks"
+    assert result.data["home"] == "~/.datus"
+
+
+@pytest.mark.asyncio
+async def test_get_agent_config_skips_none_config():
+    """Datasources whose config is None are dropped from the response."""
+    real_cfg = {"type": "duckdb"}
+    svc = _mock_svc(datasources={"empty": None, "real": real_cfg})
+
+    result = await get_agent_config_endpoint(svc)
+
+    assert result.data["datasources"] == {"real": real_cfg}
+
+
+@pytest.mark.asyncio
+async def test_get_agent_config_handles_empty_datasources():
+    svc = _mock_svc(datasources={})
+
+    result = await get_agent_config_endpoint(svc)
+
+    assert result.data["datasources"] == {}
+
+
+class _FakeConfigManager:
+    """Minimal stand-in for ConfigurationManager — captures save() calls."""
+
+    def __init__(self, initial=None):
+        self.data = dict(initial) if initial else {}
+        self.save_count = 0
+
+    def save(self):
+        self.save_count += 1
+
+
+@pytest.fixture
+def patched_cm(monkeypatch):
+    """Replace the module-level configuration_manager() with a fake instance."""
+    cm = _FakeConfigManager()
+    monkeypatch.setattr(config_routes, "configuration_manager", lambda: cm)
+    return cm
+
+
+@pytest.fixture
+def patched_cache(monkeypatch):
+    """Replace deps._service_cache with an AsyncMock so evict() is awaitable."""
+    cache = MagicMock()
+    cache.evict = AsyncMock()
+    monkeypatch.setattr(config_routes.deps, "_service_cache", cache)
+    return cache
+
+
+def _ctx(project_id="proj_a"):
+    return SimpleNamespace(project_id=project_id)
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_replaces_services_datasources(patched_cm, patched_cache):
+    patched_cm.data = {"services": {"datasources": {"old": {"type": "duckdb"}}, "other": "keep"}}
+    body = UpdateDatasourcesRequest(
+        datasources={
+            "db_a": {"type": "starrocks", "host": "h1"},
+            "db_b": {"type": "duckdb", "uri": "/tmp/a.db"},
+        }
+    )
+
+    result = await update_datasources_endpoint(body, svc=MagicMock(), ctx=_ctx("proj_a"))
+
+    assert result.success is True
+    assert result.data == {"updated": True}
+    assert patched_cm.data["services"]["datasources"] == {
+        "db_a": {"type": "starrocks", "host": "h1"},
+        "db_b": {"type": "duckdb", "uri": "/tmp/a.db"},
+    }
+    assert patched_cm.data["services"]["other"] == "keep"
+    assert patched_cm.save_count == 1
+    patched_cache.evict.assert_awaited_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_empty_dict_clears_block(patched_cm, patched_cache):
+    patched_cm.data = {"services": {"datasources": {"old": {"type": "duckdb"}}}}
+
+    result = await update_datasources_endpoint(UpdateDatasourcesRequest(datasources={}), svc=MagicMock(), ctx=_ctx())
+
+    assert result.data["updated"] is True
+    assert patched_cm.data["services"]["datasources"] == {}
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_rejects_invalid_name(patched_cm, patched_cache):
+    body = UpdateDatasourcesRequest(datasources={"bad name!": {"type": "duckdb"}})
+    with pytest.raises(DatusException):
+        await update_datasources_endpoint(body, svc=MagicMock(), ctx=_ctx())
+    assert patched_cm.save_count == 0
+    patched_cache.evict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_initializes_services_when_missing(patched_cm, patched_cache):
+    patched_cm.data = {}
+
+    await update_datasources_endpoint(
+        UpdateDatasourcesRequest(datasources={"db_a": {"type": "duckdb"}}),
+        svc=MagicMock(),
+        ctx=_ctx(),
+    )
+
+    assert patched_cm.data["services"]["datasources"] == {"db_a": {"type": "duckdb"}}
+
+
+@pytest.mark.asyncio
+async def test_update_models_replaces_models_and_target(patched_cm, patched_cache):
+    patched_cm.data = {"models": {"old": {"type": "openai"}}, "target": "old"}
+    body = UpdateModelsRequest(
+        models={"new": {"type": "deepseek", "model": "deepseek-chat"}},
+        target="new",
+    )
+
+    result = await update_models_endpoint(body, svc=MagicMock(), ctx=_ctx("proj_b"))
+
+    assert result.data["updated"] is True
+    assert patched_cm.data["models"] == {"new": {"type": "deepseek", "model": "deepseek-chat"}}
+    assert patched_cm.data["target"] == "new"
+    assert patched_cm.save_count == 1
+    patched_cache.evict.assert_awaited_once_with("proj_b")
+
+
+@pytest.mark.asyncio
+async def test_update_models_target_only(patched_cm, patched_cache):
+    patched_cm.data = {"models": {"m1": {"type": "openai"}, "m2": {"type": "claude"}}, "target": "m1"}
+
+    await update_models_endpoint(UpdateModelsRequest(target="m2"), svc=MagicMock(), ctx=_ctx())
+
+    assert patched_cm.data["target"] == "m2"
+    assert patched_cm.data["models"] == {"m1": {"type": "openai"}, "m2": {"type": "claude"}}
+
+
+@pytest.mark.asyncio
+async def test_update_models_models_only(patched_cm, patched_cache):
+    patched_cm.data = {"models": {"old": {}}, "target": "old"}
+
+    await update_models_endpoint(
+        UpdateModelsRequest(models={"old": {"type": "openai"}}),
+        svc=MagicMock(),
+        ctx=_ctx(),
+    )
+
+    assert patched_cm.data["models"] == {"old": {"type": "openai"}}
+    assert patched_cm.data["target"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_update_models_requires_at_least_one_field(patched_cm, patched_cache):
+    with pytest.raises(DatusException):
+        await update_models_endpoint(UpdateModelsRequest(), svc=MagicMock(), ctx=_ctx())
+    assert patched_cm.save_count == 0
+
+
+@pytest.mark.asyncio
+async def test_update_models_rejects_target_not_in_models(patched_cm, patched_cache):
+    patched_cm.data = {"models": {"m1": {}}, "target": "m1"}
+
+    with pytest.raises(DatusException):
+        await update_models_endpoint(UpdateModelsRequest(target="ghost"), svc=MagicMock(), ctx=_ctx())
+    assert patched_cm.save_count == 0
+
+
+@pytest.mark.asyncio
+async def test_update_models_target_validated_against_new_models(patched_cm, patched_cache):
+    """When both models and target are provided, target must exist in the NEW models."""
+    patched_cm.data = {"models": {"keep_me": {}}, "target": "keep_me"}
+
+    with pytest.raises(DatusException):
+        await update_models_endpoint(
+            UpdateModelsRequest(models={"only_new": {"type": "openai"}}, target="keep_me"),
+            svc=MagicMock(),
+            ctx=_ctx(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_models_rejects_invalid_model_name(patched_cm, patched_cache):
+    with pytest.raises(DatusException):
+        await update_models_endpoint(
+            UpdateModelsRequest(models={"bad name!": {"type": "openai"}}),
+            svc=MagicMock(),
+            ctx=_ctx(),
+        )
+    assert patched_cm.save_count == 0
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_survives_missing_service_cache(monkeypatch, patched_cm):
+    """No crash when the service cache hasn't been initialized yet."""
+    monkeypatch.setattr(config_routes.deps, "_service_cache", None)
+
+    result = await update_datasources_endpoint(
+        UpdateDatasourcesRequest(datasources={"db_a": {"type": "duckdb"}}),
+        svc=MagicMock(),
+        ctx=_ctx(),
+    )
+
+    assert result.data["updated"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_datasources_uses_default_project_when_missing(patched_cm, patched_cache):
+    await update_datasources_endpoint(
+        UpdateDatasourcesRequest(datasources={"db_a": {"type": "duckdb"}}),
+        svc=MagicMock(),
+        ctx=_ctx(project_id=None),
+    )
+
+    patched_cache.evict.assert_awaited_once_with("default")
+
+
+@pytest.mark.asyncio
+async def test_test_model_connectivity_ok(monkeypatch):
+    """Successful LLM probe returns ok=True and forwards the payload unchanged."""
+    captured = {}
+
+    def fake_probe(payload):
+        captured["payload"] = payload
+
+    monkeypatch.setattr(config_routes, "_probe_llm_sync", fake_probe)
+
+    body = ProbeModelRequest(type="openai", model="gpt-4o", api_key="sk-xxx", base_url="https://api.openai.com/v1")
+    result = await probe_model_connectivity_endpoint(body, svc=MagicMock())
+
+    assert result.success is True
+    assert result.data == {"ok": True}
+    assert captured["payload"]["type"] == "openai"
+    assert captured["payload"]["api_key"] == "sk-xxx"
+
+
+@pytest.mark.asyncio
+async def test_test_model_connectivity_reports_error_message(monkeypatch):
+    """Probe exception is surfaced as ok=False with message; HTTP stays 200."""
+
+    def fake_probe(payload):
+        raise RuntimeError("401 unauthorized")
+
+    monkeypatch.setattr(config_routes, "_probe_llm_sync", fake_probe)
+
+    body = ProbeModelRequest(type="openai", model="gpt-4o", api_key="bad")
+    result = await probe_model_connectivity_endpoint(body, svc=MagicMock())
+
+    assert result.success is True
+    assert result.data["ok"] is False
+    assert "401" in result.data["message"]
+
+
+@pytest.mark.asyncio
+async def test_test_model_connectivity_passes_extra_fields(monkeypatch):
+    """Unknown fields on the request body are forwarded to the probe (extra=allow)."""
+    captured = {}
+
+    def fake_probe(payload):
+        captured["payload"] = payload
+
+    monkeypatch.setattr(config_routes, "_probe_llm_sync", fake_probe)
+
+    body = ProbeModelRequest.model_validate({"type": "openai", "model": "gpt-4o", "api_key": "k", "vendor": "openai"})
+    await probe_model_connectivity_endpoint(body, svc=MagicMock())
+
+    assert captured["payload"].get("vendor") == "openai"
+
+
+@pytest.mark.asyncio
+async def test_test_datasource_connectivity_ok(monkeypatch):
+    """Successful datasource probe returns ok=True and forwards the payload unchanged."""
+    captured = {}
+
+    def fake_probe(payload):
+        captured["payload"] = payload
+
+    monkeypatch.setattr(config_routes, "_probe_datasource_sync", fake_probe)
+
+    body = ProbeDatasourceRequest.model_validate({"type": "duckdb", "uri": "/tmp/test.duckdb"})
+    result = await probe_datasource_connectivity_endpoint(body, svc=MagicMock())
+
+    assert result.data == {"ok": True}
+    assert captured["payload"]["type"] == "duckdb"
+    assert captured["payload"]["uri"] == "/tmp/test.duckdb"
+
+
+@pytest.mark.asyncio
+async def test_test_datasource_connectivity_reports_error_message(monkeypatch):
+    """Probe exception is surfaced as ok=False with message; HTTP stays 200."""
+
+    def fake_probe(payload):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(config_routes, "_probe_datasource_sync", fake_probe)
+
+    body = ProbeDatasourceRequest.model_validate({"type": "starrocks", "host": "unreachable", "port": "9999"})
+    result = await probe_datasource_connectivity_endpoint(body, svc=MagicMock())
+
+    assert result.data["ok"] is False
+    assert "connection refused" in result.data["message"]

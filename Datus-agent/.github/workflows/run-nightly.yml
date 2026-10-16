@@ -1,0 +1,712 @@
+name: Run Nightly Tests
+
+on:
+  schedule:
+    - cron: '0 20 * * *' # 20:00 UTC daily (offset from integration at 18:00 UTC)
+  workflow_dispatch:
+    inputs:
+      datus_agent_ref:
+        description: "Optional Datus-agent branch, tag, or SHA to test. Defaults to the workflow branch."
+        required: false
+        default: ""
+        type: string
+      nightly_group_filter:
+        description: "Optional regex for NIGHTLY_GROUP_FILTER. Leave empty to run the full nightly suite."
+        required: false
+        default: ""
+        type: string
+  workflow_call:
+    inputs:
+      datus_agent_ref:
+        description: "Datus-agent branch, tag, or SHA to test."
+        required: false
+        default: ""
+        type: string
+      nightly_group_filter:
+        description: "Optional regex for NIGHTLY_GROUP_FILTER."
+        required: false
+        default: ""
+        type: string
+    secrets:
+      RELEASE_BOT_TOKEN:
+        description: "Read token for private repositories required by Nightly."
+        required: true
+      FEISHU_NOTIFY_CI_URL:
+        description: "Optional failure-notification webhook for direct reusable calls."
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keep nightly runs serialized because the workflow intentionally uses the
+  # stable datus-nightly-* compose project names below. Per-suite startup runs
+  # compose down first to clean leftovers from force-cancelled runs.
+  group: datus-agent-nightly
+  cancel-in-progress: false
+
+jobs:
+  run-nightly:
+    runs-on: self-hosted
+    env:
+      DATUS_AGENT_REF: ${{ inputs.datus_agent_ref || github.ref_name }}
+      NIGHTLY_GROUP_FILTER: ${{ inputs.nightly_group_filter || '' }}
+      DATUS_TEST_RUN_ID: datus-agent-${{ github.run_id }}-${{ github.run_attempt }}
+      # DB, BI, scheduler, and storage adapter checkouts are installed after
+      # the locked sync. Do not let later `uv run` commands restore their
+      # registry builds from uv.lock over those checkout packages.
+      UV_NO_SYNC: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DATUS_AGENT_REF }}
+          persist-credentials: false
+
+      - name: Record Datus-agent checkout
+        run: |
+          echo "Requested Datus-agent ref: ${DATUS_AGENT_REF}"
+          echo "Checked out branch: $(git rev-parse --abbrev-ref HEAD)"
+          echo "Checked out commit: $(git rev-parse HEAD)"
+
+      - name: Checkout datus-db-adapters main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/datus-db-adapters
+          ref: main
+          path: external/datus-db-adapters
+          persist-credentials: false
+
+      - name: Checkout datus-bi-adapters main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/datus-bi-adapters
+          ref: main
+          path: external/datus-bi-adapters
+          persist-credentials: false
+
+      - name: Checkout datus-scheduler-adapters main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/datus-scheduler-adapters
+          ref: main
+          path: external/datus-scheduler-adapters
+          persist-credentials: false
+
+      - name: Checkout datus-storage-adapters main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/datus-storage-adapters
+          ref: main
+          path: external/datus-storage-adapters
+          persist-credentials: false
+
+      - name: Checkout Datus-Plugins main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/Datus-Plugins
+          ref: main
+          path: external/Datus-Plugins
+          persist-credentials: false
+
+      - name: Require private repository checkout token
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          if [[ -z "${PRIVATE_REPO_TOKEN}" ]]; then
+            echo "::error::RELEASE_BOT_TOKEN is required to checkout Datus-ai/datus-sql-policies"
+            exit 1
+          fi
+
+      - name: Checkout datus-sql-policies main
+        uses: actions/checkout@v4
+        with:
+          repository: Datus-ai/datus-sql-policies
+          ref: main
+          path: external/datus-sql-policies
+          persist-credentials: false
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      # Source checkouts of datus-gaussdb carry no vendored libpq (wheels get
+      # it at release-build time); without it the gaussdb driver binds the
+      # runner's vanilla PostgreSQL libpq and segfaults the pytest process.
+      # Restore the extracted libraries before `Install dependencies` packages
+      # the adapter, so a cache hit needs no rebuild or reinstall.
+      - name: Restore GaussDB vendored libpq cache
+        id: gaussdb-vendor-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: external/datus-db-adapters/datus-gaussdb/datus_gaussdb/_vendor/x86_64
+          key: gaussdb-vendor-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('external/datus-db-adapters/datus-gaussdb/scripts/fetch_vendor_libpq.py') }}
+
+      - name: Clean up stale temp files
+        run: |
+          echo "Cleaning stale pytest temp directories..."
+          find /tmp/pytest-of-* -maxdepth 1 -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+          echo "Cleaning stale .pyc caches..."
+          find "$GITHUB_WORKSPACE" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          echo "Disk usage: $(df -h /tmp | tail -1 | awk '{print $5, $4}')"
+
+      - name: Compute knowledge base cache key
+        id: kb-cache-key
+        run: |
+          set -euo pipefail
+          digest="$(
+            {
+              for file in \
+                build_scripts/build_test_data.sh \
+                tests/conf/agent.yml; do
+                if [ -f "$file" ]; then
+                  sha256sum "$file"
+                fi
+              done
+
+              for dir in datus/sample_data; do
+                if [ -d "$dir" ]; then
+                  find "$dir" -type f -print0 | sort -z | while IFS= read -r -d '' file; do
+                    sha256sum "$file"
+                  done
+                fi
+              done
+              if [ -d "datus/storage" ]; then
+                find "datus/storage" -type f -name '*.py' -print0 | sort -z | while IFS= read -r -d '' file; do
+                  sha256sum "$file"
+                done
+              fi
+
+              for repo in \
+                external/datus-db-adapters \
+                external/datus-bi-adapters \
+                external/datus-scheduler-adapters \
+                external/datus-storage-adapters; do
+                git -C "$repo" rev-parse HEAD
+              done
+            } | sha256sum | awk '{print $1}'
+          )"
+          echo "key=${RUNNER_OS}-kb-v6-datus_agent_nightly-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --group ci
+          # No --upgrade: keep the locked framework packages; adapters only add
+          # their own missing deps instead of bumping fastapi/starlette/etc.
+          uv pip install --no-cache-dir \
+            --reinstall-package datus-snowflake \
+            --reinstall-package datus-bigquery \
+            --reinstall-package datus-doris \
+            --reinstall-package datus-tidb \
+            --reinstall-package datus-hologres \
+            --reinstall-package datus-maxcompute \
+            --reinstall-package datus-oracle \
+            --reinstall-package datus-gaussdb \
+            --reinstall-package datus-dws \
+            --reinstall-package datus-storage-base \
+            --reinstall-package datus-storage-postgresql \
+            pytest-playwright \
+            ./external/datus-storage-adapters/datus-storage-base \
+            "./external/datus-storage-adapters/datus-storage-postgresql[dev]" \
+            ./external/datus-db-adapters/datus-db-core \
+            ./external/datus-db-adapters/datus-sqlalchemy \
+            ./external/datus-db-adapters/datus-snowflake \
+            ./external/datus-db-adapters/datus-bigquery \
+            ./external/datus-db-adapters/datus-postgresql \
+            ./external/datus-db-adapters/datus-mysql \
+            ./external/datus-db-adapters/datus-clickhouse \
+            ./external/datus-db-adapters/datus-starrocks \
+            ./external/datus-db-adapters/datus-doris \
+            ./external/datus-db-adapters/datus-tidb \
+            ./external/datus-db-adapters/datus-hologres \
+            ./external/datus-db-adapters/datus-maxcompute \
+            ./external/datus-db-adapters/datus-oracle \
+            ./external/datus-db-adapters/datus-trino \
+            ./external/datus-db-adapters/datus-greenplum \
+            ./external/datus-db-adapters/datus-hive \
+            ./external/datus-db-adapters/datus-spark \
+            ./external/datus-db-adapters/datus-gaussdb \
+            ./external/datus-db-adapters/datus-dws \
+            ./external/datus-bi-adapters/datus-bi-core \
+            ./external/datus-bi-adapters/datus-bi-superset \
+            ./external/datus-bi-adapters/datus-bi-grafana \
+            ./external/datus-scheduler-adapters/datus-scheduler-core \
+            ./external/datus-scheduler-adapters/datus-scheduler-airflow
+          uv run --no-sync python ci/verify_nightly_adapter_sources.py \
+            --external-repos-root "$GITHUB_WORKSPACE/external"
+          uv pip check
+          uv run --no-sync playwright install --with-deps chromium
+
+      - name: Ensure Docker runtime
+        env:
+          # Keep this fallback pinned and refresh it periodically when Docker Compose
+          # releases a newer stable version. The workflow prefers the live latest
+          # release when the GitHub API is reachable.
+          DOCKER_COMPOSE_FALLBACK_VERSION: v2.29.7
+        run: |
+          set -euo pipefail
+          docker --version
+          docker info >/dev/null
+
+          if ! docker compose version >/dev/null 2>&1; then
+            os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64 | amd64) arch="x86_64" ;;
+              arm64 | aarch64) arch="aarch64" ;;
+              *)
+                echo "::error::Unsupported Docker Compose architecture: $arch"
+                exit 1
+                ;;
+            esac
+            version="$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 \
+              https://api.github.com/repos/docker/compose/releases/latest \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' \
+              || true)"
+            version="${version:-$DOCKER_COMPOSE_FALLBACK_VERSION}"
+            binary_name="docker-compose-${os}-${arch}"
+            compose_url="https://github.com/docker/compose/releases/download/${version}/${binary_name}"
+            plugin_path="$HOME/.docker/cli-plugins/docker-compose"
+            checksum_file="$(mktemp)"
+            mkdir -p "$HOME/.docker/cli-plugins"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 \
+              "$compose_url" \
+              -o "$plugin_path"
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 \
+              "${compose_url}.sha256" \
+              -o "$checksum_file"
+            expected_sha="$(awk '{print $1}' "$checksum_file")"
+            actual_sha="$(sha256sum "$plugin_path" | awk '{print $1}')"
+            if [ -z "$expected_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+              echo "::error::Docker Compose checksum verification failed for ${binary_name}"
+              exit 1
+            fi
+            chmod +x "$plugin_path"
+          fi
+
+          docker compose version
+
+      # On cache miss the extraction needs Docker (it pulls the pinned
+      # openGauss image), so this runs after the Docker runtime check; the
+      # adapter was already installed without the libraries, so reinstall it.
+      - name: Vendor GaussDB client libpq
+        id: gaussdb-vendor
+        run: |
+          set -euo pipefail
+          vendor_dir="external/datus-db-adapters/datus-gaussdb/datus_gaussdb/_vendor/x86_64"
+          # Re-fetch when ANY required library is missing, not just libpq —
+          # a partial directory (e.g. an interrupted earlier run) must repair
+          # itself rather than fail the verification below.
+          need_fetch=0
+          for artifact in libpq.so.5 libssl.so.1.1 libcrypto.so.1.1; do
+            [ -f "${vendor_dir}/${artifact}" ] || need_fetch=1
+          done
+          if [ "$need_fetch" = "1" ]; then
+            python3 external/datus-db-adapters/datus-gaussdb/scripts/fetch_vendor_libpq.py --arch x86_64
+            uv pip install --no-cache-dir --reinstall-package datus-gaussdb \
+              ./external/datus-db-adapters/datus-gaussdb
+          fi
+          for artifact in libpq.so.5 libssl.so.1.1 libcrypto.so.1.1; do
+            test -f "${vendor_dir}/${artifact}" || {
+              echo "::error::GaussDB vendored library missing after fetch: ${artifact}"
+              exit 1
+            }
+          done
+          echo "fetched=${need_fetch}" >> "$GITHUB_OUTPUT"
+
+      # Only a freshly fetched, fully verified set is saved; the verification
+      # step above already failed the job for anything incomplete.
+      - name: Save GaussDB vendored libpq cache
+        if: steps.gaussdb-vendor.outputs.fetched == '1' && steps.gaussdb-vendor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: external/datus-db-adapters/datus-gaussdb/datus_gaussdb/_vendor/x86_64
+          key: gaussdb-vendor-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('external/datus-db-adapters/datus-gaussdb/scripts/fetch_vendor_libpq.py') }}
+
+      - name: Setup config file
+        run: |
+          cp /home/datus_ci/ci_template/agent.yml conf/agent.yml
+          cp /home/datus_ci/ci_template/ci.env .env
+          cp /home/datus_ci/ci_template/nightly.env .nightly.env
+
+      - name: Restore tracked test config
+        run: git restore --source=HEAD --worktree --staged tests/conf/agent.yml
+
+      - name: Isolate test data directory
+        run: |
+          DATUS_TEST_HOME="${GITHUB_WORKSPACE}/.datus_test_data"
+          DATUS_TEST_PROJECT_NAME="datus_agent_nightly"
+          echo "DATUS_TEST_HOME=$DATUS_TEST_HOME" >> $GITHUB_ENV
+          echo "DATUS_TEST_PROJECT_NAME=$DATUS_TEST_PROJECT_NAME" >> $GITHUB_ENV
+          python3 - tests/conf/agent.yml "$DATUS_TEST_HOME" "$DATUS_TEST_HOME/workspace" "$DATUS_TEST_PROJECT_NAME" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          home = sys.argv[2]
+          project_root = sys.argv[3]
+          project_name = sys.argv[4]
+
+          updated = []
+          inserted_project_name = False
+          for line in path.read_text(encoding="utf-8").splitlines():
+              stripped = line.strip()
+              if line == "agent:":
+                  updated.append(line)
+                  updated.append(f"  project_name: {project_name}")
+                  inserted_project_name = True
+                  continue
+              if line.startswith("  project_name: ") and inserted_project_name:
+                  continue
+              if line.startswith("  home: ") and stripped.startswith("home:"):
+                  updated.append(f"  home: {home}")
+                  continue
+              if line.startswith("  project_root: ") and stripped.startswith("project_root:"):
+                  updated.append(f"  project_root: {project_root}")
+                  continue
+              updated.append(line)
+
+          path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+          PY
+
+      - name: Load environment variables
+        run: |
+          for env_file in .env .nightly.env; do
+            echo "Loading environment variables from ${env_file} file..."
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ ! -z "$line" && ! "$line" =~ ^[[:space:]]*# ]]; then
+                var_name=$(echo "$line" | cut -d'=' -f1)
+                var_value=$(echo "$line" | cut -d'=' -f2-)
+                echo "::add-mask::$var_value"
+                echo "Loading variable: $var_name"
+                echo "$line" >> $GITHUB_ENV
+              fi
+            done < "$env_file"
+          done
+          echo "Environment variables loaded successfully"
+
+      - name: Enable strict nightly test requirements
+        run: |
+          echo "DATUS_STRICT_NIGHTLY_REQUIREMENTS=1" >> $GITHUB_ENV
+          echo "ADAPTERS_PG=1" >> $GITHUB_ENV
+          echo "ADAPTERS_MYSQL=1" >> $GITHUB_ENV
+          echo "ADAPTERS_CH=1" >> $GITHUB_ENV
+          echo "ADAPTERS_SR=1" >> $GITHUB_ENV
+          echo "ADAPTERS_DORIS=1" >> $GITHUB_ENV
+          echo "ADAPTERS_TIDB=1" >> $GITHUB_ENV
+          echo "ADAPTERS_TRINO=1" >> $GITHUB_ENV
+          echo "ADAPTERS_GP=1" >> $GITHUB_ENV
+          echo "ADAPTERS_HIVE=1" >> $GITHUB_ENV
+          echo "ADAPTERS_SPARK=1" >> $GITHUB_ENV
+          echo "ADAPTERS_GAUSSDB=1" >> $GITHUB_ENV
+
+          # Use dedicated high host ports so nightly compose suites do not
+          # collide with long-running services on the shared self-hosted runner.
+          echo "NIGHTLY_COMPOSE_PROJECT_PREFIX=datus-nightly-" >> $GITHUB_ENV
+          echo "SUPERSET_PORT=18088" >> $GITHUB_ENV
+          echo "SUPERSET_POSTGRES_PORT=15433" >> $GITHUB_ENV
+          echo "SUPERSET_URL=http://127.0.0.1:18088" >> $GITHUB_ENV
+          echo "GRAFANA_PORT=13000" >> $GITHUB_ENV
+          echo "GRAFANA_POSTGRES_PORT=15435" >> $GITHUB_ENV
+          echo "GRAFANA_URL=http://127.0.0.1:13000" >> $GITHUB_ENV
+          echo "AIRFLOW_HOST_PORT=18080" >> $GITHUB_ENV
+          echo "AIRFLOW_URL=http://127.0.0.1:18080/api/v1" >> $GITHUB_ENV
+          echo "POSTGRESQL_HOST_PORT=25432" >> $GITHUB_ENV
+          echo "MYSQL_HOST_PORT=23306" >> $GITHUB_ENV
+          echo "CLICKHOUSE_HTTP_HOST_PORT=28123" >> $GITHUB_ENV
+          echo "CLICKHOUSE_NATIVE_HOST_PORT=29000" >> $GITHUB_ENV
+          echo "STARROCKS_QUERY_HOST_PORT=29030" >> $GITHUB_ENV
+          echo "STARROCKS_HTTP_HOST_PORT=28030" >> $GITHUB_ENV
+          echo "DORIS_QUERY_HOST_PORT=29031" >> $GITHUB_ENV
+          echo "DORIS_HTTP_HOST_PORT=28031" >> $GITHUB_ENV
+          echo "TIDB_HOST_PORT=24000" >> $GITHUB_ENV
+          echo "TIDB_STATUS_HOST_PORT=20080" >> $GITHUB_ENV
+          echo "TRINO_HOST_PORT=28080" >> $GITHUB_ENV
+          echo "GREENPLUM_HOST_PORT=15434" >> $GITHUB_ENV
+          echo "HIVE_METASTORE_HOST_PORT=29083" >> $GITHUB_ENV
+          echo "HIVE_THRIFT_HOST_PORT=21000" >> $GITHUB_ENV
+          echo "HIVE_WEBUI_HOST_PORT=21002" >> $GITHUB_ENV
+          echo "SPARK_THRIFT_HOST_PORT=31000" >> $GITHUB_ENV
+          echo "SPARK_UI_HOST_PORT=24040" >> $GITHUB_ENV
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Prepare local Web UI assets
+        run: |
+          chatbot_root="$RUNNER_TEMP/datus-chatbot-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$chatbot_root"
+          chatbot_version=$(uv run --no-sync python -c 'from datus.cli.web.chatbot import _CDN_CHATBOT_VERSION; print(_CDN_CHATBOT_VERSION)')
+          react_version=$(uv run --no-sync python -c 'from datus.cli.web.chatbot import _CDN_REACT_VERSION; print(_CDN_REACT_VERSION)')
+          npm pack "@datus/web-chatbot@$chatbot_version" "react@$react_version" \
+            --ignore-scripts --json --registry=https://registry.npmjs.org \
+            --fetch-timeout=60000 --fetch-retries=2 \
+            --pack-destination "$chatbot_root" > "$chatbot_root/pack.json"
+          chatbot_archive=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[0]["filename"])' "$chatbot_root/pack.json")
+          react_archive=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[1]["filename"])' "$chatbot_root/pack.json")
+          tar -xzf "$chatbot_root/$chatbot_archive" -C "$chatbot_root" --strip-components=1 package/dist
+          tar -xOf "$chatbot_root/$react_archive" package/umd/react.production.min.js > "$chatbot_root/dist/react.production.min.js"
+          test -s "$chatbot_root/dist/react.production.min.js"
+          test -s "$chatbot_root/dist/datus-chatbot.css"
+          test -s "$chatbot_root/dist/datus-chatbot.umd.js"
+          echo "DATUS_TEST_CHATBOT_DIST=$chatbot_root/dist" >> "$GITHUB_ENV"
+          echo "DATUS_WEB_E2E_ARTIFACT_DIR=$GITHUB_WORKSPACE/test-results/web-e2e" >> "$GITHUB_ENV"
+
+      - name: Restore knowledge base cache
+        id: kb-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.datus_test_data/data
+          key: ${{ steps.kb-cache-key.outputs.key }}
+
+      - name: Validate knowledge base cache
+        id: kb-cache-state
+        run: |
+          set -euo pipefail
+          KB_DATA_DIR="${DATUS_TEST_HOME}/data"
+          KB_READY_DIR="$KB_DATA_DIR"
+          if [ -n "${DATUS_TEST_PROJECT_NAME:-}" ]; then
+            KB_READY_DIR="$KB_DATA_DIR/$DATUS_TEST_PROJECT_NAME/datus_db"
+          fi
+
+          CACHE_KEY="${{ steps.kb-cache-key.outputs.key }}"
+          MANIFEST_FILE="$KB_READY_DIR/.nightly_kb_cache_key"
+          required_datasets=(
+            schema_metadata.lance
+            schema_value.lance
+            metrics.lance
+            reference_sql.lance
+            reference_template.lance
+          )
+
+          cache_ready=true
+          if [ "${{ steps.kb-cache.outputs.cache-hit }}" != "true" ] || [ ! -d "$KB_READY_DIR" ]; then
+            cache_ready=false
+          elif [ ! -f "$MANIFEST_FILE" ] || [ "$(cat "$MANIFEST_FILE")" != "$CACHE_KEY" ]; then
+            echo "Knowledge base cache manifest is missing or stale"
+            cache_ready=false
+          else
+            for dataset in "${required_datasets[@]}"; do
+              dataset_dir="$KB_READY_DIR/$dataset/data"
+              if [ ! -d "$dataset_dir" ] || ! find "$dataset_dir" -type f -size +0 -print -quit | grep -q .; then
+                echo "Knowledge base cache dataset is missing or empty: $dataset"
+                cache_ready=false
+                break
+              fi
+            done
+          fi
+
+          if [ "$cache_ready" = "true" ]; then
+            echo "Restored knowledge base cache from $KB_READY_DIR"
+            echo "needs-build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Knowledge base cache is missing or empty; rebuilding test data"
+          rm -rf "$KB_DATA_DIR"
+          echo "needs-build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build test data
+        id: build-test-data
+        if: steps.kb-cache-state.outputs.needs-build == 'true'
+        run: |
+          echo "Building test data before running nightly tests..."
+          chmod +x build_scripts/build_test_data.sh
+          ./build_scripts/build_test_data.sh || exit 1
+          KB_READY_DIR="${DATUS_TEST_HOME}/data/${DATUS_TEST_PROJECT_NAME}/datus_db"
+          required_datasets=(
+            schema_metadata.lance
+            schema_value.lance
+            metrics.lance
+            reference_sql.lance
+            reference_template.lance
+          )
+          for dataset in "${required_datasets[@]}"; do
+            dataset_dir="$KB_READY_DIR/$dataset/data"
+            if [ ! -d "$dataset_dir" ] || ! find "$dataset_dir" -type f -size +0 -print -quit | grep -q .; then
+              echo "::error::Knowledge base dataset is missing or empty after build: $dataset"
+              exit 1
+            fi
+          done
+          echo "${{ steps.kb-cache-key.outputs.key }}" > "$KB_READY_DIR/.nightly_kb_cache_key"
+          echo "Test data build completed"
+
+      - name: Save knowledge base cache
+        if: steps.kb-cache-state.outputs.needs-build == 'true' && steps.build-test-data.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.datus_test_data/data
+          key: ${{ steps.kb-cache-key.outputs.key }}
+
+      - name: Verify FEISHU_WEBHOOK_URL
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_NOTIFY_CI_URL }}
+        run: |
+          if [ -n "$FEISHU_WEBHOOK_URL" ]; then
+            echo "FEISHU_WEBHOOK_URL is set (length: ${#FEISHU_WEBHOOK_URL} characters)"
+          else
+            echo "FEISHU_WEBHOOK_URL is not set or empty"
+          fi
+
+      - name: Run nightly tests
+        id: nightly_tests
+        timeout-minutes: 150
+        env:
+          EXTERNAL_REPOS_ROOT: ${{ github.workspace }}/external
+          NIGHTLY_PYTEST_BASETEMP: ${{ runner.temp }}/datus-agent-nightly-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+          LANGFUSE_TRACING_ENABLED: "true"
+          NIGHTLY_REQUIRE_LANGFUSE_TRACING: "1"
+        run: |
+          ci/run-nightly-tests.sh
+
+      - name: Stop nightly services
+        if: always()
+        env:
+          EXTERNAL_REPOS_ROOT: ${{ github.workspace }}/external
+          NIGHTLY_PYTEST_BASETEMP: ${{ runner.temp }}/datus-agent-nightly-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          ci/run-nightly-tests.sh --cleanup-only
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-test-results-${{ github.run_number }}
+          path: |
+            test_output_nightly_*.log
+            nightly-manifest.json
+            nightly-failure-classification.json
+            provider-coverage-manifest.json
+            nightly-trace-references.jsonl
+            nightly-trace-summary.jsonl
+            nightly-process-diagnostics.json
+            test-results/web-e2e/
+          retention-days: 7
+
+      - name: Check documented coverage gaps
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Rollout step 2 (see docs/superpowers/specs/2026-06-20-nightly-coverage-gap-detection-design.md):
+          # runs in --dry-run, so it only writes the digest artifact and makes no
+          # GitHub issue changes. To enable per-flow issue sync, create the
+          # `coverage-gap` label once and drop the --dry-run flag below.
+          uv run python ci/harness/check_nightly_coverage.py \
+            --coverage-map ci/harness/coverage-map.yml \
+            --nightly-manifest nightly-manifest.json \
+            --output coverage-gap-report.md \
+            --repo "${{ github.repository }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --dry-run
+
+      - name: Upload coverage gap report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gap-report-${{ github.run_number }}
+          path: coverage-gap-report.md
+          retention-days: 7
+
+      - name: Send Feishu notification
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_NOTIFY_CI_URL }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { buildNightlyFeishuMessage } = require('./ci/format-nightly-feishu-report');
+
+            const testStatus = '${{ steps.nightly_tests.outputs.test_exit_code }}' === '0' ? 'PASSED' : 'FAILED';
+            const today = new Date().toISOString().split('T')[0];
+            const messageBody = buildNightlyFeishuMessage({
+              status: testStatus,
+              runNumber: '${{ github.run_number }}',
+              runUrl: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+              date: today,
+            });
+
+            // Send to Feishu
+            const https = require('https');
+
+            const feishuWebhookUrl = process.env.FEISHU_WEBHOOK_URL;
+
+            if (feishuWebhookUrl) {
+              console.log('FEISHU_WEBHOOK_URL is set in JS environment.');
+            } else {
+              console.error('FEISHU_WEBHOOK_URL is not set in JS environment.');
+            }
+
+            if (!feishuWebhookUrl) {
+              console.error('FEISHU_WEBHOOK_URL environment variable is not set');
+              return;
+            }
+
+            const url = new URL(feishuWebhookUrl);
+
+            const data = JSON.stringify({
+              "msg_type": "interactive",
+              "card": {
+                "type": "template",
+                "data": {
+                  "template_id": "AAqz7JC34dHlY",
+                  "template_version_name": "1.0.0",
+                  "template_variable": {
+                    "report_result": messageBody
+                  }
+                }
+              }
+            });
+
+            const options = {
+              hostname: url.hostname,
+              port: url.port || 443,
+              path: url.pathname + url.search,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(data)
+              }
+            };
+
+            await new Promise((resolve) => {
+              const req = https.request(options, (res) => {
+                // Drain the response so the socket can close immediately instead
+                // of keeping the workflow alive until the server's keep-alive timeout.
+                res.resume();
+                res.on('end', () => {
+                  console.log('Feishu notification sent:', res.statusCode);
+                  resolve();
+                });
+                res.on('error', (error) => {
+                  console.error('Error reading Feishu response:', error);
+                  resolve();
+                });
+              });
+
+              req.setTimeout(10_000, () => {
+                req.destroy(new Error('Feishu notification timed out after 10 seconds'));
+              });
+              req.on('error', (error) => {
+                console.error('Error sending to Feishu:', error);
+                resolve();
+              });
+
+              req.write(data);
+              req.end();
+            });

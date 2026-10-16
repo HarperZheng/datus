@@ -1,0 +1,206 @@
+# MCP Extensions
+
+## 1. Overview
+
+MCP (Model Context Protocol) is how Datus-CLI connects to external tool servers — enabling your agent to gain new capabilities beyond what's built in.
+
+With `/mcp`, you can:
+
+- Add local or remote MCP servers (stdio, HTTP, SSE)
+- List all available servers and their status
+- Check a server's connection and available tools
+- Call a tool exposed by any MCP server directly inside your CLI
+
+This makes Datus-CLI extensible: you can plug in SQLite, Snowflake, Filesystem, or your own MCP server without changing the Datus core.
+
+## 2. Basic Usage
+
+### Add a New MCP Server
+
+```bash
+/mcp add <name> <command> [args...]
+```
+
+**Examples:**
+
+```bash
+# Local stdio-based server
+/mcp add --transport stdio sqlite /Users/me/bin/uv -- -m mcp_sqlite_server
+
+# SSE server with authentication header
+/mcp add --transport sse api-server https://api.example.com/mcp/sse \
+  --header "Authorization: Bearer token" --timeout 30.0
+
+# HTTP stream server
+/mcp add --transport http analytics https://localhost:9000/mcp
+```
+
+---
+
+### List Existing Servers
+
+```bash
+/mcp list
+```
+
+Shows all configured MCP servers and their status:
+
+```
+1. duckdb-mftutorial  ✘ failed
+2. filesystem         ✔ connected
+3. analytics          ✔ connected
+4. snowflake_local    ✔ connected
+5. sqlite             ✔ connected
+```
+
+You can press Enter to view server details, such as command, args, environment, and available tools.
+
+---
+
+### Check a Specific Server
+
+```bash
+/mcp check <mcp_name>
+```
+
+Verifies connectivity and prints available tools from that server.
+
+---
+
+### Call a Tool from a Server
+
+```bash
+/mcp call <mcp_name>.<tool_name> <args>
+```
+
+**Examples:**
+
+```bash
+/mcp call sqlite.list_tables
+/mcp call sqlite.read_query "SELECT COUNT(*) FROM customers"
+```
+
+---
+
+### Remove a Server
+
+```bash
+/mcp remove <name>
+```
+
+Removes an existing MCP server configuration from your `~/.datus/conf/.mcp.json`.
+
+---
+
+### Tool Filtering
+
+Allows you to explicitly include or exclude specific tools exposed by a server.
+
+```bash
+# Allow only specific tools
+/mcp filter set <mcp_name> include read_query,list_tables
+
+# Reject specific tools (all others allowed)
+/mcp filter set <mcp_name> exclude write_query,drop_table
+
+# Check current filters
+/mcp filter get <mcp_name>
+
+# Remove all filters for a server
+/mcp filter remove <mcp_name>
+```
+
+---
+
+## 3. Advanced Features
+
+### Storage & Configuration
+
+- All MCP server definitions are stored in a single JSON file: `~/.datus/conf/.mcp.json`
+- Each entry includes command, args, optional env, and headers
+- Environment variables can be expanded with `${VAR}` or `${VAR:-default}` inside command, args, env, url, or headers
+
+**Example configuration:**
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/me/project"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### Server Types
+
+- **stdio** — starts a local subprocess and communicates via stdin/stdout
+- **http** — connects to a streamable HTTP endpoint
+- **sse** — connects to a Server-Sent Events endpoint
+
+Use stdio for local dev tools (fastest), http for persistent servers, and sse for remote cloud services.
+
+### Environment Variable Expansion
+
+MCP configurations support environment variable expansion:
+
+```json
+{
+  "mcpServers": {
+    "snowflake": {
+      "command": "${PYTHON_PATH:-python}",
+      "args": ["-m", "mcp_snowflake_server"],
+      "env": {
+        "SNOWFLAKE_ACCOUNT": "${SNOWFLAKE_ACCOUNT}",
+        "SNOWFLAKE_USER": "${SNOWFLAKE_USER}",
+        "SNOWFLAKE_PASSWORD": "${SNOWFLAKE_PASSWORD:-}"
+      }
+    }
+  }
+}
+```
+
+### Error Handling and Debugging
+
+- Server connection failures are clearly reported
+- Tool call errors include detailed error messages
+- Debug mode available for troubleshooting connectivity issues
+- Automatic retry logic for transient connection failures
+
+### Security Considerations
+
+- Environment variables containing secrets are handled securely
+- Authentication headers are stored encrypted
+- Local stdio servers run with user permissions
+- Remote connections use secure protocols (HTTPS/WSS)
+
+## Integration Examples
+
+### Database Integration
+
+```bash
+# Add SQLite server for local development
+/mcp add sqlite uvx mcp-server-sqlite --db-path ./data/sample.db
+
+# Query tables through MCP
+/mcp call sqlite.list_tables
+/mcp call sqlite.read_query "SELECT * FROM customers LIMIT 5"
+```
+
+### Filesystem Integration
+
+```bash
+# Add filesystem server for file operations
+/mcp add filesystem python -m mcp_filesystem_server --base-path /project/data
+
+# File operations through MCP
+/mcp call filesystem.list_directory /reports
+/mcp call filesystem.read_file /reports/summary.md
+```

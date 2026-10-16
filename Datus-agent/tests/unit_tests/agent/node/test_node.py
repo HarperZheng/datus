@@ -1,0 +1,557 @@
+import copy
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+import duckdb
+import pytest
+import yaml
+from agents import Tool
+from pydantic import BaseModel, ValidationError
+
+from datus.agent.node import Node
+from datus.configuration.agent_config import AgentConfig
+from datus.configuration.node_type import NodeType
+from datus.schemas.base import BaseResult
+from datus.schemas.compare_node_models import CompareInput, CompareResult
+from datus.schemas.node_models import (
+    ExecuteSQLInput,
+    ExecuteSQLResult,
+    SQLContext,
+    SqlTask,
+)
+from datus.schemas.schema_linking_node_models import SchemaLinkingInput, SchemaLinkingResult
+from datus.tools.func_tool import db_function_tools
+from datus.utils.constants import DBType
+from datus.utils.loggings import get_logger
+from tests.conftest import TEST_DATA_DIR, isolate_bird_sqlite_databases, load_acceptance_config
+from tests.unit_tests.mock_llm_model import (
+    MockLLMResponse,
+    MockToolCall,
+)
+
+logger = get_logger(__name__)
+
+
+@pytest.fixture
+def schema_linking_input() -> List[Dict[str, Any]]:
+    """Load test data from YAML file"""
+    yaml_path = TEST_DATA_DIR / "SchemaLinkingInput.yaml"
+    with open(yaml_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def execute_sql_input() -> List[Dict[str, Any]]:
+    """Load test data from YAML file"""
+    yaml_path = TEST_DATA_DIR / "ExecuteSQLInput.yaml"
+    with open(yaml_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def output_input() -> Dict[str, Any]:
+    """Load test data from YAML file"""
+    yaml_path = TEST_DATA_DIR / "OutputInput.yaml"
+    with open(yaml_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+# @pytest.fixture
+# def mock_gen_sql_input() -> Dict[str, Any]:
+#    return {
+#        "database_type": "sqlite",
+#        "table_schemas": "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+#        "input_text": "Query all data from users table",
+#        "context": []
+#    }
+
+
+@pytest.fixture(scope="module")
+def isolated_bird_sqlite_root(tmp_path_factory) -> Path:
+    return tmp_path_factory.mktemp("bird_sqlite")
+
+
+@pytest.fixture(scope="module")
+def isolated_demo_duckdb_path(tmp_path_factory) -> Path:
+    return init_demo_db(tmp_path_factory.mktemp("demo_duckdb") / "duck.db")
+
+
+@pytest.fixture
+def agent_config(isolated_bird_sqlite_root, isolated_demo_duckdb_path) -> AgentConfig:
+    # Post-refactor (PR #542) legacy configs with `path_pattern` expand into
+    # one database per matched file (keyed by logic name). The old "bird_sqlite" key is no
+    # longer valid, so the loader drops it; individual tests override `current_datasource` as
+    # needed. Seed a valid default here so fixtures that touch the DB (e.g. `function_tools`)
+    # can initialize.
+    agent_config = load_acceptance_config(datasource="bird_sqlite")
+    isolate_bird_sqlite_databases(
+        agent_config,
+        isolated_bird_sqlite_root,
+        ("california_schools", "financial", "toxicology", "card_games"),
+        reuse_existing=True,
+    )
+    if "duckdb" in agent_config.services.datasources:
+        agent_config.services.datasources["duckdb"].uri = str(isolated_demo_duckdb_path)
+    agent_config.agentic_nodes = copy.deepcopy(agent_config.agentic_nodes)
+    if not agent_config.current_datasource and agent_config.services.datasources:
+        agent_config.current_datasource = "bird_school"
+    Path(agent_config.rag_storage_path()).mkdir(parents=True, exist_ok=True)
+    return agent_config
+
+
+def save_to_yaml(content: BaseModel, filename: str):
+    """Save a Pydantic model instance to a YAML file"""
+    with open(filename, "w") as f:
+        yaml.dump(content.to_dict(), f, allow_unicode=True)
+
+
+@pytest.fixture
+def function_tools(agent_config: AgentConfig) -> List[Tool]:
+    return db_function_tools(agent_config)
+
+
+def init_demo_db(db_path: Path) -> Path:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    conn = duckdb.connect(db_path)
+    try:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS demo;")
+    finally:
+        conn.close()
+    return db_path
+
+
+class TestNodeFactory:
+    """Test suite for Node class"""
+
+    def test_node_initialization(self, agent_config):
+        """Test node initialization"""
+        node = Node.new_instance(
+            node_id="test_node",
+            description="Test Node",
+            node_type=NodeType.TYPE_SCHEMA_LINKING,
+            agent_config=agent_config,
+        )
+
+        assert node.id == "test_node"
+        assert node.description == "Test Node"
+        assert node.type == NodeType.TYPE_SCHEMA_LINKING
+        assert node.status == "pending"
+        assert node.result is None
+        assert node.dependencies == []
+
+    def test_node_state_transitions(self, agent_config):
+        """Test node state transitions"""
+        node = Node.new_instance("test_node", "Test Node", NodeType.TYPE_SCHEMA_LINKING, agent_config=agent_config)
+
+        # Test start state
+        before_start = time.time()
+        node.start()
+        assert node.status == "running"
+        assert isinstance(node.start_time, float)
+        assert node.start_time >= before_start
+
+        # Test complete state
+        result = BaseResult(success=True, error=None)
+        node.complete(result)
+        assert node.status == "completed"
+        assert node.result == result
+        assert isinstance(node.end_time, float)
+        assert node.end_time >= node.start_time
+
+        # Test fail state
+        node = Node.new_instance("test_node", "Test Node", NodeType.TYPE_SCHEMA_LINKING, agent_config=agent_config)
+        error_msg = "Test error"
+        node.fail(error_msg)
+        assert node.status == "failed"
+        assert node.result == BaseResult(success=False, error=error_msg)
+
+    def test_schema_linking_node(self, schema_linking_input, agent_config: AgentConfig, mock_llm_create):
+        """Test schema linking node"""
+        # Mock LLM response for schema linking
+        mock_llm_create.reset(
+            responses=[
+                MockLLMResponse(
+                    tool_calls=[
+                        MockToolCall(name="list_tables", arguments="{}"),
+                    ],
+                    content=json.dumps(
+                        {
+                            "schemas": [
+                                {
+                                    "catalog_name": "",
+                                    "database_name": "california_schools",
+                                    "schema_name": "",
+                                    "table_name": "schools",
+                                    "columns": ["CDSCode", "NCESDist", "NCESSchool"],
+                                    "description": "School information table",
+                                }
+                            ],
+                            "values": [],
+                            "explanation": "Identified relevant schema for the query",
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        # Take first test case from the list
+        for inputs in schema_linking_input:
+            test_case = inputs["input"]
+            if "datasource" in test_case:
+                agent_config.current_datasource = test_case["datasource"]
+                del test_case["datasource"]
+            node = Node.new_instance(
+                node_id="schema_link",
+                description="Schema Linking",
+                node_type=NodeType.TYPE_SCHEMA_LINKING,
+                input_data=SchemaLinkingInput(**test_case),
+                agent_config=agent_config,
+            )
+            assert node.type == NodeType.TYPE_SCHEMA_LINKING
+            assert isinstance(node.input, SchemaLinkingInput)
+            assert node.input.input_text == test_case["input_text"]
+            result = node.run()
+            assert isinstance(result, SchemaLinkingResult)
+            assert result.success is True
+            actual_table_names = {schema.table_name for schema in result.table_schemas}
+            known_fixture_tables = {
+                "_dummy",
+                "account",
+                "atom",
+                "bond",
+                "card",
+                "cards",
+                "client",
+                "connected",
+                "disp",
+                "district",
+                "foreign_data",
+                "frpm",
+                "legalities",
+                "loan",
+                "molecule",
+                "order",
+                "rulings",
+                "satscores",
+                "schools",
+                "set_translations",
+                "sets",
+                "trans",
+            }
+            assert result.schema_count == len(result.table_schemas)
+            assert actual_table_names != set()
+            assert actual_table_names <= known_fixture_tables
+
+    def test_schema_linking_fallback(self, agent_config: AgentConfig, mock_llm_create):
+        """Test schema linking node with fallback"""
+        # Mock LLM response for schema linking fallback
+        mock_llm_create.reset(
+            responses=[
+                MockLLMResponse(
+                    content=json.dumps(
+                        {
+                            "schemas": [
+                                {
+                                    "catalog_name": "",
+                                    "database_name": "california_schools",
+                                    "schema_name": "",
+                                    "table_name": "schools",
+                                    "columns": ["CDSCode", "NCESDist"],
+                                    "description": "School data",
+                                }
+                            ],
+                            "values": [],
+                            "explanation": "Using fallback schema linking",
+                        }
+                    ),
+                ),
+            ]
+        )
+
+        agent_config.current_datasource = "bird_school"
+        agent_config.rag_base_path = "/tmp/test_data"
+        node = Node.new_instance(
+            node_id="schema_link",
+            description="Schema Linking",
+            node_type=NodeType.TYPE_SCHEMA_LINKING,
+            input_data=SchemaLinkingInput(
+                input_text="",
+                database_type=DBType.SQLITE,
+                catalog_name="",
+                database_name="california_schools",
+                schema_name="",
+            ),
+            agent_config=agent_config,
+        )
+        res = node.run()
+        assert isinstance(res, SchemaLinkingResult)
+        assert res.success is True
+        assert res.schema_count > 0
+        assert res.value_count == 0
+
+    def test_node_dependencies(self, agent_config):
+        """Test node dependencies"""
+        node = Node.new_instance("test_node", "Test Node", NodeType.TYPE_SCHEMA_LINKING, agent_config=agent_config)
+
+        # Add dependencies
+        node.add_dependency("dep_1")
+        node.add_dependency("dep_2")
+
+        assert "dep_1" in node.dependencies
+        assert "dep_2" in node.dependencies
+        assert len(node.dependencies) == 2
+
+        # Test duplicate dependency
+        node.add_dependency("dep_1")
+        assert len(node.dependencies) == 2
+
+    def test_invalid_node_type(self, agent_config):
+        """Test invalid node type"""
+        with pytest.raises(ValueError) as exc_info:
+            Node.new_instance("test_node", "Test Node", "invalid_type", agent_config=agent_config)
+        assert "Invalid node type" in str(exc_info.value)
+
+    def test_execution_node(self, execute_sql_input, agent_config, function_tools: List[Tool]):
+        """Test SQL execution node with Snowflake database"""
+        try:
+            # Create execution input from test data
+            test_cases = [0, 1]
+            for test_case_num in test_cases:
+                # Create execution input from test data
+                exec_input = execute_sql_input[test_case_num]["input"]
+                input_data = ExecuteSQLInput(**exec_input)
+                # All BIRD databases (california_schools, financial, ...) live under the
+                # bird_sqlite glob datasource; the input's database_name selects which one.
+                if exec_input.get("database_name") and exec_input["database_name"] in agent_config.services.datasources:
+                    agent_config.current_datasource = exec_input["database_name"]
+                else:
+                    agent_config.current_datasource = "bird_sqlite"
+
+                # Create node instance for testing
+                node = Node.new_instance(
+                    node_id="execute_sql_test",
+                    description="Execute SQL Test",
+                    node_type=NodeType.TYPE_EXECUTE_SQL,
+                    input_data=input_data,
+                    agent_config=agent_config,
+                    tools=function_tools,
+                )
+
+                # Verify initial node configuration
+                assert node.type == NodeType.TYPE_EXECUTE_SQL
+                assert isinstance(node.input, ExecuteSQLInput)
+                assert node.input.sql_query == exec_input["sql_query"]
+
+                # Test validation error for invalid input
+                with pytest.raises(ValidationError):
+                    ExecuteSQLInput(**{"invalid": "data"})
+
+                # Execute node with valid database connection
+                result = node.run()
+                logger.debug(f"Execution node result: {result}")
+
+                # Verify execution results
+                assert node.status == "completed", f"Node execution failed with status: {node.status}"
+                assert isinstance(result, ExecuteSQLResult), "Result type mismatch"
+                assert result.success is True, f"Node execution failed: {result}"
+                assert result.row_count == 1
+                assert isinstance(result.sql_return, str)
+                assert result.sql_return.endswith("\n")
+                assert int(result.sql_return.splitlines()[1]) > 0
+
+        except Exception as e:
+            logger.error(f"Execution node test failed: {str(e)}")
+            raise
+
+    def test_compare_node(self, agent_config: AgentConfig, function_tools: List[Tool], mock_llm_create):
+        """Test compare node with mock LLM and california_schools data"""
+        try:
+            # Mock LLM response for SQL comparison
+            resp = {
+                "explanation": (
+                    "The two queries differ in approach: the first query directly "
+                    "selects from schools table using Charter and FundingType columns, "
+                    "while the expected query joins frpm and schools tables."
+                ),
+                "suggest": (
+                    "Consider joining with the frpm table to ensure data consistency. "
+                    "The frpm table may contain the authoritative charter funding information."
+                ),
+            }
+            mock_llm_create.reset(
+                responses=[
+                    MockLLMResponse(content=json.dumps(resp)),
+                ]
+            )
+
+            # Create test SQL task
+            sql_task = SqlTask(
+                task=(
+                    "Please list the phone numbers of the direct charter-funded schools that are opened after 2000/1/1."
+                ),
+                database_type="sqlite",
+                database_name="california_schools",
+            )
+
+            # Create test SQL context
+            sql_context = SQLContext(
+                sql_query=(
+                    "SELECT Phone FROM schools WHERE Charter = 1 AND FundingType = 'Directly funded' "
+                    "AND OpenDate > '2000-01-01' AND Phone IS NOT NULL ORDER BY OpenDate"
+                ),
+                explanation="Query to get phone numbers of direct charter-funded schools opened after 2000/1/1",
+                sql_return="Phone numbers result",
+                row_count=5,
+            )
+
+            # Create compare input with expected SQL
+            input_data = CompareInput(
+                sql_task=sql_task,
+                sql_context=sql_context,
+                expectation=(
+                    "SELECT T2.Phone FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode "
+                    "WHERE T1.Charter Funding Type = 'Directly funded' AND T1.Charter School (Y/N) = 1 "
+                    "AND T2.OpenDate > '2000-01-01'"
+                ),
+            )
+
+            # Create compare node
+            node = Node.new_instance(
+                node_id="compare_test",
+                description="Compare SQL Test",
+                node_type=NodeType.TYPE_COMPARE,
+                input_data=input_data,
+                agent_config=agent_config,
+                tools=db_function_tools,
+            )
+
+            # Verify initial node configuration
+            assert node.type == NodeType.TYPE_COMPARE
+            assert isinstance(node.input, CompareInput)
+            assert (
+                node.input.sql_task.task
+                == "Please list the phone numbers of the direct charter-funded schools that are opened after 2000/1/1."
+            )
+            assert "SELECT Phone FROM schools WHERE Charter = 1" in node.input.sql_context.sql_query
+            assert "SELECT T2.Phone FROM frpm AS T1 INNER JOIN schools AS T2" in node.input.expectation
+
+            # Test validation error for invalid input
+            with pytest.raises(ValidationError):
+                CompareInput(**{"invalid": "data"})
+
+            # Execute node
+            result = node.run()
+            logger.info(f"Compare node result: {result}")
+
+            # Verify execution results
+            assert node.status == "completed", f"Node execution failed with status: {node.status}"
+            assert isinstance(result, CompareResult), "Result type mismatch"
+            assert result.success is True, f"Node execution failed: {result}"
+            assert result.explanation == resp["explanation"]
+            assert result.suggest == resp["suggest"]
+
+        except Exception as e:
+            logger.error(f"Compare node test failed: {str(e)}")
+            raise
+
+    def test_compare_with_mcp_node(self, agent_config, function_tools: List[Tool], mock_llm_create):
+        """Test compare node with MCP streaming for enhanced database analysis"""
+        try:
+            # Mock LLM response for SQL comparison with MCP
+            mock_llm_create.reset(
+                responses=[
+                    MockLLMResponse(
+                        tool_calls=[
+                            MockToolCall(name="describe_table", arguments='{"table_name": "schools"}'),
+                            MockToolCall(name="describe_table", arguments='{"table_name": "frpm"}'),
+                        ],
+                        content=json.dumps(
+                            {
+                                "explanation": (
+                                    "The MCP analysis reveals that the frpm table contains the authoritative charter "
+                                    "funding information. The current query uses schools table directly which may not "
+                                    "accurately reflect the charter funding type."
+                                ),
+                                "suggest": (
+                                    "Join with the frpm table using CDSCode to accurately retrieve "
+                                    "charter school information. Use `Charter Funding Type` and "
+                                    "`Charter School (Y/N)` columns from frpm table."
+                                ),
+                            }
+                        ),
+                    ),
+                ]
+            )
+
+            # Create test SQL task
+            sql_task = SqlTask(
+                task=(
+                    "Please list the phone numbers of the direct charter-funded schools that are opened after 2000/1/1."
+                ),
+                database_type="sqlite",
+                database_name="california_schools",
+            )
+
+            # Create test SQL context with current query
+            sql_context = SQLContext(
+                sql_query=(
+                    "SELECT Phone FROM schools WHERE Charter = 1 AND FundingType = 'Directly funded' "
+                    "AND OpenDate > '2000-01-01' AND Phone IS NOT NULL ORDER BY OpenDate"
+                ),
+                explanation="Query to get phone numbers of direct charter-funded schools opened after 2000/1/1",
+                sql_return="Phone numbers result",
+                row_count=5,
+            )
+
+            # Create compare input with expected SQL that uses proper joins
+            input_data = CompareInput(
+                sql_task=sql_task,
+                sql_context=sql_context,
+                expectation=(
+                    "SELECT T2.Phone FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode"
+                    " WHERE T1.`Charter Funding Type` = 'Directly funded' AND T1.`Charter School (Y/N)` = 1"
+                    " AND T2.OpenDate > '2000-01-01'"
+                ),
+            )
+
+            # Create compare node
+            node = Node.new_instance(
+                node_id="compare_mcp_test",
+                description="Compare SQL MCP Test",
+                node_type=NodeType.TYPE_COMPARE,
+                input_data=input_data,
+                agent_config=agent_config,
+                tools=function_tools,
+            )
+
+            # Verify initial node configuration
+            assert node.type == NodeType.TYPE_COMPARE
+            assert isinstance(node.input, CompareInput)
+            assert (
+                node.input.sql_task.task
+                == "Please list the phone numbers of the direct charter-funded schools that are opened after 2000/1/1."
+            )
+            assert "SELECT Phone FROM schools WHERE Charter = 1" in node.input.sql_context.sql_query
+            assert "SELECT T2.Phone FROM frpm AS T1 INNER JOIN schools AS T2" in node.input.expectation
+
+            # Test MCP streaming method exists
+            assert hasattr(node, "_compare_sql_stream"), "Node should have MCP streaming method"
+
+            # Execute node (standard execution first)
+            result = node.run()
+            logger.debug(f"Compare MCP node result: {result}")
+
+            # Verify execution results
+            assert node.status == "completed", f"Node execution failed with status: {node.status}"
+            assert isinstance(result, CompareResult), "Result type mismatch"
+            assert result.success is True, f"Node execution failed: {result}"
+            assert "frpm table contains the authoritative charter funding information" in result.explanation
+            assert "Join with the frpm table using CDSCode" in result.suggest
+
+        except Exception as e:
+            logger.error(f"Compare MCP node test failed: {str(e)}")
+            raise

@@ -1,0 +1,197 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+
+"""Unit tests for :mod:`datus.cli.tui.console_bridge`.
+
+The bridge has a single helper, ``run_in_terminal_sync``, whose contract is:
+
+* If no prompt_toolkit Application is active, invoke ``func`` directly.
+* If a **full-screen** Application is active (the main Datus TUI), invoke
+  ``func`` directly — the output buffer handles its own thread safety and
+  ``in_terminal()`` would blank the layout for every print.
+* Otherwise (legacy non-full-screen modal): schedule ``func`` via
+  ``run_in_terminal`` and block on the returned future.
+"""
+
+from __future__ import annotations
+
+from unittest import mock
+
+from datus.cli.tui.console_bridge import run_in_terminal_sync
+
+
+def test_runs_inline_when_no_application() -> None:
+    # The real ``get_app_or_none`` returns ``None`` in unit tests (there is
+    # no Application), so patching is unnecessary here — exercise the real
+    # code path to catch accidental regressions in the fallback logic.
+    called: dict = {"count": 0}
+
+    def _fn() -> None:
+        called["count"] += 1
+
+    run_in_terminal_sync(_fn)
+
+    assert called["count"] == 1
+
+
+def test_schedules_via_run_in_terminal_when_on_event_loop() -> None:
+    """On the prompt_toolkit event loop with a live app, dispatch via run_in_terminal.
+
+    Fire-and-forget because blocking on the returned awaitable would deadlock
+    the loop that has to run the scheduled callback. run_in_terminal already
+    schedules its own Task internally (ensure_future(run())) and returns it,
+    so no outer wrapping is needed.
+    """
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = False  # legacy modal path; full_screen path is exercised separately
+    fake_app.is_running = True
+    fake_loop = mock.MagicMock()
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch("datus.cli.tui.console_bridge.asyncio.get_running_loop", return_value=fake_loop),
+        mock.patch("datus.cli.tui.console_bridge.run_in_terminal") as mocked_rit,
+    ):
+        fn = mock.MagicMock()
+        run_in_terminal_sync(fn)
+
+        mocked_rit.assert_called_once_with(fn)
+
+
+def test_calls_directly_when_app_is_shutting_down() -> None:
+    """On the event loop but with is_running=False (app teardown), func must
+    be called inline rather than scheduled.
+
+    Root cause of #617: loop.close() calls _ready.clear(), discarding the
+    Task's pending first __step before it runs. The inner coroutine is then
+    GC'd unawaited, emitting RuntimeWarning. Detecting is_running=False and
+    falling back to a direct call eliminates the race.
+    """
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = False
+    fake_app.is_running = False
+    called = {"count": 0}
+
+    def _fn() -> None:
+        called["count"] += 1
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch("datus.cli.tui.console_bridge.asyncio.get_running_loop", return_value=mock.MagicMock()),
+        mock.patch("datus.cli.tui.console_bridge.run_in_terminal") as mocked_rit,
+    ):
+        run_in_terminal_sync(_fn)
+
+    assert called["count"] == 1
+    mocked_rit.assert_not_called()
+
+
+def test_submits_coroutine_from_off_loop_thread() -> None:
+    """Off the event loop with a live Application, submit via app.loop.
+
+    ``run_in_terminal`` needs a running loop on the calling thread (Python
+    3.12+); on the streaming refresh daemon there is none, so the bridge
+    hops to ``app.loop`` via :func:`asyncio.run_coroutine_threadsafe` and
+    blocks on the concurrent.futures.Future it returns.
+    """
+    fake_cf = mock.MagicMock()
+    fake_cf.result.return_value = None
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = False
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch(
+            "datus.cli.tui.console_bridge.asyncio.get_running_loop",
+            side_effect=RuntimeError("no loop"),
+        ),
+        mock.patch(
+            "datus.cli.tui.console_bridge.asyncio.run_coroutine_threadsafe",
+            return_value=fake_cf,
+        ) as mocked_submit,
+    ):
+        run_in_terminal_sync(lambda: None)
+
+    mocked_submit.assert_called_once()
+    _coro, loop_arg = mocked_submit.call_args.args
+    assert loop_arg is fake_app.loop
+    _coro.close()
+    fake_cf.result.assert_called_once()
+
+
+def test_swallows_future_exceptions() -> None:
+    # Exceptions raised on the prompt_toolkit loop thread must not leak
+    # back to callers: a worker-thread callback failing silently is
+    # preferable to the REPL crashing mid-dispatch.
+    fake_cf = mock.MagicMock()
+    fake_cf.result.side_effect = RuntimeError("boom")
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = False
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch(
+            "datus.cli.tui.console_bridge.asyncio.get_running_loop",
+            side_effect=RuntimeError("no loop"),
+        ),
+        mock.patch(
+            "datus.cli.tui.console_bridge.asyncio.run_coroutine_threadsafe",
+            return_value=fake_cf,
+        ) as mocked_submit,
+    ):
+        run_in_terminal_sync(lambda: None)
+
+    # The bridge both scheduled the callback and awaited its result even
+    # though the result raised — the exception was swallowed, not re-raised.
+    mocked_submit.assert_called_once()
+    _coro, _loop_arg = mocked_submit.call_args.args
+    _coro.close()
+    fake_cf.result.assert_called_once()
+
+
+def test_runs_inline_when_loop_missing_on_app() -> None:
+    """Application without a running loop (e.g. pre-run) → invoke directly.
+
+    There is no pinned area to preserve yet, so forwarding through
+    ``run_in_terminal`` would be needlessly indirect — the helper falls
+    through to an inline call.
+    """
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = False
+    fake_app.loop = None
+    called = {"count": 0}
+
+    def _fn() -> None:
+        called["count"] += 1
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch(
+            "datus.cli.tui.console_bridge.asyncio.get_running_loop",
+            side_effect=RuntimeError("no loop"),
+        ),
+    ):
+        run_in_terminal_sync(_fn)
+
+    assert called["count"] == 1
+
+
+def test_runs_inline_when_full_screen_application_is_active() -> None:
+    """The main Datus TUI runs full_screen — the bridge must invoke
+    ``func`` directly. ``in_terminal()`` would erase the full layout
+    for every print, which is unusable. The output buffer that
+    receives ``func``'s side-effects is independently thread-safe."""
+    fake_app = mock.MagicMock()
+    fake_app.full_screen = True
+    called = {"count": 0}
+
+    with (
+        mock.patch("datus.cli.tui.console_bridge.get_app_or_none", return_value=fake_app),
+        mock.patch("datus.cli.tui.console_bridge.run_in_terminal") as mocked_rit,
+        mock.patch("datus.cli.tui.console_bridge.asyncio.run_coroutine_threadsafe") as mocked_submit,
+    ):
+        run_in_terminal_sync(lambda: called.__setitem__("count", called["count"] + 1))
+
+    assert called["count"] == 1
+    mocked_rit.assert_not_called()
+    mocked_submit.assert_not_called()

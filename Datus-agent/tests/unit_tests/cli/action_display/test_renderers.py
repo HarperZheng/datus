@@ -1,0 +1,1586 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Unit tests for datus/cli/action_display/renderers.py (ActionRenderer)."""
+
+import json
+import uuid
+from datetime import datetime, timedelta
+from io import StringIO
+
+import pytest
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+from datus.cli.action_display.renderers import (
+    ActionContentGenerator,
+    ActionRenderer,
+    _get_assistant_content,
+    is_task_anchor_input,
+    parse_task_tool_input,
+    resolve_assistant_body,
+)
+from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from datus.utils.text_utils import LITELLM_EMPTY_PLACEHOLDER
+
+
+def _make_action(
+    role: ActionRole,
+    status: ActionStatus,
+    depth: int = 0,
+    action_type: str = "test",
+    messages: str = "",
+    input_data: dict = None,
+    output_data: dict = None,
+    start_time: datetime = None,
+    end_time: datetime = None,
+    parent_action_id: str = None,
+) -> ActionHistory:
+    return ActionHistory(
+        action_id=str(uuid.uuid4()),
+        role=role,
+        messages=messages,
+        action_type=action_type,
+        input=input_data,
+        output=output_data,
+        status=status,
+        start_time=start_time or datetime.now(),
+        end_time=end_time,
+        depth=depth,
+        parent_action_id=parent_action_id,
+    )
+
+
+def _renderer():
+    return ActionRenderer(ActionContentGenerator(enable_truncation=True))
+
+
+def _plain(renderables):
+    """Extract plain text from a list of renderables."""
+    parts = []
+    for r in renderables:
+        if isinstance(r, Text):
+            parts.append(r.plain)
+        else:
+            buf = StringIO()
+            Console(file=buf, no_color=True, width=120).print(r)
+            parts.append(buf.getvalue().strip())
+    return "\n".join(parts)
+
+
+# ── parse_task_tool_input / is_task_anchor_input ──────────────────
+
+
+@pytest.mark.ci
+class TestParseTaskToolInput:
+    """Helpers that decide whether a TOOL action is a real subagent anchor.
+
+    Both functions must agree on the two layouts emitted in production:
+    direct (``bootstrap_subagent``) and wrapped (model adapters). The bug
+    they replaced was that ``streaming.py`` only checked the direct layout
+    via ``input.get("type")`` and silently fell through for wrapped tasks,
+    letting depth>0 children seed misnamed groups.
+    """
+
+    def test_direct_layout_extracts_all_fields(self):
+        data = {"type": "gen_sql", "prompt": "rev?", "description": "revenue"}
+        assert parse_task_tool_input(data) == ("gen_sql", "rev?", "revenue")
+        assert is_task_anchor_input(data) is True
+
+    def test_wrapped_layout_with_dict_arguments(self):
+        data = {
+            "function_name": "task",
+            "arguments": {"type": "gen_table", "prompt": "rollup", "description": "sales"},
+        }
+        assert parse_task_tool_input(data) == ("gen_table", "rollup", "sales")
+        assert is_task_anchor_input(data) is True
+
+    def test_wrapped_layout_with_json_string_arguments(self):
+        data = {
+            "function_name": "task",
+            "arguments": '{"type": "gen_skill", "prompt": "make", "description": "create"}',
+        }
+        assert parse_task_tool_input(data) == ("gen_skill", "make", "create")
+        assert is_task_anchor_input(data) is True
+
+    def test_missing_type_falls_back_to_sentinel(self):
+        assert parse_task_tool_input({}) == ("__no_task_anchor__", "", "")
+        assert is_task_anchor_input({}) is False
+
+    def test_wrapped_arguments_with_invalid_json_is_not_anchor(self):
+        data = {"function_name": "task", "arguments": "not-json"}
+        assert parse_task_tool_input(data) == ("__no_task_anchor__", "", "")
+        assert is_task_anchor_input(data) is False
+
+    def test_non_dict_input_is_not_anchor(self):
+        assert parse_task_tool_input(None) == ("__no_task_anchor__", "", "")
+        assert is_task_anchor_input(None) is False
+        assert is_task_anchor_input("string-input") is False
+
+    def test_empty_type_string_is_not_anchor(self):
+        # Edge case: empty-string ``type`` should hit the fallback branch
+        # instead of yielding ``("", ...)`` and being treated as an anchor.
+        data = {"type": "", "arguments": {"type": ""}}
+        assert parse_task_tool_input(data) == ("__no_task_anchor__", "", "")
+        assert is_task_anchor_input(data) is False
+
+
+# ── render_subagent_header ─────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderSubagentHeader:
+    """Test subagent header rendering."""
+
+    def test_compact_with_description(self):
+        """Compact mode shows description in header."""
+        # Under the cleaned-up grouping contract the group's first_action
+        # is the outer task PROCESSING action — never the inner USER —
+        # so renderer fixtures synthesise that shape directly.
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="task(gen_sql, What is total revenue?)",
+            input_data={
+                "type": "gen_sql",
+                "prompt": "What is total revenue?",
+                "description": "Generate SQL for revenue",
+            },
+        )
+        result = _renderer().render_subagent_header(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "Generate SQL for revenue" in text
+
+    def test_compact_without_description(self):
+        """Compact mode shows truncated prompt when no description."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="task(gen_sql, What is total revenue?)",
+            input_data={"type": "gen_sql", "prompt": "What is total revenue?"},
+        )
+        result = _renderer().render_subagent_header(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "What is total revenue?" in text
+
+    def test_verbose_shows_full_prompt(self):
+        """Verbose mode shows full prompt line."""
+        action = _make_action(
+            ActionRole.USER,
+            ActionStatus.PROCESSING,
+            depth=1,
+            action_type="gen_sql",
+            messages="User: What is total revenue for Q4?",
+        )
+        result = _renderer().render_subagent_header(action, verbose=True)
+        text = _plain(result)
+        assert "prompt:" in text
+        assert "What is total revenue for Q4?" in text
+
+    def test_long_prompt_truncated_compact(self):
+        """Long prompt is truncated in compact mode."""
+        long_prompt = "User: " + "A" * 300
+        action = _make_action(
+            ActionRole.USER,
+            ActionStatus.PROCESSING,
+            depth=1,
+            action_type="gen_sql",
+            messages=long_prompt,
+        )
+        result = _renderer().render_subagent_header(action, verbose=False)
+        text = _plain(result)
+        assert " ... " in text
+
+    def test_no_goal_shows_type_only(self):
+        """When no prompt or description, show type only."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="",
+            input_data={"type": "gen_sql"},
+        )
+        result = _renderer().render_subagent_header(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+
+    def test_outer_task_action_uses_input_type_as_label(self):
+        """Outer ``task`` PROCESSING action: header label comes from
+        ``input["type"]``, not the literal ``"task"`` action_type.
+
+        Regression: previously the bootstrap subagent group rendered the
+        header as ``⏺ task(...)`` because the renderer used
+        ``action.action_type`` verbatim. With the outer task action
+        becoming the group's ``first_action`` (Fix B in streaming.py),
+        the label must surface the real subagent type.
+        """
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="task(gen_sql_summary, orders.sql)",
+            input_data={
+                "type": "gen_sql_summary",
+                "_task_description": "orders.sql",
+                "function_name": "task",
+            },
+        )
+        text = _plain(_renderer().render_subagent_header(action, verbose=False))
+        assert "gen_sql_summary" in text
+        assert "orders.sql" in text
+        # The literal "task" must NOT replace the real subagent name.
+        assert "⏺ task(" not in text
+
+    @pytest.mark.parametrize(
+        "input_data",
+        [
+            {"type": "gen_sql_summary", "description": "summary"},
+            {
+                "function_name": "task",
+                "arguments": {"type": "gen_sql_summary", "description": "summary"},
+            },
+            {
+                "function_name": "task",
+                "arguments": '{"type": "gen_sql_summary", "description": "summary"}',
+            },
+        ],
+        ids=["direct", "wrapped_dict", "wrapped_json_string"],
+    )
+    def test_both_layouts_render_identical_header(self, input_data):
+        """Header text is independent of input layout.
+
+        Regression for the user-reported double-wrap: the streaming gate
+        and the renderer must canonicalise both layouts through the same
+        helper so wrapped-input tasks never fall back to rendering the
+        inner tool's ``action_type`` / ``messages``.
+        """
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="",
+            input_data=input_data,
+        )
+        text = _plain(_renderer().render_subagent_header(action, verbose=False))
+        assert "gen_sql_summary" in text
+        assert "summary" in text
+
+
+# ── render_subagent_action ─────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderSubagentAction:
+    """Test subagent action rendering."""
+
+    def test_tool_compact(self):
+        """TOOL action renders with function name and status."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            messages="list_tables",
+            input_data={"function_name": "list_tables"},
+            start_time=now,
+            end_time=now + timedelta(seconds=1.5),
+        )
+        result = _renderer().render_subagent_action(action, verbose=False)
+        text = _plain(result)
+        assert "list_tables" in text
+        assert "\u2713" in text
+        assert "1.5s" in text
+
+    def test_tool_verbose_with_args_and_output(self):
+        """Verbose TOOL action shows arguments and output."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            messages="read_query",
+            input_data={"function_name": "read_query", "arguments": {"sql": "SELECT 1"}},
+            output_data={"raw_output": '{"success": true, "text": "ok"}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.5),
+        )
+        result = _renderer().render_subagent_action(action, verbose=True)
+        text = _plain(result)
+        assert "read_query" in text
+        assert "sql" in text
+        assert "SELECT 1" in text
+
+    def test_assistant_action(self):
+        """ASSISTANT action renders message content."""
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            depth=1,
+            messages="I will query the database",
+        )
+        result = _renderer().render_subagent_action(action, verbose=False)
+        text = _plain(result)
+        assert "I will query the database" in text
+
+    def test_user_action_skipped(self):
+        """USER actions return empty list (prompt already in header)."""
+        action = _make_action(
+            ActionRole.USER,
+            ActionStatus.PROCESSING,
+            depth=1,
+            messages="User: query",
+        )
+        result = _renderer().render_subagent_action(action, verbose=False)
+        assert result == []
+
+    def test_other_role(self):
+        """Other roles render with label."""
+        action = _make_action(
+            ActionRole.WORKFLOW,
+            ActionStatus.SUCCESS,
+            depth=1,
+            messages="workflow step",
+        )
+        result = _renderer().render_subagent_action(action, verbose=False)
+        text = _plain(result)
+        assert "workflow step" in text
+
+
+# ── render_subagent_done ──────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderSubagentDone:
+    """Test subagent Done summary rendering."""
+
+    def test_done_with_duration(self):
+        """Done line shows tool count and duration."""
+        now = datetime.now()
+        end_action = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=now + timedelta(seconds=3))
+        result = _renderer().render_subagent_done(5, now, end_action)
+        text = result.plain
+        assert "Done" in text
+        assert "5 tool uses" in text
+        assert "3.0s" in text
+
+    def test_done_without_start_time(self):
+        """Done line works when start_time is None."""
+        end_action = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=datetime.now())
+        result = _renderer().render_subagent_done(2, None, end_action)
+        text = result.plain
+        assert "Done" in text
+        assert "2 tool uses" in text
+
+    def test_done_appends_token_suffix_when_totals_present(self):
+        """Sync-path Done line carries the accumulated ↑input(cached) ↓output
+        suffix so it stays consistent with the collapsed / async paths."""
+        now = datetime.now()
+        end_action = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=now + timedelta(seconds=2))
+        text = (
+            _renderer()
+            .render_subagent_done(3, now, end_action, token_input=12603, token_output=2048, token_cached=8192)
+            .plain
+        )
+        assert "Done" in text
+        assert "↑12K(8.0K) ↓2.0K" in text
+
+    def test_done_omits_token_suffix_when_zero(self):
+        """No token text when nothing was recorded (default kwargs)."""
+        end_action = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=datetime.now())
+        text = _renderer().render_subagent_done(1, None, end_action).plain
+        assert "Done" in text
+        assert "↑" not in text
+
+
+# ── render_subagent_collapsed ────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderSubagentCollapsed:
+    """Test collapsed subagent group rendering."""
+
+    def test_collapsed_format(self):
+        """Collapsed group shows header and Done line."""
+        now = datetime.now()
+        # first_action is the outer task PROCESSING action under the
+        # cleaned-up grouping contract (never the inner USER).
+        first = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="task(gen_sql, revenue query)",
+            input_data={"type": "gen_sql", "prompt": "revenue query"},
+        )
+        end = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=now + timedelta(seconds=5))
+        result = _renderer().render_subagent_collapsed(first, 3, now, end)
+        assert len(result) == 2
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "Done" in text
+        assert "3 tool uses" in text
+        assert "\u2713" in text
+
+    def test_collapsed_appends_token_totals(self):
+        """When token totals are provided, the Done line carries the input/output
+        split, with the cached parenthetical only when caching happened."""
+        now = datetime.now()
+        first = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_type="task",
+            messages="task(gen_sql, revenue query)",
+            input_data={"type": "gen_sql", "prompt": "revenue query"},
+        )
+        end = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=now + timedelta(seconds=5))
+        text = _plain(
+            _renderer().render_subagent_collapsed(
+                first, 3, now, end, token_input=12603, token_output=2048, token_cached=8192
+            )
+        )
+        assert "\u219112K(8.0K) \u21932.0K" in text
+
+    def test_collapsed_omits_cached_when_zero(self):
+        """No cached parens when cache_read is 0; no token text when nothing recorded."""
+        now = datetime.now()
+        first = _make_action(
+            ActionRole.TOOL, ActionStatus.PROCESSING, depth=0, action_type="task", input_data={"type": "gen_sql"}
+        )
+        end = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS, end_time=now + timedelta(seconds=1))
+        with_tokens = _plain(
+            _renderer().render_subagent_collapsed(
+                first, 1, now, end, token_input=2048, token_output=512, token_cached=0
+            )
+        )
+        assert "\u21912.0K \u21930.5K" in with_tokens
+        assert "(" not in with_tokens.split("\u2191")[1]  # no cached parens on the input segment
+        no_tokens = _plain(_renderer().render_subagent_collapsed(first, 1, now, end))
+        assert "Done" in no_tokens
+        assert "\u2191" not in no_tokens
+
+
+# ── render_main_action ────────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderMainAction:
+    """Test main-agent action rendering."""
+
+    def test_tool_action(self):
+        """Regular TOOL action renders with inline completed format."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="list_tables",
+            input_data={"function_name": "list_tables"},
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        text = _plain(result)
+        assert "list_tables" in text
+
+    def test_bash_multiline_result_folds_extra_lines(self):
+        """bash compact result renders first 3 lines + a '… +N lines' overflow row."""
+        out = "\\n".join(f"line{i}" for i in range(10))
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            input_data={"function_name": "bash", "arguments": {"command": "ls"}},
+            output_data={"raw_output": f'{{"success": 1, "result": "{out}"}}'},
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        text = _plain(result)
+        assert "line0" in text and "line1" in text and "line2" in text
+        assert "line3" not in text  # folded
+        assert "… +7 lines" in text
+
+    def test_single_line_tool_returns_one_text(self):
+        """Regression: tools without multi-line compact fields render exactly one line block."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            input_data={"function_name": "list_tables"},
+            output_data={"raw_output": '{"success": 1, "result": ["a", "b"]}'},
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        # No overflow / continuation rows for a plain single-line result.
+        assert "… +" not in _plain(result)
+
+    def test_task_tool_renders_as_subagent(self):
+        """TOOL(task) action renders as subagent summary."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="task",
+            input_data={"function_name": "task", "type": "gen_sql", "prompt": "revenue query"},
+            output_data={"raw_output": '{"success": 1, "result": {"response": "done"}}'},
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+
+    def test_assistant_action_markdown(self):
+        """ASSISTANT action renders as Markdown without a prefix."""
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            messages="Here is the answer",
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        assert len(result) == 1
+        text = _plain(result)
+        assert "Here is the answer" in text
+        assert "⏺" not in text
+        assert "💬" not in text
+
+    def test_assistant_markdown_fence_not_broken_by_prefix(self):
+        """Assistant rendering preserves fenced Markdown source."""
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            messages="```markdown\n# Title\n```",
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        text = _plain(result)
+        assert "Title" in text
+        assert "⏺" not in text
+        assert "⏺ ```markdown" not in text
+        assert "```markdown" not in text
+
+    def test_user_action(self):
+        """USER action renders as a bordered Panel with > prefix inside."""
+        action = _make_action(
+            ActionRole.USER,
+            ActionStatus.SUCCESS,
+            messages="User: my question",
+        )
+        result = _renderer().render_main_action(action, verbose=False)
+        panel = result[0]
+        assert isinstance(panel, Panel)
+        assert str(panel.border_style) == "green"
+        # No background fill: the block must inherit the terminal background so
+        # it reads correctly on both dark and light schemes.
+        assert str(panel.style) == "none"
+        inner = panel.renderable
+        assert isinstance(inner, Text)
+        assert inner.plain.startswith("> ")
+        assert "my question" in inner.plain
+        assert str(inner.spans[0].style) == "green bold"
+        assert all("on " not in str(span.style) for span in inner.spans)
+
+    def test_user_action_exec_message_is_suppressed_live(self):
+        """During the live model turn, a marker-encoded manual-execution USER
+        message renders NOTHING — the execution was already shown live as the
+        streamed ``manual_exec`` frame, so re-drawing it would double it. (The
+        block is drawn via ``render_user_header`` on resume / Ctrl+O instead.)"""
+        from datus.cli.manual_exec import build_sql_payload, encode_exec_message
+
+        message = encode_exec_message(build_sql_payload("SELECT id FROM t", ["id"], [{"id": 7}], 1, 0.03))
+        action = _make_action(ActionRole.USER, ActionStatus.SUCCESS, messages=f"User: {message}")
+        assert _renderer().render_main_action(action, verbose=False) == []
+
+    def test_manual_exec_terminal_renders_block(self):
+        """The streamed ``manual_exec`` terminal action renders the styled block
+        from its stored payload (live execution frame's resolved state)."""
+        from datus.cli.manual_exec import build_bash_payload
+
+        payload = build_bash_payload("git status", True, "On branch main", None, 0.05)
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            action_type="manual_exec",
+            input_data={"kind": "bash", "command": "git status"},
+            output_data={"payload": payload},
+        )
+        text = _plain(_renderer().render_main_action(action, verbose=False))
+        assert "bash>" in text
+        assert "On branch main" in text
+        assert "datus-exec" not in text
+
+    def test_manual_exec_processing_renders_running_frame(self):
+        """The PROCESSING ``manual_exec`` frame shows the mode command line +
+        a ticking ``running`` indicator (the live blink)."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            action_type="manual_exec",
+            input_data={"kind": "sql", "command": "SELECT 1"},
+        )
+        text = _renderer().render_processing(action, frame="○").plain
+        assert "sql>" in text
+        assert "SELECT 1" in text
+        assert "running" in text
+
+
+# ── render_task_tool_as_subagent ──────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderTaskToolAsSubagent:
+    """Test task tool as subagent rendering."""
+
+    def test_compact_with_preview(self):
+        """Compact mode shows output preview."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="task",
+            input_data={"function_name": "task", "type": "gen_sql", "prompt": "get revenue"},
+            output_data={"raw_output": '{"success": 1, "result": {"response": "SQL generated"}}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=2),
+        )
+        result = _renderer().render_task_tool_as_subagent(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "result" in text
+
+    def test_verbose_with_response(self):
+        """Verbose mode shows full response."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="task",
+            input_data={"function_name": "task", "type": "gen_sql", "prompt": "get revenue"},
+            output_data={"raw_output": '{"success": 1, "result": {"response": "SELECT SUM(revenue) FROM sales"}}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=2),
+        )
+        result = _renderer().render_task_tool_as_subagent(action, verbose=True)
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "response:" in text
+        assert "SELECT SUM(revenue) FROM sales" in text
+
+    def test_wrapped_arguments_format(self):
+        """Type is extracted from arguments JSON string (resume/session_loader format)."""
+        import json
+
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="task",
+            input_data={
+                "function_name": "task",
+                "arguments": json.dumps({"type": "gen_sql", "prompt": "get revenue", "description": "Revenue query"}),
+            },
+            output_data={"raw_output": '{"success": 1, "result": {"response": "done"}}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=1),
+        )
+        result = _renderer().render_task_tool_as_subagent(action, verbose=False)
+        text = _plain(result)
+        assert "gen_sql" in text
+        assert "subagent" not in text.lower()
+
+    def test_wrapped_arguments_dict_format(self):
+        """Type is extracted from arguments when already parsed as dict."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="task",
+            input_data={
+                "function_name": "task",
+                "arguments": {"type": "explore", "prompt": "check schema"},
+            },
+            start_time=now,
+            end_time=now + timedelta(seconds=1),
+        )
+        result = _renderer().render_task_tool_as_subagent(action, verbose=False)
+        text = _plain(result)
+        assert "explore" in text
+
+
+# ── render_processing ─────────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderProcessing:
+    """Test PROCESSING tool blinking frame rendering."""
+
+    def test_processing_frame(self):
+        """PROCESSING tool shows blinking frame."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            messages="list_tables",
+            input_data={"function_name": "list_tables"},
+        )
+        result = _renderer().render_processing(action, "\u25cb")
+        assert isinstance(result, Text)
+        assert "list_tables" in result.plain
+        assert result.plain.startswith("\u25cb ")
+
+    def test_processing_shows_running_elapsed(self):
+        """PROCESSING frame appends a `· running Ns` elapsed suffix (all tools)."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            input_data={"function_name": "bash", "arguments": {"command": "sleep 5"}},
+            start_time=datetime.now() - timedelta(seconds=3),
+        )
+        result = _renderer().render_processing(action, "○")
+        assert "running 3s" in result.plain
+
+    def test_processing_depth_gt_zero_dim_and_elbow(self):
+        """Sub-agent (depth>0) PROCESSING frame keeps the ⎿ elbow and running suffix."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=1,
+            input_data={"function_name": "bash", "arguments": {"command": "ls"}},
+            start_time=datetime.now() - timedelta(seconds=1),
+        )
+        result = _renderer().render_processing(action, "○")
+        assert "⎿" in result.plain
+        assert "running 1s" in result.plain
+
+    def test_processing_includes_first_argument(self):
+        """PROCESSING frame includes the first argument as `(key: value)` summary."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            input_data={
+                "function_name": "db_describe",
+                "arguments": {"table": "orders", "schema": "public"},
+            },
+        )
+        result = _renderer().render_processing(action, "\u25cf")
+        assert "db_describe" in result.plain
+        assert "(table: orders)" in result.plain
+
+    def test_processing_without_arguments_falls_back_to_ellipsis(self):
+        """PROCESSING frame falls back to `...` suffix when no arguments are present."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            messages="list_tables",
+            input_data={"function_name": "list_tables"},
+        )
+        result = _renderer().render_processing(action, "\u25cb")
+        # Args fall back to "..."; a running-duration suffix now trails the frame.
+        assert "list_tables..." in result.plain
+        assert "running" in result.plain
+
+    def test_processing_truncates_long_argument_value(self):
+        """Long argument values get middle-truncated at 80 chars."""
+        long_sql = "SELECT " + "col, " * 50 + "last FROM t"
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            input_data={
+                "function_name": "execute_sql",
+                "arguments": {"sql": long_sql},
+            },
+        )
+        result = _renderer().render_processing(action, "\u25cb")
+        # Truncation helper inserts " ... " separator in the middle.
+        assert " ... " in result.plain
+        # Value is shown positionally (matching the completed header), no key prefix.
+        assert "SELECT" in result.plain
+        assert "sql:" not in result.plain
+
+    def test_processing_indents_inside_subagent(self):
+        """PROCESSING row inside a subagent (depth>0) gets the `  ⎿  ` prefix."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=1,
+            input_data={
+                "function_name": "db_describe",
+                "arguments": {"table": "orders"},
+            },
+        )
+        result = _renderer().render_processing(action, "\u25cb")
+        assert result.plain.startswith("  \u23bf  ")
+        assert "db_describe" in result.plain
+
+    def test_processing_no_indent_at_top_level(self):
+        """PROCESSING row at depth=0 is not indented."""
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            input_data={"function_name": "list_tables"},
+        )
+        result = _renderer().render_processing(action, "\u25cb")
+        assert not result.plain.startswith("  \u23bf")
+
+
+# ── render_user_header / render_separator ──────────────────────────
+
+
+@pytest.mark.ci
+class TestUtilityRenderables:
+    """Test utility renderables."""
+
+    def test_user_header(self):
+        panel = _renderer().render_user_header("What is revenue?")
+        assert isinstance(panel, Panel)
+        assert str(panel.border_style) == "green"
+        assert str(panel.style) == "none"
+        inner = panel.renderable
+        assert isinstance(inner, Text)
+        assert inner.plain.startswith("> ")
+        assert "What is revenue?" in inner.plain
+        assert str(inner.spans[0].style) == "green bold"
+        assert all("on " not in str(span.style) for span in inner.spans)
+
+    def test_user_header_exec_message_renders_styled_block(self):
+        """On resume, a manual-execution record renders as its bash/sql block
+        (identical to the live turn), never as a plain green user panel."""
+        from datus.cli.manual_exec import build_bash_payload, encode_exec_message
+
+        message = encode_exec_message(build_bash_payload("git status", True, "On branch main", None, 0.05))
+        renderable = _renderer().render_user_header(message)
+        console = Console(file=StringIO(), width=200, no_color=True)
+        console.print(renderable)
+        text = console.file.getvalue()
+        assert "bash>" in text
+        assert "git status" in text
+        assert "On branch main" in text
+        assert "datus-exec" not in text
+
+    def test_separator(self):
+        text = _renderer().render_separator()
+        assert "\u2500" in text.plain
+
+
+# ── print_renderables ─────────────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestPrintRenderables:
+    """Test print_renderables convenience method."""
+
+    def test_prints_to_console(self):
+        buf = StringIO()
+        console = Console(file=buf, no_color=True)
+        renderables = [Text("line1"), Text("line2")]
+        ActionRenderer.print_renderables(console, renderables)
+        output = buf.getvalue()
+        assert "line1" in output
+        assert "line2" in output
+
+
+# ── _extract_subagent_response ────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestExtractSubagentResponse:
+    """Test response extraction from task tool output."""
+
+    def test_extracts_from_nested_result(self):
+        output = {"raw_output": '{"success": 1, "result": {"response": "hello"}}'}
+        assert ActionRenderer._extract_subagent_response(output) == "hello"
+
+    def test_extracts_from_flat_dict(self):
+        output = {"response": "flat hello"}
+        assert ActionRenderer._extract_subagent_response(output) == "flat hello"
+
+    def test_returns_empty_for_invalid(self):
+        assert ActionRenderer._extract_subagent_response({}) == ""
+
+    def test_returns_empty_for_non_json_string(self):
+        output = {"raw_output": "not json"}
+        assert ActionRenderer._extract_subagent_response(output) == ""
+
+
+# ── render_subagent_response ──────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderSubagentResponse:
+    """Test subagent response rendering."""
+
+    def test_renders_response_lines(self):
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            output_data={"raw_output": '{"success": 1, "result": {"response": "line1\\nline2"}}'},
+        )
+        result = _renderer().render_subagent_response(action)
+        text = _plain(result)
+        assert "response:" in text
+        assert "line1" in text
+        assert "line2" in text
+
+    def test_no_output_returns_empty(self):
+        action = _make_action(ActionRole.TOOL, ActionStatus.SUCCESS)
+        result = _renderer().render_subagent_response(action)
+        assert result == []
+
+
+# ── Verbose markup rendering ──────────────────────────────────────
+
+
+@pytest.mark.ci
+class TestVerboseMarkupRendering:
+    """Test that verbose mode uses Rich markup in Text objects."""
+
+    def test_main_tool_verbose_all_text_objects(self):
+        """Verbose _render_main_tool returns only Text objects."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="read_query",
+            input_data={"function_name": "read_query", "arguments": {"sql": "SELECT 1"}},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.3),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        assert len(result) >= 2
+        for r in result:
+            assert isinstance(r, Text)
+
+    def test_sql_args_highlighted(self):
+        """SQL arguments rendered with bright_cyan markup."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="read_query",
+            input_data={
+                "function_name": "read_query",
+                "arguments": {"sql": "SELECT SUM(revenue) FROM sales WHERE year = 2024"},
+            },
+            start_time=now,
+            end_time=now + timedelta(seconds=0.3),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        text = _plain(result)
+        assert "SELECT SUM(revenue) FROM sales" in text
+        assert "sql" in text
+
+    def test_tool_reported_failure_renders_cross_not_check(self):
+        """A tool that returns FuncToolResult(success=0) WITHOUT raising leaves
+        ``action.status == SUCCESS``; the compact ``└─`` line must still show ✗
+        (driven by the per-tool builder's status_mark), not a green ✓.
+
+        Regression: an unsupported/denied execute_sql statement showed ``✓``.
+        """
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,  # no exception bubbled up
+            action_type="execute_sql",
+            messages="execute_sql",
+            input_data={"function_name": "execute_sql", "arguments": {"sql": "CREATE DATABASE x"}},
+            output_data={"success": 0, "error": "boom", "result": None},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        result = _renderer()._render_main_tool(action, verbose=False)
+        text = _plain(result)
+        assert "✗" in text or "×" in text
+        assert "✓" not in text
+
+    def test_args_key_bold(self):
+        """Argument keys are rendered with bold markup."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="custom_tool",
+            input_data={"function_name": "custom_tool", "arguments": {"param": "value"}},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        text = _plain(result)
+        assert "param" in text
+        assert "value" in text
+
+    def test_subagent_verbose_text_objects(self):
+        """Verbose render_subagent_action returns Text objects with markup."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            messages="describe_table",
+            input_data={"function_name": "describe_table", "arguments": {"table_name": "sales"}},
+            output_data={"raw_output": '{"success": true, "result": {"columns": [{"name": "id", "type": "INT"}]}}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.2),
+        )
+        result = _renderer().render_subagent_action(action, verbose=True)
+        for r in result:
+            assert isinstance(r, Text)
+        text = _plain(result)
+        assert "columns" in text
+        assert "id" in text
+
+    def test_edit_file_verbose_diff_colors(self):
+        """edit_file verbose shows diff with old/new lines."""
+        import json
+
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="edit_file",
+            input_data={
+                "function_name": "edit_file",
+                "arguments": {
+                    "path": "src/main.py",
+                    "edits": [{"oldText": "old_line", "newText": "new_line"}],
+                },
+            },
+            output_data={"raw_output": json.dumps({"success": True, "result": "Applied 1 edit"})},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.2),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        text = _plain(result)
+        assert "- old_line" in text
+        assert "+ new_line" in text
+
+    def test_error_output_in_verbose(self):
+        """Error output shows error text in verbose mode."""
+        import json
+
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.FAILED,
+            messages="read_query",
+            input_data={"function_name": "read_query", "arguments": {"sql": "INVALID SQL"}},
+            output_data={"raw_output": json.dumps({"success": False, "error": "Syntax error near INVALID"})},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        text = _plain(result)
+        assert "Syntax error near INVALID" in text
+        assert "error" in text
+
+    def test_output_with_markup_keys_bold(self):
+        """Output keys rendered bold in verbose mode, metadata (success/error) skipped."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="list_tables",
+            input_data={"function_name": "list_tables"},
+            output_data={"raw_output": '{"success": true, "text": "ok"}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.5),
+        )
+        result = _renderer()._render_main_tool(action, verbose=True)
+        assert len(result) >= 2
+        text = _plain(result)
+        # success metadata should be stripped in verbose output
+        assert "success" not in text
+        assert "ok" in text
+
+    def test_inline_expanded_strips_markup(self):
+        """format_inline_expanded strips markup tags for plain text output."""
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            messages="custom_tool",
+            input_data={"function_name": "custom_tool", "arguments": {"key": "val"}},
+            output_data={"raw_output": '{"result": "ok"}'},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        renderer = _renderer()
+        lines = renderer.cg.format_inline_expanded(action)
+        for line in lines:
+            assert "[bold]" not in line
+            assert "[/bold]" not in line
+
+
+# ── render_interaction (batch) ──────────────────────────────────
+
+
+@pytest.mark.ci
+class TestRenderBatchInteractionRequest:
+    """Test batch interaction request rendering (contents/choices format)."""
+
+    def test_single_question_shows_legacy_header(self):
+        """Single question renders with legacy Interaction Request header."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.PROCESSING,
+            action_type="request_choice",
+            input_data={
+                "events": [
+                    {
+                        "content": "Which DB?",
+                        "choices": {"1": "MySQL", "2": "PG"},
+                        "content_type": "markdown",
+                    }
+                ],
+            },
+        )
+        result = _renderer().render_interaction_request(action, verbose=False)
+        text = _plain(result)
+        assert "Interaction Request" in text
+        assert "Which DB?" in text
+
+    def test_multi_question_shows_brief_header(self):
+        """Multiple questions render brief header only (no detailed listing)."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.PROCESSING,
+            action_type="request_batch",
+            input_data={
+                "events": [
+                    {"content": "Which DB?", "choices": {"1": "MySQL", "2": "PG"}},
+                    {"content": "Time range?", "choices": {}},
+                ],
+            },
+        )
+        result = _renderer().render_interaction_request(action, verbose=False)
+        text = _plain(result)
+        assert "Agent Questions (2 questions)" in text
+        # Individual questions are NOT listed in the overview
+        assert "MySQL / PG" not in text
+
+    def test_empty_contents_fallback(self):
+        """Empty contents list renders header only."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.PROCESSING,
+            action_type="request_choice",
+            input_data={"events": []},
+        )
+        result = _renderer().render_interaction_request(action, verbose=False)
+        text = _plain(result)
+        assert "Interaction Request" in text
+
+    def test_single_question_markdown_content(self):
+        """Single question with markdown content_type renders as Markdown."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.PROCESSING,
+            action_type="request_choice",
+            input_data={
+                "events": [
+                    {"content": "Legacy question", "choices": {}, "content_type": "markdown"},
+                ],
+            },
+        )
+        result = _renderer().render_interaction_request(action, verbose=False)
+        text = _plain(result)
+        assert "Interaction Request" in text
+        assert "Legacy question" in text
+
+
+@pytest.mark.ci
+class TestRenderBatchInteractionSuccess:
+    """Test batch interaction success rendering (contents/choices format)."""
+
+    def test_success_with_contents_and_answers(self):
+        """SUCCESS renders answers matched to contents."""
+        import json
+
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.SUCCESS,
+            action_type="request_batch",
+            input_data={"events": [{"content": "Which DB?"}, {"content": "Time range?"}]},
+            output_data={"user_choice": json.dumps(["MySQL", "Last 7 days"])},
+        )
+        result = _renderer().render_interaction_success(action, verbose=False)
+        text = _plain(result)
+        assert "Answers submitted (2/2)" in text
+        assert "Which DB?" in text
+        assert "MySQL" in text
+        assert "Time range?" in text
+        assert "Last 7 days" in text
+
+    def test_success_non_json_user_choice(self):
+        """SUCCESS with non-JSON user_choice wraps as single answer."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.SUCCESS,
+            action_type="request_batch",
+            input_data={"events": [{"content": "Q1?"}, {"content": "Q2?"}]},
+            output_data={"user_choice": "plain text"},
+        )
+        result = _renderer().render_interaction_success(action, verbose=False)
+        text = _plain(result)
+        assert "Answers submitted (1/2)" in text
+        assert "plain text" in text
+
+    def test_success_multi_question_non_list_json_falls_back(self):
+        """SUCCESS with multiple questions and non-list JSON falls back to raw string."""
+        import json
+
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.SUCCESS,
+            action_type="request_batch",
+            input_data={"events": [{"content": "Q1?"}, {"content": "Q2?"}]},
+            output_data={"user_choice": json.dumps("just a string")},
+        )
+        result = _renderer().render_interaction_success(action, verbose=False)
+        text = _plain(result)
+        assert "Answers submitted (1/2)" in text
+
+    def test_success_truncates_long_question(self):
+        """Long question text is truncated to 40 chars."""
+        import json
+
+        long_q = "A" * 60
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.SUCCESS,
+            action_type="request_batch",
+            input_data={"events": [{"content": long_q}, {"content": "Q2?"}]},
+            output_data={"user_choice": json.dumps(["yes", "no"])},
+        )
+        result = _renderer().render_interaction_success(action, verbose=False)
+        text = _plain(result)
+        assert "..." in text
+
+    def test_single_question_success_not_routed_to_batch(self):
+        """Single-question SUCCESS renders as single choice (Selected: y)."""
+        action = _make_action(
+            ActionRole.INTERACTION,
+            ActionStatus.SUCCESS,
+            action_type="request_choice",
+            input_data={"events": [{"content": "Sync?"}]},
+            output_data={"user_choice": "y", "content": "Saved", "content_type": "markdown"},
+        )
+        result = _renderer().render_interaction_success(action, verbose=False)
+        text = _plain(result)
+        assert "Selected: y" in text
+
+
+class TestGetAssistantContentPlaceholderFiltering:
+    """Verify _get_assistant_content strips LiteLLM sanitizer placeholder."""
+
+    def test_placeholder_in_raw_output_returns_empty(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            output_data={"raw_output": LITELLM_EMPTY_PLACEHOLDER},
+        )
+        assert _get_assistant_content(action) == ""
+
+    def test_placeholder_in_messages_returns_empty(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            messages=LITELLM_EMPTY_PLACEHOLDER,
+        )
+        assert _get_assistant_content(action) == ""
+
+    def test_normal_raw_output_unchanged(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            output_data={"raw_output": "SELECT * FROM users"},
+        )
+        assert _get_assistant_content(action) == "SELECT * FROM users"
+
+
+@pytest.mark.ci
+class TestResolveAssistantBody:
+    """``resolve_assistant_body`` never falls back to boilerplate ``messages``."""
+
+    def test_prefers_raw_output_over_response(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            messages="boilerplate",
+            output_data={"raw_output": "streamed text", "response": "node result"},
+        )
+        assert resolve_assistant_body(action) == "streamed text"
+
+    def test_falls_back_to_response_key(self):
+        """Node wrapper results (``ChatNodeResult``) carry no ``raw_output``."""
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            action_type="chat_response",
+            messages="chat interaction completed successfully",
+            output_data={"success": True, "response": "The orders table has 42 rows."},
+        )
+        assert resolve_assistant_body(action) == "The orders table has 42 rows."
+
+    def test_returns_empty_when_no_body_keys(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            action_type="chat_response",
+            messages="chat interaction completed successfully",
+            output_data={"success": True, "response": "   ", "tokens_used": 12},
+        )
+        assert resolve_assistant_body(action) == ""
+
+    def test_returns_empty_when_output_not_dict(self):
+        action = _make_action(ActionRole.ASSISTANT, ActionStatus.SUCCESS, messages="only messages")
+        action.output = "string output"
+        assert resolve_assistant_body(action) == ""
+
+    def test_skips_non_string_body_values(self):
+        """Structured tool-shaped payloads are not renderable markdown bodies."""
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            output_data={"raw_output": {"success": True, "result": "x"}, "response": "plain text"},
+        )
+        assert resolve_assistant_body(action) == "plain text"
+
+    def test_strips_litellm_placeholder_body(self):
+        action = _make_action(
+            ActionRole.ASSISTANT,
+            ActionStatus.SUCCESS,
+            messages="boilerplate",
+            output_data={"raw_output": LITELLM_EMPTY_PLACEHOLDER, "response": "real body"},
+        )
+        assert resolve_assistant_body(action) == "real body"
+
+
+class TestPermissionReviewRow:
+    """The AI review row sits above the result, in both compact and verbose."""
+
+    @staticmethod
+    def _action(review, result="added 42 packages"):
+        now = datetime.now()
+        return _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            action_type="bash",
+            messages="bash",
+            input_data={"function_name": "bash", "arguments": {"command": "npm ci"}},
+            output_data={
+                "raw_output": json.dumps({"success": 1, "result": result}),
+                "permission_review": review,
+            },
+            start_time=now,
+            end_time=now + timedelta(seconds=2.3),
+        )
+
+    def test_compact_shows_verdict_above_the_result(self):
+        action = self._action({"decision": "allow", "risk_level": "low", "confidence": 0.92, "rationale": "reversible"})
+        text = _plain(_renderer()._render_main_tool(action, verbose=False))
+
+        assert "AI review ✓ passed" in text
+        assert "reversible" in text
+        assert text.index("AI review") < text.index("added 42 packages")
+
+    def test_compact_flagged_run_names_the_override(self):
+        action = self._action(
+            {"outcome": "user_approved", "decision": "ask", "risk_level": "high", "rationale": "irreversible"}
+        )
+        text = _plain(_renderer()._render_main_tool(action, verbose=False))
+
+        assert "AI review ✗ flagged" in text
+        assert "user approved" in text
+
+    def test_unreviewed_call_renders_no_review_row(self):
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            action_type="bash",
+            messages="bash",
+            input_data={"function_name": "bash", "arguments": {"command": "npm ci"}},
+            output_data={"raw_output": json.dumps({"success": 1, "result": "ok"})},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        assert "AI review" not in _plain(_renderer()._render_main_tool(action, verbose=False))
+
+    def test_verbose_shows_the_untruncated_rationale(self):
+        rationale = "y" * 300
+        action = self._action({"decision": "allow", "risk_level": "low", "rationale": rationale})
+        text = _plain(_renderer()._render_main_tool(action, verbose=True))
+
+        assert rationale in text.replace("\n", "")
+
+    def test_multiline_output_keeps_its_own_rows(self):
+        """The review row must not be counted as one of the output lines."""
+        action = self._action({"decision": "allow", "rationale": "safe"}, result="\n".join(f"l{i}" for i in range(8)))
+        text = _plain(_renderer()._render_main_tool(action, verbose=False))
+
+        assert "AI review" in text
+        # Three output rows plus the folded remainder, unchanged by the review row.
+        assert "l0" in text and "l2" in text
+        assert "+5 lines" in text
+
+
+class TestSubagentPermissionReviewRow:
+    """A reviewed sub-agent tool call shows the same verdict as a main-agent one.
+
+    Regression: the row was only wired into ``_render_main_tool``, so a
+    subagent could run a gated bash/SQL action and display just its result —
+    the reader could not tell a review had happened or what it concluded.
+    """
+
+    @staticmethod
+    def _bash_action(review):
+        now = datetime.now()
+        return _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            action_type="bash",
+            messages="bash",
+            input_data={"function_name": "bash", "arguments": {"command": "npm ci"}},
+            output_data={
+                "raw_output": json.dumps({"success": 1, "result": "added 42 packages"}),
+                "permission_review": review,
+            },
+            start_time=now,
+            end_time=now + timedelta(seconds=2.3),
+        )
+
+    @staticmethod
+    def _sql_action(review):
+        now = datetime.now()
+        return _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            action_type="execute_sql",
+            messages="execute_sql",
+            input_data={"function_name": "execute_sql", "arguments": {"sql": "DELETE FROM staging WHERE id = 1"}},
+            output_data={"success": 1, "result": "1 row affected", "permission_review": review},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.4),
+        )
+
+    def test_compact_bash_shows_the_verdict(self):
+        action = self._bash_action(
+            {"decision": "allow", "risk_level": "low", "confidence": 0.92, "rationale": "reinstalls declared deps"}
+        )
+        text = _plain(_renderer().render_subagent_action(action, verbose=False))
+
+        assert "AI review ✓ passed" in text
+        assert "reinstalls declared deps" in text
+
+    def test_compact_bash_puts_the_verdict_above_the_result(self):
+        action = self._bash_action({"decision": "allow", "rationale": "reversible"})
+        text = _plain(_renderer().render_subagent_action(action, verbose=False))
+
+        assert text.index("AI review") < text.index("added 42 packages")
+
+    def test_compact_sql_shows_the_verdict(self):
+        action = self._sql_action({"decision": "ask", "risk_level": "medium", "rationale": "predicate-bounded delete"})
+        text = _plain(_renderer().render_subagent_action(action, verbose=False))
+
+        assert "AI review ✗ flagged" in text
+        assert "predicate-bounded delete" in text
+
+    def test_verbose_bash_shows_the_untruncated_rationale(self):
+        rationale = "z" * 300
+        action = self._bash_action({"decision": "allow", "risk_level": "low", "rationale": rationale})
+        text = _plain(_renderer().render_subagent_action(action, verbose=True))
+
+        assert rationale in text.replace("\n", "")
+
+    def test_verbose_sql_shows_the_verdict(self):
+        action = self._sql_action({"decision": "allow", "risk_level": "low", "rationale": "bounded"})
+        text = _plain(_renderer().render_subagent_action(action, verbose=True))
+
+        assert "AI review ✓ passed" in text
+
+    def test_unreviewed_subagent_call_renders_no_review_row(self):
+        now = datetime.now()
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            depth=1,
+            action_type="bash",
+            messages="bash",
+            input_data={"function_name": "bash", "arguments": {"command": "npm ci"}},
+            output_data={"raw_output": json.dumps({"success": 1, "result": "ok"})},
+            start_time=now,
+            end_time=now + timedelta(seconds=0.1),
+        )
+        assert "AI review" not in _plain(_renderer().render_subagent_action(action, verbose=False))
+
+
+class TestManualExecPermissionReviewRow:
+    """The manually run bash>/sql> block shows what authorised the command.
+
+    Regression: ``bash_mode`` stamped the verdict onto the action's output and
+    the renderer read only ``output["payload"]``, dropping it.
+    """
+
+    @staticmethod
+    def _action(review):
+        payload = {
+            "kind": "bash",
+            "command": "npm ci",
+            "success": True,
+            "output": "added 42 packages",
+            "meta": "exit 0 in 2.30s",
+        }
+        output_data = {"payload": payload}
+        if review is not None:
+            output_data["permission_review"] = review
+        return _make_action(
+            ActionRole.TOOL,
+            ActionStatus.SUCCESS,
+            action_type="manual_exec",
+            messages="bash> npm ci",
+            input_data={"kind": "bash", "command": "npm ci"},
+            output_data=output_data,
+        )
+
+    def test_block_shows_the_verdict(self):
+        action = self._action(
+            {"decision": "allow", "risk_level": "low", "confidence": 0.92, "rationale": "reinstalls declared deps"}
+        )
+        text = _plain(_renderer().render_main_action(action, verbose=False))
+
+        assert "AI review ✓ passed" in text
+        assert "reinstalls declared deps" in text
+        # Still the full execution block, not a bare review line.
+        assert "npm ci" in text and "added 42 packages" in text
+
+    def test_block_names_a_user_override(self):
+        action = self._action({"outcome": "user_approved", "decision": "ask", "risk_level": "high", "rationale": "rm"})
+        text = _plain(_renderer().render_main_action(action, verbose=False))
+
+        assert "AI review ✗ flagged" in text
+        assert "user approved" in text
+
+    def test_verbose_block_shows_the_untruncated_rationale(self):
+        rationale = "w" * 300
+        action = self._action({"decision": "allow", "risk_level": "low", "rationale": rationale})
+        text = _plain(_renderer().render_main_action(action, verbose=True))
+
+        assert rationale in text.replace("\n", "").replace(" ", "")
+
+    def test_unreviewed_block_is_unchanged(self):
+        text = _plain(_renderer().render_main_action(self._action(None), verbose=False))
+
+        assert "AI review" not in text
+        assert "added 42 packages" in text
+
+    def test_payloadless_action_renders_nothing(self):
+        action = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.FAILED,
+            action_type="manual_exec",
+            messages="bash> npm ci",
+            input_data={"kind": "bash", "command": "npm ci"},
+            output_data={"payload": None, "permission_review": {"decision": "ask", "rationale": "denied"}},
+        )
+        assert _renderer().render_main_action(action, verbose=False) == []

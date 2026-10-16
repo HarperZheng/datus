@@ -1,0 +1,986 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Unit tests for :class:`datus.cli.model_app.ModelApp`.
+
+The Application itself is not exercised under a pty — instead each test
+constructs a ``ModelApp`` and drives its state machine by calling the
+action methods directly (``_on_provider_enter``, ``_submit_cred_form``,
+``_apply_seed``, ...). :meth:`Application.exit` is patched so we can
+capture what the app would have returned to its caller.
+"""
+
+from __future__ import annotations
+
+import io
+from unittest.mock import MagicMock, patch
+
+import pytest
+from rich.console import Console
+
+from datus.cli.model_app import ModelApp, ModelSelection, _Tab, _View
+
+pytestmark = pytest.mark.ci
+
+
+def _stub_agent_config(**overrides):
+    cfg = MagicMock()
+    cfg.provider_catalog = {
+        "providers": {
+            "openai": {
+                "type": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "default_model": "gpt-4.1",
+                "models": ["gpt-4.1", "gpt-4o"],
+            },
+            "claude_subscription": {
+                "type": "claude",
+                "base_url": "https://api.anthropic.com",
+                "default_model": "claude-sonnet-4-6",
+                "models": ["claude-sonnet-4-6"],
+                "auth_type": "subscription",
+            },
+            "codex": {
+                "type": "codex",
+                "base_url": "https://api.codex",
+                "default_model": "code-1",
+                "models": ["code-1"],
+                "auth_type": "oauth",
+            },
+        },
+    }
+    cfg.providers = {}
+    cfg.models = overrides.get("models", {"my-internal": MagicMock(type="openai", model="internal-gpt")})
+    cfg.target = overrides.get("target", "")
+    cfg._target_provider = overrides.get("target_provider")
+    cfg._target_model = overrides.get("target_model")
+    cfg.provider_available = MagicMock(side_effect=lambda name: name == "openai")
+    return cfg
+
+
+def _build(**overrides) -> ModelApp:
+    cfg = _stub_agent_config(**overrides)
+    return ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Provider listing
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestProviderList:
+    def test_providers_tab_excludes_plan_entries(self):
+        """``Providers`` tab hides subscription / OAuth / coding-plan providers."""
+        app = _build()
+        visible = app._providers_for_tab(_Tab.PROVIDERS)
+        assert "openai" in visible
+        assert "claude_subscription" not in visible
+        assert "codex" not in visible
+
+    def test_plans_tab_contains_plan_entries(self):
+        app = _build()
+        plans = app._providers_for_tab(_Tab.PLANS)
+        assert set(plans) == {"claude_subscription", "codex"}
+
+    def test_plans_tab_contains_bigmodel_and_zai_coding_entries(self):
+        cfg = _stub_agent_config()
+        cfg.provider_catalog["providers"].update(
+            {
+                "bigmodel_coding": {
+                    "type": "claude",
+                    "base_url": "https://open.bigmodel.cn/api/anthropic",
+                    "default_model": "glm-5.1",
+                    "models": ["glm-5.1", "glm-5"],
+                },
+                "zai_coding": {
+                    "type": "claude",
+                    "base_url": "https://api.z.ai/api/anthropic",
+                    "default_model": "glm-5.1",
+                    "models": ["glm-5.1", "glm-5"],
+                },
+            }
+        )
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        plans = app._providers_for_tab(_Tab.PLANS)
+        assert "bigmodel_coding" in plans
+        assert "zai_coding" in plans
+
+    def test_availability_is_cached(self):
+        cfg = _stub_agent_config()
+        ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        # One call per provider during __init__ — no extra disk hits per render.
+        assert cfg.provider_available.call_count == len(cfg.provider_catalog["providers"])
+
+    def test_available_provider_enter_drills_into_model_list(self):
+        app = _build()
+        visible = app._providers_for_tab(_Tab.PROVIDERS)
+        app._list_cursor = visible.index("openai")
+        app._on_provider_enter()
+        assert app._view == _View.PROVIDER_MODELS
+        assert app._active_provider == "openai"
+        assert app._provider_models == ["gpt-4.1", "gpt-4o"]
+
+    def test_unconfigured_api_key_provider_enter_opens_cred_form(self):
+        cfg = _stub_agent_config()
+        # Make openai look unavailable too (no credentials).
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        visible = app._providers_for_tab(_Tab.PROVIDERS)
+        app._list_cursor = visible.index("openai")
+        with patch.object(app, "_focus"):
+            app._on_provider_enter()
+        assert app._view == _View.PROVIDER_CRED_FORM
+
+    def test_unconfigured_subscription_prefers_auto_detected_token(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._enter_provider_list(_Tab.PLANS)
+        visible = app._providers_for_tab(_Tab.PLANS)
+        app._list_cursor = visible.index("claude_subscription")
+        with patch(
+            "datus.auth.claude_credential.get_claude_subscription_token",
+            return_value=("sk-ant-oat01-abc", "~/.claude/.credentials.json"),
+        ):
+            app._on_provider_enter()
+        assert app._view == _View.PROVIDER_MODELS
+        cfg.set_provider_config.assert_called_once()
+        persist_kwargs = cfg.set_provider_config.call_args.kwargs
+        assert persist_kwargs["auth_type"] == "subscription"
+        assert persist_kwargs["api_key"] == "sk-ant-oat01-abc"
+
+    def test_oauth_provider_enter_exits_with_needs_oauth(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._enter_provider_list(_Tab.PLANS)
+        visible = app._providers_for_tab(_Tab.PLANS)
+        app._list_cursor = visible.index("codex")
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_provider_enter()
+        mock_exit.assert_called_once()
+        result = mock_exit.call_args.args[0]
+        assert isinstance(result, ModelSelection)
+        assert result.kind == "needs_oauth"
+        assert result.provider == "codex"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Model list selection
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestEditCredentialsShortcut:
+    def test_edit_opens_cred_form_even_when_provider_is_configured(self):
+        """The ``e`` shortcut must bypass the "available → drill in" short-circuit."""
+        app = _build()  # openai is configured via stub's provider_available side_effect
+        visible = app._providers_for_tab(_Tab.PROVIDERS)
+        app._list_cursor = visible.index("openai")
+        with patch.object(app, "_focus"):
+            app._on_edit_credentials()
+        assert app._view == _View.PROVIDER_CRED_FORM
+        assert app._active_provider == "openai"
+
+    def test_edit_prefills_base_url_from_saved_config(self):
+        cfg = _stub_agent_config()
+        saved = MagicMock(api_key="sk-prev", base_url="https://saved.example", auth_type="api_key")
+        cfg.providers = {"openai": saved}
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        visible = app._providers_for_tab(_Tab.PROVIDERS)
+        app._list_cursor = visible.index("openai")
+        with patch.object(app, "_focus"):
+            app._on_edit_credentials()
+        assert app._cred_base_url.text == "https://saved.example"
+        from datus.cli.model_app import _MASKED_KEY_PLACEHOLDER
+
+        assert app._cred_api_key.text == _MASKED_KEY_PLACEHOLDER
+
+    def test_edit_on_subscription_opens_token_form_without_auto_detect(self):
+        app = _build()
+        app._enter_provider_list(_Tab.PLANS)
+        visible = app._providers_for_tab(_Tab.PLANS)
+        app._list_cursor = visible.index("claude_subscription")
+        with (
+            patch.object(app, "_focus"),
+            patch("datus.auth.claude_credential.get_claude_subscription_token") as auto_detect,
+        ):
+            app._on_edit_credentials()
+        assert app._view == _View.PROVIDER_TOKEN_FORM
+        auto_detect.assert_not_called()
+
+    def test_edit_on_oauth_provider_exits_with_needs_oauth(self):
+        app = _build()
+        app._enter_provider_list(_Tab.PLANS)
+        visible = app._providers_for_tab(_Tab.PLANS)
+        app._list_cursor = visible.index("codex")
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_edit_credentials()
+        result = mock_exit.call_args.args[0]
+        assert result.kind == "needs_oauth"
+        assert result.provider == "codex"
+
+    def test_edit_ignored_on_non_provider_views(self):
+        """The handler is cursor-driven; no-op when the provider list is empty."""
+        app = _build()
+        app._enter_provider_list(_Tab.PROVIDERS)
+        app._list_cursor = 999  # out of range
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_edit_credentials()
+        mock_exit.assert_not_called()
+        assert app._view == _View.PROVIDER_LIST
+
+
+class TestModelSelection:
+    def test_on_model_enter_exits_with_provider_model(self):
+        app = _build()
+        app._enter_provider_models("openai")
+        app._list_cursor = 0
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_model_enter()
+        result = mock_exit.call_args.args[0]
+        assert result.kind == "provider_model"
+        assert (result.provider, result.model) == ("openai", "gpt-4.1")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Custom tab
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCustomTab:
+    def test_enter_custom_list_populates_names_and_appends_add_row(self):
+        app = _build()
+        app._enter_custom_list()
+        items = app._current_items()
+        # All stored custom entries + the trailing "+ Add model..." row.
+        assert len(items) == len(app._custom_names) + 1
+        assert items[-1][0].startswith("+ Add model")
+
+    def test_custom_enter_on_name_exits_with_custom_selection(self):
+        app = _build()
+        app._enter_custom_list()
+        app._list_cursor = app._custom_names.index("my-internal")
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_custom_enter()
+        result = mock_exit.call_args.args[0]
+        assert result.kind == "custom"
+        assert result.name == "my-internal"
+
+    def test_custom_enter_on_add_row_opens_add_model_form(self):
+        app = _build()
+        app._enter_custom_list()
+        app._list_cursor = len(app._custom_names)  # cursor on the "+ Add model..." row
+        with patch.object(app, "_focus"):
+            app._on_custom_enter()
+        assert app._view == _View.ADD_MODEL_FORM
+
+
+class TestDeleteCustomShortcut:
+    def test_first_press_arms_confirmation_without_exit(self):
+        app = _build()
+        app._enter_custom_list()
+        app._list_cursor = app._custom_names.index("my-internal")
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_delete_custom()
+        mock_exit.assert_not_called()
+        assert app._pending_delete_custom == "my-internal"
+        assert app._error_message and "Delete" in app._error_message
+
+    def test_second_press_on_same_row_emits_delete_custom(self):
+        app = _build()
+        app._enter_custom_list()
+        app._list_cursor = app._custom_names.index("my-internal")
+        app._on_delete_custom()  # arms
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_delete_custom()  # confirms
+        result = mock_exit.call_args.args[0]
+        assert result.kind == "delete_custom"
+        assert result.name == "my-internal"
+        assert app._pending_delete_custom is None
+
+    def test_cursor_move_cancels_pending_confirmation(self):
+        """Re-binding guards: moving the cursor clears the arm state."""
+        cfg = _stub_agent_config(
+            models={"a": MagicMock(type="openai", model="x"), "b": MagicMock(type="openai", model="y")}
+        )
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._enter_custom_list()
+        app._list_cursor = 0
+        app._on_delete_custom()  # arms delete of "a"
+        assert app._pending_delete_custom == "a"
+        # Simulate the down-arrow binding: move cursor and clear pending.
+        app._list_cursor = 1
+        app._pending_delete_custom = None
+        # Now a single press on "b" should only arm, not delete.
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_delete_custom()
+        mock_exit.assert_not_called()
+        assert app._pending_delete_custom == "b"
+
+    def test_delete_ignored_on_add_row(self):
+        app = _build()
+        app._enter_custom_list()
+        app._list_cursor = len(app._custom_names)  # "+ Add model..." row
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_delete_custom()
+        mock_exit.assert_not_called()
+        assert app._pending_delete_custom is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Credential form submission
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCredentialForm:
+    def test_submit_persists_and_advances_to_model_list(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        app._cred_api_key.text = "sk-test"
+        app._cred_base_url.text = "https://custom.example"
+        # provider_available is re-queried after the save; pretend it now succeeds.
+        cfg.provider_available.side_effect = lambda name: name == "openai"
+        app._submit_cred_form()
+        cfg.set_provider_config.assert_called_once_with(
+            provider="openai",
+            api_key="sk-test",
+            base_url="https://custom.example",
+            auth_type="api_key",
+        )
+        assert app._view == _View.PROVIDER_MODELS
+
+    def test_masked_placeholder_keeps_existing_key(self):
+        from datus.cli.model_app import _MASKED_KEY_PLACEHOLDER
+
+        cfg = _stub_agent_config()
+        saved = MagicMock(api_key="sk-old", base_url=None, auth_type="api_key")
+        cfg.providers = {"openai": saved}
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        with patch.object(app, "_focus"):
+            app._enter_cred_form("openai")
+        assert app._cred_api_key.text == _MASKED_KEY_PLACEHOLDER
+        app._submit_cred_form()
+        cfg.set_provider_config.assert_called_once_with(
+            provider="openai",
+            api_key=None,
+            base_url="https://api.openai.com/v1",
+            auth_type="api_key",
+        )
+
+    def test_empty_key_clears_existing_key(self):
+        cfg = _stub_agent_config()
+        saved = MagicMock(api_key="sk-old", base_url=None, auth_type="api_key")
+        cfg.providers = {"openai": saved}
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        with patch.object(app, "_focus"):
+            app._enter_cred_form("openai")
+        app._cred_api_key.text = ""
+        cfg.provider_available.side_effect = lambda name: name == "openai"
+        app._submit_cred_form()
+        cfg.set_provider_config.assert_called_once_with(
+            provider="openai",
+            api_key="",
+            base_url="https://api.openai.com/v1",
+            auth_type="api_key",
+        )
+
+    def test_new_key_replaces_existing_key(self):
+        cfg = _stub_agent_config()
+        saved = MagicMock(api_key="sk-old", base_url=None, auth_type="api_key")
+        cfg.providers = {"openai": saved}
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        with patch.object(app, "_focus"):
+            app._enter_cred_form("openai")
+        app._cred_api_key.text = "sk-new"
+        cfg.provider_available.side_effect = lambda name: name == "openai"
+        app._submit_cred_form()
+        cfg.set_provider_config.assert_called_once_with(
+            provider="openai",
+            api_key="sk-new",
+            base_url="https://api.openai.com/v1",
+            auth_type="api_key",
+        )
+
+    def test_multiline_api_key_is_rejected_before_save(self):
+        cfg = _stub_agent_config()
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        app._cred_api_key.text = "sk-test\nnext"
+        app._cred_base_url.text = "https://custom.example"
+
+        app._submit_cred_form()
+
+        cfg.set_provider_config.assert_not_called()
+        assert app._error_message == "API key must be a single line"
+
+    def test_non_ascii_api_key_is_rejected_before_save(self):
+        cfg = _stub_agent_config()
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        app._cred_api_key.text = "sk-test-\u7ffb\u8bd1"
+        app._cred_base_url.text = "https://custom.example"
+
+        app._submit_cred_form()
+
+        cfg.set_provider_config.assert_not_called()
+        assert app._error_message == "API key must contain only ASCII characters"
+
+    def test_no_saved_key_leaves_field_empty(self):
+        cfg = _stub_agent_config()
+        cfg.providers = {}
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._active_provider = "openai"
+        with patch.object(app, "_focus"):
+            app._enter_cred_form("openai")
+        assert app._cred_api_key.text == ""
+
+
+class TestTokenForm:
+    def test_submit_with_empty_token_surfaces_error(self):
+        app = _build()
+        app._active_provider = "claude_subscription"
+        app._token_input.text = ""
+        app._submit_token_form()
+        assert isinstance(app._error_message, str)
+        assert "token" in app._error_message.lower()
+        assert app._view != _View.PROVIDER_MODELS
+
+    def test_submit_with_valid_token_advances_to_model_list(self):
+        app = _build()
+        app._active_provider = "claude_subscription"
+        app._token_input.text = "sk-ant-oat01-xyz"
+        app._submit_token_form()
+        assert app._view == _View.PROVIDER_MODELS
+        app._cfg.set_provider_config.assert_called_once()
+
+    def test_multiline_token_is_rejected_before_save(self):
+        app = _build()
+        app._active_provider = "claude_subscription"
+        app._token_input.text = "sk-ant-oat01-xyz\nnext"
+
+        app._submit_token_form()
+
+        assert app._cfg.set_provider_config.call_count == 0
+        assert app._error_message == "Token must be a single line"
+
+    def test_non_ascii_token_is_rejected_before_save(self):
+        app = _build()
+        app._active_provider = "claude_subscription"
+        app._token_input.text = "sk-ant-oat01-\u7ffb\u8bd1"
+
+        app._submit_token_form()
+
+        assert app._cfg.set_provider_config.call_count == 0
+        assert app._error_message == "Token must contain only ASCII characters"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Add-model form submission
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestAddModelForm:
+    def _prepare(self, **fields):
+        app = _build()
+        app._enter_custom_list()
+        with patch.object(app, "_focus"):
+            app._enter_add_model_form()
+        for attr, value in fields.items():
+            getattr(app, f"_add_{attr}").text = value
+        return app
+
+    def test_submit_exits_with_add_custom_payload(self):
+        app = self._prepare(name="my-new", type="openai", model="gpt-4o", base_url="https://x", api_key="sk")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        result = mock_exit.call_args.args[0]
+        assert result.kind == "add_custom"
+        assert result.name == "my-new"
+        assert result.payload["type"] == "openai"
+        assert result.payload["model"] == "gpt-4o"
+        assert result.payload["base_url"] == "https://x"
+        assert result.payload["api_key"] == "sk"
+
+    def test_submit_rejects_empty_name(self):
+        app = self._prepare(name="", type="openai", model="gpt-4o")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        mock_exit.assert_not_called()
+        assert app._error_message and "name" in app._error_message.lower()
+
+    def test_submit_rejects_duplicate_name(self):
+        app = self._prepare(name="my-internal", type="openai", model="gpt-4o")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        mock_exit.assert_not_called()
+        assert app._error_message and "already exists" in app._error_message
+
+    def test_submit_rejects_missing_required_fields(self):
+        app = self._prepare(name="x", type="", model="")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        mock_exit.assert_not_called()
+
+    def test_multiline_custom_api_key_is_rejected(self):
+        app = self._prepare(name="x", type="openai", model="gpt-4o", api_key="sk\nnext")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        mock_exit.assert_not_called()
+        assert app._error_message == "api_key must be a single line"
+
+    def test_non_ascii_custom_api_key_is_rejected(self):
+        app = self._prepare(name="x", type="openai", model="gpt-4o", api_key="sk-\u7ffb\u8bd1")
+        with patch.object(app, "_finish") as mock_exit:
+            app._submit_add_model_form()
+        mock_exit.assert_not_called()
+        assert app._error_message == "api_key must contain only ASCII characters"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Tab switching + seeding
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestTabCycle:
+    def test_forward_cycle_visits_providers_plans_custom(self):
+        app = _build()
+        assert app._tab == _Tab.PROVIDERS
+        app._cycle_tab(+1)
+        assert app._tab == _Tab.PLANS
+        app._cycle_tab(+1)
+        assert app._tab == _Tab.CUSTOM
+        app._cycle_tab(+1)
+        assert app._tab == _Tab.PROVIDERS
+
+    def test_backward_cycle_goes_providers_custom_plans(self):
+        app = _build()
+        app._cycle_tab(-1)
+        assert app._tab == _Tab.CUSTOM
+        app._cycle_tab(-1)
+        assert app._tab == _Tab.PLANS
+        app._cycle_tab(-1)
+        assert app._tab == _Tab.PROVIDERS
+
+    def test_cycle_into_plans_shows_only_plan_providers(self):
+        app = _build()
+        app._cycle_tab(+1)  # → PLANS
+        items = app._current_items()
+        labels = [label for label, _ in items]
+        # All plan entries must be labelled; no api_key providers here.
+        joined = " ".join(labels)
+        assert "openai" not in joined
+        assert "claude" in joined
+        assert "codex" in joined
+
+
+class TestApplySeed:
+    def test_seed_available_provider_enters_model_list(self):
+        cfg = _stub_agent_config()
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True), seed_provider="openai")
+        early = app._apply_seed()
+        assert early is None
+        assert app._view == _View.PROVIDER_MODELS
+        assert app._active_provider == "openai"
+
+    def test_seed_unavailable_api_key_provider_opens_cred_form(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True), seed_provider="openai")
+        with patch.object(app, "_focus"):
+            early = app._apply_seed()
+        assert early is None
+        assert app._view == _View.PROVIDER_CRED_FORM
+
+    def test_seed_oauth_provider_returns_needs_oauth_without_starting_app(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True), seed_provider="codex")
+        early = app._apply_seed()
+        assert isinstance(early, ModelSelection)
+        assert early.kind == "needs_oauth"
+        assert early.provider == "codex"
+
+    def test_seed_subscription_uses_auto_token_when_available(self):
+        cfg = _stub_agent_config()
+        cfg.provider_available = MagicMock(return_value=False)
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True), seed_provider="claude_subscription")
+        with patch(
+            "datus.auth.claude_credential.get_claude_subscription_token",
+            return_value=("sk-ant-oat01-abc", "env"),
+        ):
+            early = app._apply_seed()
+        assert early is None
+        assert app._view == _View.PROVIDER_MODELS
+        cfg.set_provider_config.assert_called_once()
+
+    def test_seed_unknown_provider_is_ignored(self):
+        app = _build()
+        app._seed_provider = "does-not-exist"
+        assert app._apply_seed() is None
+        # Default view unchanged.
+        assert app._view == _View.PROVIDER_LIST
+
+    def test_seed_tab_custom_enters_custom_list(self):
+        cfg = _stub_agent_config()
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True), seed_tab="custom")
+        assert app._apply_seed() is None
+        assert app._tab == _Tab.CUSTOM
+        assert app._view == _View.CUSTOM_LIST
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Cursor / scrolling safety
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCursor:
+    def test_clamp_cursor_handles_empty_list(self):
+        app = _build()
+        app._list_cursor = 5
+        app._clamp_cursor(0)
+        assert app._list_cursor == 0
+
+    def test_clamp_cursor_reigns_in_overshoot(self):
+        app = _build()
+        app._list_cursor = 99
+        app._clamp_cursor(3)
+        assert app._list_cursor == 2
+
+    @staticmethod
+    def _set_rendered_height(app, window_height):
+        """Pin the list Window's rendered height, mimicking a real paint."""
+        app._list_window = MagicMock()
+        app._list_window.render_info = MagicMock(window_height=window_height)
+
+    def test_visible_slice_scrolls_to_cursor(self):
+        app = _build()
+        self._set_rendered_height(app, 16)  # 16 - 1 indicator = 15 visible
+        total = 25
+        app._list_cursor = 20
+        start, end = app._visible_slice(total)
+        assert start <= app._list_cursor < end
+        assert end - start <= 15
+
+    def test_visible_slice_returns_full_range_when_total_fits(self):
+        app = _build()
+        self._set_rendered_height(app, 16)
+        start, end = app._visible_slice(10)
+        assert (start, end) == (0, 10)
+
+    def test_effective_max_visible_uses_rendered_window_height(self):
+        """The cap follows the height prompt_toolkit actually allotted to the
+        list Window (one row reserved for the scroll indicator)."""
+        app = _build()
+        self._set_rendered_height(app, 12)
+        assert app._effective_max_visible() == 11
+
+    def test_effective_max_visible_caps_at_max(self):
+        app = _build()
+        self._set_rendered_height(app, 100)
+        assert app._effective_max_visible() == 15
+
+    def test_effective_max_visible_floors_at_min(self):
+        app = _build()
+        self._set_rendered_height(app, 2)
+        assert app._effective_max_visible() == 3
+
+    def test_effective_max_visible_falls_back_without_render_info(self):
+        """Before the first paint (no render_info) a conservative half-screen
+        estimate is used instead of overflowing."""
+        app = _build()
+        app._list_window = None
+        with patch("datus.cli.model_app.shutil.get_terminal_size") as mock_size:
+            mock_size.return_value.lines = 24  # 24 // 2 - 2 = 10
+            assert app._effective_max_visible() == 10
+
+    def test_visible_slice_respects_short_embedded_panel(self):
+        """A small panel height (embedded mode) yields a small visible slice."""
+        app = _build()
+        app._view = _View.PROVIDER_MODELS
+        self._set_rendered_height(app, 6)  # 6 - 1 = 5 visible
+        app._list_cursor = 0
+        start, end = app._visible_slice(50)
+        assert end - start == 5
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Rendering helpers — smoke tests
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestRendering:
+    def test_tab_strip_contains_all_three_labels(self):
+        app = _build()
+        fragments = app._render_tab_strip()
+        flat = "".join(text for _, text in fragments)
+        assert "Providers" in flat
+        assert "Plans" in flat
+        assert "Custom" in flat
+
+    def test_provider_items_mark_current_provider(self):
+        cfg = _stub_agent_config(target_provider="openai", target_model="gpt-4.1")
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        labels = [label for label, _ in app._provider_items()]
+        openai_label = next(label for label in labels if label.startswith("openai"))
+        assert "\u2190 current" in openai_label
+
+    def test_provider_models_mark_current_model(self):
+        cfg = _stub_agent_config(target_provider="openai", target_model="gpt-4o")
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._enter_provider_models("openai")
+        labels = [label for label, _ in app._provider_models_items()]
+        assert any("\u2190 current" in label for label in labels)
+
+    def test_configured_marker_uses_checkmark(self):
+        cfg = _stub_agent_config()
+        # Only openai is available (provider_available stub returns True for it).
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        labels = [label for label, _ in app._provider_items()]
+        openai_label = next(label for label in labels if label.startswith("openai"))
+        assert "\u2713" in openai_label
+        assert "[configured]" not in openai_label
+
+    def test_plans_tab_labels_have_no_parenthesised_tags(self):
+        app = _build()
+        app._enter_provider_list(_Tab.PLANS)
+        labels = [label for label, _ in app._provider_items()]
+        assert labels, "Plans tab should not be empty"
+        for label in labels:
+            assert "(" not in label, f"Plans tab label unexpectedly tagged: {label!r}"
+            assert ")" not in label, f"Plans tab label unexpectedly tagged: {label!r}"
+
+    def test_plans_tab_renames_claude_subscription_to_claude_code(self):
+        app = _build()
+        app._enter_provider_list(_Tab.PLANS)
+        labels = [label for label, _ in app._provider_items()]
+        joined = " | ".join(labels)
+        assert "claude code" in joined
+        assert "claude_subscription" not in joined
+
+    def test_plans_tab_replaces_underscores_in_names_with_spaces(self):
+        cfg = _stub_agent_config()
+        cfg.provider_catalog["providers"]["alibaba_coding"] = {
+            "type": "claude",
+            "base_url": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+            "default_model": "qwen3-coder-plus",
+            "models": ["qwen3-coder-plus"],
+        }
+        app = ModelApp(cfg, Console(file=io.StringIO(), no_color=True))
+        app._enter_provider_list(_Tab.PLANS)
+        labels = [label for label, _ in app._provider_items()]
+        joined = " | ".join(labels)
+        assert "alibaba coding" in joined
+        assert "alibaba_coding" not in joined
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Dual-mode finish hook + embedded panel + standalone run() with
+# mocked Application.
+# ─────────────────────────────────────────────────────────────────────
+
+
+import asyncio  # noqa: E402
+
+from datus.cli.tui.wizard_host import EmbeddedWizard  # noqa: E402
+
+
+def _make_future():
+    loop = asyncio.new_event_loop()
+    return loop, loop.create_future()
+
+
+class TestEmbeddedPanel:
+    def test_build_embedded_panel_returns_wizard(self):
+        app = _build()
+        loop, fut = _make_future()
+        try:
+            panel = app.build_embedded_panel(fut)
+            assert isinstance(panel, EmbeddedWizard)
+            assert panel.done_future is fut
+            assert app._on_done is not None
+        finally:
+            loop.close()
+
+    def test_finish_via_future_with_result(self):
+        """``_finish_via_future`` is the adapter ``build_embedded_panel``
+        wires into ``_on_done``. Verify both branches."""
+        loop, fut = _make_future()
+        try:
+            sel = ModelSelection(kind="provider_model", provider="openai", model="gpt-4.1")
+            ModelApp._finish_via_future(fut, sel)
+            assert fut.done() and fut.result() is sel
+        finally:
+            loop.close()
+
+    def test_finish_via_future_with_none(self):
+        loop, fut = _make_future()
+        try:
+            ModelApp._finish_via_future(fut, None)
+            assert fut.done() and fut.result() is None
+        finally:
+            loop.close()
+
+
+class TestFinishAndLayout:
+    def test_finish_without_on_done_noop(self):
+        app = _build()
+        assert app._on_done is None
+        app._finish(None)
+
+    def test_finish_invokes_on_done(self):
+        app = _build()
+        captured: list = []
+        app._on_done = lambda r: captured.append(r)
+        sel = ModelSelection(kind="provider_model", provider="openai", model="gpt-4.1")
+        app._finish(sel)
+        assert captured == [sel]
+
+    def test_layout_with_app_returns_app_layout(self):
+        app = _build()
+        fake_layout = MagicMock()
+        app._app = MagicMock(layout=fake_layout)
+        assert app._layout() is fake_layout
+
+    def test_layout_returns_none_when_get_app_raises(self):
+        app = _build()
+        app._app = None
+        with patch("prompt_toolkit.application.get_app", side_effect=RuntimeError("no app")):
+            assert app._layout() is None
+
+    def test_focus_no_target_noop(self):
+        """``_focus(None)`` returns ``None`` via the early-out guard
+        and never touches the (absent) layout."""
+        app = _build()
+        app._app = None
+        assert app._focus(None) is None
+
+    def test_focus_dispatches_to_layout(self):
+        app = _build()
+        fake_layout = MagicMock()
+        app._app = MagicMock(layout=fake_layout)
+        target = object()
+        app._focus(target)
+        fake_layout.focus.assert_called_once_with(target)
+
+
+class TestProviderModelSearch:
+    """The provider-model view has a live search box that filters the list."""
+
+    def _enter_models(self, app, models, provider="openai"):
+        app._active_provider = provider
+        app._provider_models = list(models)
+        app._view = _View.PROVIDER_MODELS
+        app._model_search.text = ""
+        app._list_cursor = 0
+
+    def test_empty_search_returns_all_models(self):
+        app = _build()
+        models = ["anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.5-pro"]
+        self._enter_models(app, models)
+        assert app._filtered_models() == models
+
+    def test_filter_is_case_insensitive_substring(self):
+        app = _build()
+        self._enter_models(
+            app,
+            ["anthropic/claude-sonnet-4", "openai/gpt-4o", "openai/gpt-4o-mini", "google/gemini-2.5-pro"],
+        )
+        app._model_search.text = "OpenAI"
+        assert app._filtered_models() == ["openai/gpt-4o", "openai/gpt-4o-mini"]
+
+    def test_provider_models_items_reflects_filter(self):
+        app = _build()
+        self._enter_models(app, ["openai/gpt-4o", "anthropic/claude-sonnet-4"])
+        app._model_search.text = "claude"
+        labels = [label for label, _style in app._provider_models_items()]
+        assert labels == ["anthropic/claude-sonnet-4"]
+
+    def test_text_change_resets_cursor_and_offset(self):
+        app = _build()
+        self._enter_models(app, ["a/one", "b/two", "c/three", "d/four"])
+        app._list_cursor = 3
+        app._list_offset = 2
+        app._model_search.text = "t"  # matches two/three
+        assert app._list_cursor == 0
+        assert app._list_offset == 0
+
+    def test_on_model_enter_selects_from_filtered_list(self):
+        app = _build()
+        self._enter_models(app, ["openai/gpt-4o", "anthropic/claude-sonnet-4", "anthropic/claude-haiku"])
+        app._model_search.text = "haiku"
+        app._list_cursor = 0  # first (and only) filtered row
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_model_enter()
+        result = mock_exit.call_args.args[0]
+        assert (result.provider, result.model) == ("openai", "anthropic/claude-haiku")
+
+    def test_on_model_enter_noops_when_filter_matches_nothing(self):
+        app = _build()
+        self._enter_models(app, ["openai/gpt-4o"])
+        app._model_search.text = "nonexistent"
+        with patch.object(app, "_finish") as mock_exit:
+            app._on_model_enter()
+        mock_exit.assert_not_called()
+
+    def test_enter_provider_models_clears_stale_filter(self):
+        app = _build()
+        app._model_search.text = "leftover"
+        app._enter_provider_models("openai")  # openai has models in the stub catalog
+        assert app._model_search.text == ""
+        assert app._filtered_models() == ["gpt-4.1", "gpt-4o"]
+
+    def test_footer_hint_mentions_filtering(self):
+        app = _build()
+        app._view = _View.PROVIDER_MODELS
+        hint = "".join(text for _style, text in app._render_footer_hint())
+        assert "filter" in hint.lower()
+
+    def _escape_binding(self, app):
+        from prompt_toolkit.keys import Keys
+
+        kb = app._build_key_bindings()
+        for binding in kb.bindings:
+            if binding.keys == (Keys.Escape,) and binding.filter():
+                return binding
+        raise AssertionError("no active escape binding for current view")
+
+    def test_escape_clears_filter_before_going_back(self):
+        app = _build()
+        self._enter_models(app, ["openai/gpt-4o", "anthropic/claude-sonnet-4"])
+        app._model_search.text = "gpt"
+        binding = self._escape_binding(app)
+        binding.call(MagicMock())
+        # First Esc only clears the filter; still on the model view.
+        assert app._model_search.text == ""
+        assert app._view == _View.PROVIDER_MODELS
+        # Second Esc returns to the provider list.
+        binding = self._escape_binding(app)
+        binding.call(MagicMock())
+        assert app._view == _View.PROVIDER_LIST
+
+
+class TestRunStandalone:
+    def test_run_returns_selection(self):
+        app = _build()
+        sel = ModelSelection(kind="provider_model", provider="openai", model="gpt-4.1")
+        fake_app = MagicMock()
+        fake_app.run.return_value = sel
+        with patch("datus.cli.model_app.Application", return_value=fake_app):
+            assert app.run() is sel
+        assert app._on_done is None
+        assert app._app is None
+
+    def test_run_keyboard_interrupt_returns_none(self):
+        app = _build()
+        fake_app = MagicMock()
+        fake_app.run.side_effect = KeyboardInterrupt
+        with patch("datus.cli.model_app.Application", return_value=fake_app):
+            assert app.run() is None

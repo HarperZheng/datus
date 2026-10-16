@@ -1,0 +1,1366 @@
+schema_version: 1
+source:
+  docs_navigation: mkdocs.yml
+  definition: >
+    A core flow is a documented user-facing entry point, data/knowledge lifecycle,
+    adapter contract, or release-confidence operation exposed from docs/.
+layers:
+  pr_acceptance:
+    description: >
+      Fast deterministic PR signal for documented core flows. Only nodeids whose
+      file is listed in PR_ACCEPTANCE_TARGETS (ci/run-pr-tests.py) run on every
+      PR; other nodeids run through the diff-driven impacted unit suite and only
+      execute when the PR touches their mapped source tree.
+  merge_queue:
+    description: Deterministic pre-merge signal on the merge-group commit.
+  nightly:
+    description: Full product and integration signal with real services, adapters, and provider health.
+  weekly_benchmark:
+    description: Quality and retrieval signal for benchmarked product scenarios.
+gap_issue: https://github.com/Datus-ai/Datus-agent/issues/910
+docs_coverage_policy:
+  description: >
+    Every page in the mkdocs nav must either be referenced by a flow's docs: list
+    or be excluded here with a rationale. validate_coverage_map.py fails when a nav
+    page is neither, so new documented user-facing surfaces cannot be added without
+    a conscious coverage decision.
+  exclude:
+    - path: docs/index.md
+      reason: Documentation site landing page, not a user-facing flow.
+    - path: docs/getting_started/index.md
+      reason: Getting Started path chooser and section overview, not a discrete product flow.
+    - path: docs/develop/README.md
+      reason: Contributor/development guide, not a product flow.
+    - path: docs/plugin/development.md
+      reason: Contributor/development guide for plugin authors, not a product flow.
+    - path: docs/release_notes.md
+      reason: Release notes, not a user-facing flow.
+    - path: docs/configuration/introduction.md
+      reason: Configuration section overview, not a discrete flow.
+    - path: docs/knowledge_base/introduction.md
+      reason: Knowledge base section overview, not a discrete flow.
+    - path: docs/API/debugging.md
+      reason: REST API diagnostics/troubleshooting reference (SIGUSR1 task dump), not a discrete product flow.
+flow_groups:
+  onboarding:
+    description: First-run and documented bootstrap flows.
+    flows:
+      - id: onboarding.quickstart
+        title: Quickstart CLI chat and workspace setup
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/getting_started/Quickstart.md
+          - docs/cli/chat_command.md
+          - docs/cli/reference.md
+        entrypoints:
+          - "CLI: datus"
+          - "CLI slash commands: /datasource, /model, /init"
+        contracts:
+          - Documented REPL commands stay routable through the shared command dispatcher.
+          - Quickstart workspace initialization remains available from the CLI.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_quickstart_documented_repl_entrypoints_stay_routable
+              - tests/unit_tests/cli/test_interactive_init.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_quickstart_documented_repl_entrypoints_stay_routable
+              - tests/unit_tests/cli/test_interactive_init.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/cli/test_quickstart_smoke.py
+              - tests/integration/cli/test_quickstart_smoke.py::TestQuickstartChatInitialization::test_chat_node_exposes_sql_tools_on_quickstart_datasource
+              - tests/integration/cli/test_quickstart_smoke.py::TestQuickstartChatSmoke::test_quickstart_natural_language_question_answered_with_sql
+            notes: >
+              Nightly smoke exercises the documented quickstart chat path (natural-language
+              question answered with real-LLM SQL generation on a local datasource). Full
+              guided tutorial replay remains tracked by the gap issue.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/893
+
+      - id: onboarding.bootstrap_bi
+        title: Dashboard copilot and bootstrap BI
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/getting_started/dashboard_copilot.md
+          - docs/skills/dashboard_bootstrap.md
+          - docs/getting_started/data_engineering_quickstart.md
+          - docs/configuration/bi_platforms.md
+        entrypoints:
+          - "REPL: /bootstrap-bi compatibility skill shortcut"
+          - "CLI chat: natural-language dashboard bootstrap request"
+        contracts:
+          - The shortcut routes to the dashboard-bootstrap skill through the standard chat pipeline.
+          - The selected BI plugin exports confirmed SQL; builtin agents construct reference SQL and metrics.
+          - When configuration is mutable, the workflow uses create-subagent to persist the dashboard agent pair.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_bootstrap_bi_routes_to_dashboard_bootstrap_skill
+              - tests/unit_tests/tools/skill_tools/test_dashboard_bootstrap_skill.py
+              - tests/unit_tests/tools/skill_tools/test_create_subagent_skill.py
+              - tests/unit_tests/tools/func_tool/test_bi_tools.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_bootstrap_bi_routes_to_dashboard_bootstrap_skill
+              - tests/unit_tests/tools/skill_tools/test_dashboard_bootstrap_skill.py
+              - tests/unit_tests/tools/skill_tools/test_create_subagent_skill.py
+              - tests/unit_tests/tools/func_tool/test_bi_tools.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/plugins/test_dashboard_bootstrap_plugin.py::test_dashboard_bootstrap_installs_plugin_and_exports_verified_superset_queries
+              - tests/integration/agent/test_gen_dashboard_agentic.py::TestGenDashboardAgenticInit
+              - tests/integration/tools/test_bi_dashboard.py::TestPartialIntegration::test_workflow_without_llm
+              - tests/integration/tools/test_bi_grafana.py
+            notes: >
+              The P0 Superset path installs the managed plugin from source, verifies a real
+              dashboard SQL export manifest and checksums, checks node/tool initialization,
+              and exercises BI orchestration with fixed generation results. Superset real-model
+              workflows are manual evaluations; nightly does not guarantee model adherence
+              to the skill's confirmation boundary. See ci/cross-repo-harness.md.
+          weekly_benchmark:
+            status: not_applicable
+            notes: >
+              Scoped out: the weekly benchmark measures query/retrieval quality (Baisheng),
+              not BI bootstrap artifact quality. bootstrap-bi is validated by nightly, not by
+              weekly benchmark, until a deliberate artifact-quality scoring design exists (#921).
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: onboarding.contextual_data_engineering
+        title: Contextual data engineering bootstrap
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/getting_started/contextual_data_engineering.md
+          - docs/knowledge_base/metadata.md
+          - docs/knowledge_base/reference_sql.md
+        entrypoints:
+          - "CLI: datus bootstrap"
+          - "CLI chat: context-aware SQL workflow"
+        contracts:
+          - Local context bootstrap produces searchable metadata, semantic, knowledge, and SQL context.
+          - Query-time context retrieval can use historical SQL and knowledge artifacts.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_bootstrap_semantic_modeling_stream_orchestrates_unified_helper
+              - tests/integration/storage/test_storage_layout.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py::test_bootstrap_semantic_modeling_stream_orchestrates_unified_helper
+              - tests/integration/storage/test_storage_layout.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_semantic_modeling_agentic.py
+              - tests/integration/agent/test_sql_summary_agentic.py
+          weekly_benchmark:
+            status: covered
+            notes: datus-benchmark Baisheng weekly scenario exercises query-time context use.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/856
+
+  chat_surface:
+    description: User chat surfaces and interaction lifecycle.
+    flows:
+      - id: chat_surface.cli_chat
+        title: CLI chat, command routing, and model overrides
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/cli/introduction.md
+          - docs/cli/chat_command.md
+          - docs/cli/other_commands.md
+          - docs/cli/plan_mode.md
+          - docs/configuration/compact.md
+        entrypoints:
+          - "CLI: datus"
+          - "CLI slash commands: /model, /language, /effort"
+        contracts:
+          - Documented CLI command routing remains stable.
+          - Model, language, and effort overrides are accepted and persisted through the CLI layer.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py
+              - tests/unit_tests/cli/test_model_commands.py
+              - tests/unit_tests/cli/test_language_commands.py
+              - tests/unit_tests/cli/test_effort_commands.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_core_entrypoint_acceptance.py
+              - tests/unit_tests/cli/test_model_commands.py
+              - tests/unit_tests/cli/test_language_commands.py
+              - tests/unit_tests/cli/test_effort_commands.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/cli/test_cli_commands.py
+              - tests/integration/cli/test_cli_textual.py
+          weekly_benchmark:
+            status: not_applicable
+        gaps: []
+
+      - id: chat_surface.rest_chat_lifecycle
+        title: REST chat streaming and session lifecycle
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/API/introduction.md
+          - docs/API/chat.md
+          - docs/API/deployment.md
+        entrypoints:
+          - "REST API: /api/chat"
+          - "REST API: stream, resume, stop, session history"
+        contracts:
+          - Chat streaming emits stable events and persists session state.
+          - Resume, stop, user interaction, and error envelopes remain compatible.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/api/routes/test_chat_routes.py
+              - tests/unit_tests/api/services/test_chat_task_manager.py
+              - tests/integration/api/test_api.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/api/routes/test_chat_routes.py
+              - tests/unit_tests/api/services/test_chat_task_manager.py
+              - tests/integration/api/test_api.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/api/test_api_chat.py
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: chat_surface.web_chatbot
+        title: Web Chatbot
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/web_chatbot/introduction.md
+        entrypoints:
+          - Web Chatbot UI
+          - "CLI: datus web"
+        contracts:
+          - Web chat sessions can start, stream, and render persisted conversation state.
+          - Success-story archive behavior remains compatible with the API service layer.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/web/test_chatbot.py
+              - tests/unit_tests/api/services/test_success_story_service.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/web/test_chatbot.py
+              - tests/unit_tests/api/services/test_success_story_service.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/cli/test_web_chatbot.py
+              - tests/regression/test_regression_web_e2e.py
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: chat_surface.im_gateway
+        title: IM Gateway for Slack and Feishu
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/gateway/introduction.md
+          - docs/gateway/slack.md
+          - docs/gateway/feishu.md
+        entrypoints:
+          - "Gateway: Slack"
+          - "Gateway: Feishu"
+        contracts:
+          - Gateway adapters parse inbound messages and render outbound rich text consistently.
+          - Gateway runtime can route messages to Datus chat services.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/gateway/test_runtime.py
+              - tests/unit_tests/gateway/adapters/test_feishu.py
+              - tests/unit_tests/gateway/adapters/test_slack.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/gateway/test_runtime.py
+              - tests/unit_tests/gateway/adapters/test_feishu.py
+              - tests/unit_tests/gateway/adapters/test_slack.py
+          nightly:
+            status: manual
+            notes: >
+              Scoped out of automated nightly: live Slack/Feishu smoke needs real workspace/tenant
+              credentials and Socket Mode/WebSocket connections, classified as an external dependency.
+              Adapter parsing, rich-text rendering, and runtime routing are covered deterministically;
+              end-to-end channel delivery is validated by manual release QA.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+  data_access:
+    description: Datasource configuration, SQL execution, adapter contracts, and context injection.
+    flows:
+      - id: data_access.datasource_configuration
+        title: Datasource configuration and SQL execution commands
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/configuration/datasources.md
+          - docs/configuration/datasources/bigquery.md
+          - docs/configuration/datasources/clickhouse.md
+          - docs/configuration/datasources/clickzetta.md
+          - docs/configuration/datasources/doris.md
+          - docs/configuration/datasources/duckdb.md
+          - docs/configuration/datasources/dws.md
+          - docs/configuration/datasources/gaussdb.md
+          - docs/configuration/datasources/greenplum.md
+          - docs/configuration/datasources/hive.md
+          - docs/configuration/datasources/hologres.md
+          - docs/configuration/datasources/maxcompute.md
+          - docs/configuration/datasources/mysql.md
+          - docs/configuration/datasources/oracle.md
+          - docs/configuration/datasources/postgresql.md
+          - docs/configuration/datasources/redshift.md
+          - docs/configuration/datasources/snowflake.md
+          - docs/configuration/datasources/spark.md
+          - docs/configuration/datasources/sqlite.md
+          - docs/configuration/datasources/starrocks.md
+          - docs/configuration/datasources/tidb.md
+          - docs/configuration/datasources/trino.md
+          - docs/cli/sql_execution.md
+          - docs/cli/execution_command.md
+        entrypoints:
+          - "CLI slash commands: /datasource, /sql"
+          - DBFuncTool
+        contracts:
+          - Datasource selection routes SQL tools to the configured connector.
+          - Read-only SQL execution rejects unsafe statements where required.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_func_tools_db.py
+              - tests/integration/tools/db_tools/test_connector_duckdb.py
+              - tests/unit_tests/tools/db_tools/test_db_func_tools.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_func_tools_db.py
+              - tests/integration/tools/db_tools/test_connector_duckdb.py
+              - tests/unit_tests/tools/db_tools/test_db_func_tools.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/adapters/test_postgresql.py
+              - tests/integration/adapters/test_mysql.py
+              - tests/integration/adapters/test_clickhouse.py
+              - tests/integration/adapters/test_starrocks.py
+              - tests/integration/adapters/test_doris.py
+              - tests/integration/adapters/test_tidb.py
+              - tests/integration/adapters/test_trino.py
+              - tests/integration/adapters/test_greenplum.py
+              - tests/integration/adapters/test_hive.py
+              - tests/integration/adapters/test_spark.py
+              - tests/integration/adapters/test_gaussdb.py
+          weekly_benchmark:
+            status: covered
+            notes: Baisheng weekly benchmark runs Datus queries against StarRocks.
+        gaps: []
+
+      - id: data_access.sql_policy_enforcement
+        title: Request-scoped SQL policy enforcement
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/configuration/sql_policy.md
+          - docs/API/introduction.md
+        entrypoints:
+          - "REST API: /api/v1/chat/stream"
+          - "REST API header: X-Datus-Policy-Context"
+          - DBFuncTool policy runtime enforcement
+        contracts:
+          - The default API provider parses execution policy inputs from X-Datus-Policy-Context JSON.
+          - X-Datus-User-Id remains session identity and is not merged into policy context.
+          - Active policy runtimes validate context before any subagent starts.
+          - Policy plugins can rewrite or deny reads before execution and transform successful results afterward.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/api/auth/test_header_context_provider.py
+              - tests/unit_tests/api/routes/test_chat_routes.py::TestStreamChatPolicyContextPreCheck
+              - tests/unit_tests/tools/test_policy_runtime.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/api/auth/test_header_context_provider.py
+              - tests/unit_tests/api/routes/test_chat_routes.py::TestStreamChatPolicyContextPreCheck
+              - tests/unit_tests/tools/test_policy_runtime.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/plugins/test_sql_policy_plugin.py::test_managed_sql_policy_enforces_sql_semantic_and_api_reads
+              - tests/integration/api/test_api_chat.py
+              - tests/integration/adapters/test_starrocks.py
+            notes: >
+              The P0 managed-plugin test installs the real policy package and exercises fresh-process
+              CLI discovery, SQL row filtering, semantic argument rewriting, API context validation,
+              deny behavior, and user-permission precedence without an LLM.
+          weekly_benchmark:
+            status: covered
+            notes: Baisheng weekly benchmark can run against StarRocks with request-scoped market filters.
+        gaps: []
+
+      - id: data_access.adapter_contracts
+        title: DB, BI, and scheduler adapter contracts
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/adapters/db_adapters.md
+          - docs/adapters/bi_adapters.md
+          - docs/adapters/scheduler_adapters.md
+        entrypoints:
+          - DB adapters
+          - BI adapters
+          - Scheduler adapters
+        contracts:
+          - Adapter packages keep the contract consumed by Datus-agent stable.
+          - Datus-agent nightly installs sibling/source adapters where required and exercises real integrations.
+        coverage:
+          pr_acceptance:
+            status: covered
+            notes: Adapter repos run their own unit/build checks; Datus-agent PR covers consuming contracts.
+            nodeids:
+              - tests/unit_tests/tools/db_tools/test_registry.py
+              - tests/unit_tests/tools/func_tool/test_bi_tools.py
+              - tests/unit_tests/tools/func_tool/test_scheduler_tools.py
+          merge_queue:
+            status: covered
+            notes: Adapter repos run merge-queue integration checks for Docker-backed contracts.
+            nodeids:
+              - tests/unit_tests/tools/db_tools/test_registry.py
+              - tests/unit_tests/tools/func_tool/test_bi_tools.py
+              - tests/unit_tests/tools/func_tool/test_scheduler_tools.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_bi_dashboard.py::TestPartialIntegration::test_workflow_without_llm
+              - tests/integration/tools/test_bi_grafana.py
+              - tests/integration/agent/test_scheduler_agentic.py
+              - tests/integration/adapters/test_starrocks.py
+              - tests/integration/adapters/test_doris.py
+              - tests/integration/adapters/test_tidb.py
+          weekly_benchmark:
+            status: covered
+            notes: Weekly benchmark uses datus-agent with released/source adapter packages for the selected scenario.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: data_access.context_injection
+        title: Catalog, subject, historical SQL, and fuzzy-search context injection
+        priority: p1
+        quality_sensitive: true
+        docs:
+          - docs/cli/context_command.md
+          - docs/getting_started/contextual_data_engineering.md
+          - docs/assets/context_fuzzy.png
+        entrypoints:
+          - CLI context command
+          - Context search tools
+          - Agent SQL generation prompts
+        contracts:
+          - SQL generation can retrieve catalog, subject, historical SQL, metric, and knowledge context.
+          - Fuzzy search and subject-tree context remain available to context-search tools.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+              - tests/integration/tools/test_context_search.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+              - tests/integration/tools/test_context_search.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_context_search.py
+              - tests/integration/tools/test_context_injection.py
+              - tests/integration/tools/test_context_injection.py::TestContextRetrievalInjection::test_search_semantic_objects_surfaces_catalog_table
+              - tests/integration/tools/test_context_injection.py::TestContextRetrievalInjection::test_list_subject_tree_nests_all_sources
+              - tests/integration/tools/test_context_injection.py::TestContextInjectionRealLLM::test_context_tools_wired_into_node
+              - tests/integration/tools/test_context_injection.py::TestContextInjectionRealLLM::test_execute_stream_invokes_context_tools
+            notes: >
+              Catalog/semantic, subject-tree, historical reference SQL, external knowledge, and
+              fuzzy-search retrieval are each exercised, plus a real-LLM check that the SQL-generation
+              node wires in and invokes the context-search tools during generation.
+          weekly_benchmark:
+            status: covered
+            notes: Baisheng weekly benchmark measures query quality under contextual retrieval.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/856
+
+  knowledge_base:
+    description: Knowledge lifecycle and retrieval surfaces.
+    flows:
+      - id: knowledge_base.metadata
+        title: Metadata bootstrap and storage
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/knowledge_base/metadata.md
+          - docs/knowledge_base/metadata_fts.md
+          - docs/configuration/storage.md
+        entrypoints:
+          - CLI bootstrap
+          - Knowledge Base API
+          - Metadata storage backend
+        contracts:
+          - Table and column metadata can be initialized, stored, searched, and scoped by datasource.
+          - Metadata bootstrap and runtime retrieval use the configured vector or FTS mode consistently.
+          - FTS reports unsupported, missing, legacy, or incompatible indexes instead of silently falling back.
+          - Storage layout remains isolated between projects.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_storage_layout.py
+              - tests/unit_tests/storage/schema_metadata/test_store.py
+              - tests/unit_tests/api/routes/test_kb_routes.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_storage_layout.py
+              - tests/unit_tests/storage/schema_metadata/test_store.py
+              - tests/unit_tests/api/routes/test_kb_routes.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_postgresql_semantic_kb.py::test_postgresql_semantic_kb_reconcile_is_idempotent
+              - tests/integration/agent/test_semantic_modeling_agentic.py
+            notes: >
+              The P0 PostgreSQL test configures both Agent RDB and vector storage to real
+              PostgreSQL/pgvector and verifies semantic projection, nullable booleans,
+              reconcile idempotency, vectors, subject tree rows, and RAG reads.
+          weekly_benchmark:
+            status: covered
+            notes: Metadata is part of the Baisheng scenario context.
+        gaps: []
+
+      - id: knowledge_base.semantic_model_metrics
+        title: Semantic model and metrics
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/knowledge_base/semantic_model.md
+          - docs/knowledge_base/metrics.md
+          - docs/subagent/semantic_modeling.md
+          - docs/subagent/ask_metrics.md
+          - docs/semantic/dosi_engine.md
+        entrypoints:
+          - CLI bootstrap
+          - Semantic modeling subagent
+          - Ask metrics subagent
+          - Extract-knowledge skill
+          - Context search tools
+        contracts:
+          - Bootstrap and agentic generation persist semantic objects that are available to query-time retrieval.
+          - Metrics and semantic models remain separable by kind and datasource scope, and extracted knowledge is captured as markdown via the extract-knowledge skill.
+          - Existing metrics can be queried through the metric-first AskMetrics subagent without falling back to raw SQL generation.
+          - Semantic authoring uses the built-in Dosi runtime.
+          - Runtime database context is propagated into Dosi so validation can use the selected catalog/database/schema without a static datasource database.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_semantic_modeling_agentic_node.py
+              - tests/unit_tests/agent/node/test_ask_metrics_agentic_node.py
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+              - tests/unit_tests/configuration/test_agent_config.py::TestDosiDbProfile::test_runtime_context_overlay_uses_generic_aliases
+              - tests/unit_tests/tools/func_tool/test_semantic_tools.py::TestRuntimeDbContext::test_runtime_change_rebuilds_dosi_runtime
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_semantic_modeling_agentic_node.py
+              - tests/unit_tests/agent/node/test_ask_metrics_agentic_node.py
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+              - tests/unit_tests/configuration/test_agent_config.py::TestDosiDbProfile::test_runtime_context_overlay_uses_generic_aliases
+              - tests/unit_tests/tools/func_tool/test_semantic_tools.py::TestRuntimeDbContext::test_runtime_change_rebuilds_dosi_runtime
+          nightly:
+            status: covered
+            nodeids:
+              - tests/unit_tests/configuration/test_agent_config.py::TestDosiDbProfile::test_runtime_context_overlay_uses_generic_aliases
+              - tests/unit_tests/tools/func_tool/test_semantic_tools.py::TestRuntimeDbContext::test_runtime_change_rebuilds_dosi_runtime
+              - tests/integration/agent/test_semantic_modeling_agentic.py::test_dosi_authoring_validates_reconciles_and_queries_without_llm
+              - tests/integration/agent/test_semantic_modeling_agentic.py::test_semantic_modeling_authors_one_queryable_dosi_model_with_real_llm
+              - tests/integration/storage/test_postgresql_semantic_kb.py::test_postgresql_semantic_kb_reconcile_is_idempotent
+            notes: >
+              The P0 Dosi group owns a deterministic author-validate-reconcile-query test and one
+              real-LLM authoring smoke. PostgreSQL semantic projection is verified separately at
+              the Agent/storage seam.
+          weekly_benchmark:
+            status: covered
+            notes: Baisheng weekly benchmark exercises retrieval-backed query generation.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/856
+
+      - id: knowledge_base.reference_sql_template
+        title: Reference SQL and reference template
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/knowledge_base/reference_sql.md
+          - docs/knowledge_base/reference_template.md
+          - docs/subagent/gen_sql_summary.md
+        entrypoints:
+          - SQL summary subagent
+          - Reference template tools
+          - Context search tools
+        contracts:
+          - Historical SQL can be summarized into reusable reference SQL and templates.
+          - Query generation can retrieve relevant reference SQL without changing answer semantics.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_sql_summary_agentic_node.py
+              - tests/unit_tests/tools/func_tool/test_reference_template_tools.py
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_sql_summary_agentic_node.py
+              - tests/unit_tests/tools/func_tool/test_reference_template_tools.py
+              - tests/unit_tests/tools/func_tool/test_context_search.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_sql_summary_agentic.py
+              - tests/integration/tools/test_reference_template.py
+          weekly_benchmark:
+            status: covered
+            notes: Baisheng benchmark includes reference SQL seed context.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/856
+
+      - id: knowledge_base.platform_documentation
+        title: Platform documentation bootstrap
+        priority: p1
+        quality_sensitive: true
+        docs:
+          - docs/knowledge_base/platform_doc.md
+          - docs/API/knowledge_base.md
+        entrypoints:
+          - Platform documentation bootstrap
+          - Knowledge Base API
+          - Platform doc search tools
+        contracts:
+          - Local platform docs can be ingested, searched, and read back.
+          - GitHub and website sources remain represented as tracked gaps until covered.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_platform_doc_acceptance.py
+              - tests/unit_tests/tools/func_tool/test_platform_doc_search.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_platform_doc_acceptance.py
+              - tests/unit_tests/tools/func_tool/test_platform_doc_search.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/storage/test_platform_doc.py
+          weekly_benchmark:
+            status: gap
+            notes: Platform-doc retrieval is not currently part of weekly benchmark scoring.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+  subagents:
+    description: Built-in and custom subagent product flows.
+    flows:
+      - id: subagents.sql_and_analysis_nodes
+        title: SQL, compare, explore, report, feedback, and skill creator agentic nodes
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/subagent/introduction.md
+          - docs/subagent/builtin_subagents.md
+          - docs/skills/introduction.md
+        entrypoints:
+          - CLI chat subagent routing
+          - Agentic node registry
+          - Skill creator subagent
+        contracts:
+          - Core agentic nodes route tools, preserve state, and return structured outputs under fake-LLM harnesses.
+          - Skill creator and feedback flows remain callable from documented subagent paths.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_chat_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_sql_agentic_node.py
+              - tests/unit_tests/agent/node/test_compare_agentic_node.py
+              - tests/unit_tests/agent/node/test_explore_agentic_node.py
+              - tests/unit_tests/agent/node/test_feedback_agentic_node.py
+              - tests/unit_tests/agent/node/test_skill_creator_agentic_node.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_chat_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_sql_agentic_node.py
+              - tests/unit_tests/agent/node/test_compare_agentic_node.py
+              - tests/unit_tests/agent/node/test_explore_agentic_node.py
+              - tests/unit_tests/agent/node/test_feedback_agentic_node.py
+              - tests/unit_tests/agent/node/test_skill_creator_agentic_node.py
+          nightly:
+            status: partial
+            nodeids:
+              - tests/integration/agent/test_chat_agentic.py
+              - tests/integration/agent/test_feedback_agentic.py
+          weekly_benchmark:
+            status: covered
+            notes: SQL generation quality is covered by datus-benchmark scenario scoring.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: subagents.data_products
+        title: Dashboard, scheduler, job, table, visual report, and visual dashboard generation
+        priority: p1
+        quality_sensitive: true
+        docs:
+          - docs/subagent/gen_dashboard.md
+          - docs/subagent/scheduler.md
+          - docs/subagent/gen_job.md
+          - docs/subagent/gen_table.md
+          - docs/subagent/gen_visual_report.md
+          - docs/subagent/gen_visual_dashboard.md
+          - docs/configuration/schedulers.md
+        entrypoints:
+          - Gen dashboard subagent
+          - Scheduler subagent
+          - Gen job subagent
+          - Gen table subagent
+          - Visual report/dashboard subagents
+        contracts:
+          - Product-output subagents create deterministic artifacts or tool requests under fake-LLM tests.
+          - Real dashboard and scheduler paths are exercised in nightly with managed dependencies.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_gen_dashboard_agentic_node.py
+              - tests/unit_tests/agent/node/test_scheduler_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_job_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_table_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_visual_report_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_visual_dashboard_agentic_node.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/node/test_gen_dashboard_agentic_node.py
+              - tests/unit_tests/agent/node/test_scheduler_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_job_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_table_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_visual_report_agentic_node.py
+              - tests/unit_tests/agent/node/test_gen_visual_dashboard_agentic_node.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_gen_dashboard_agentic.py::TestGenDashboardAgenticInit
+              - tests/integration/agent/test_scheduler_agentic.py
+              - tests/integration/tools/test_bi_grafana.py
+              - tests/integration/agent/test_gen_table_agentic.py
+              - tests/integration/agent/test_gen_table_agentic.py::TestGenTableAgenticRealLLM::test_execute_stream_creates_table
+              - tests/integration/agent/test_gen_job_agentic.py
+              - tests/integration/agent/test_gen_job_agentic.py::TestGenJobAgenticRealLLM::test_execute_stream_runs_single_db_etl
+              - tests/integration/agent/test_gen_visual_report_agentic.py
+              - tests/integration/agent/test_gen_visual_report_agentic.py::TestGenVisualReportAgenticRealLLM::test_execute_stream_builds_report
+              - tests/integration/agent/test_gen_visual_dashboard_agentic.py
+              - tests/integration/agent/test_gen_visual_dashboard_agentic.py::TestGenVisualDashboardAgenticRealLLM::test_execute_stream_builds_dashboard
+            notes: >
+              Real-LLM smoke now covers gen_table (CTAS), gen_job (single-DB ETL on an isolated
+              SQLite copy), gen_visual_report, and gen_visual_dashboard in addition to the existing
+              scheduler/Grafana paths. Superset dashboard initialization is checked with a fake
+              model; its real-model workflow is a manual evaluation. gen_job cross-DB transfer
+              stays in the unit tier.
+          weekly_benchmark:
+            status: not_applicable
+            notes: >
+              Scoped out: data-product subagents are artifact-generation paths. Nightly is the right
+              layer for real-dependency artifact smoke; weekly benchmark stays out until a deliberate
+              artifact-quality scoring design exists (#923).
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: subagents.custom_subagents
+        title: Customized subagents
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/subagent/customized_subagent.md
+          - docs/configuration/nodes.md
+        entrypoints:
+          - Subagent configuration
+          - Agentic node registry
+        contracts:
+          - Custom subagent definitions load from configuration and can be routed by the runtime.
+          - Node configuration remains compatible with documented custom subagent examples.
+        coverage:
+          pr_acceptance:
+            status: partial
+            nodeids:
+              - tests/unit_tests/agent/test_workflow.py
+              - tests/unit_tests/agent/node/test_node_factory.py
+          merge_queue:
+            status: partial
+            nodeids:
+              - tests/unit_tests/agent/test_workflow.py
+              - tests/unit_tests/agent/node/test_node_factory.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_custom_subagent_agentic.py
+              - tests/integration/agent/test_custom_subagent_agentic.py::TestCustomSubagentResolution::test_factory_builds_gen_sql_node_for_custom_subagent
+              - tests/integration/agent/test_custom_subagent_agentic.py::TestCustomSubagentRealLLM::test_custom_subagent_executes_query
+            notes: >
+              A config-defined custom subagent (custom name + node_class + system_prompt) resolves
+              through the node factory, exposes the configured tools, and routes a real-LLM query to
+              completion.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+  extension:
+    description: MCP, skills, memory, workflow orchestration, and editor extension surfaces.
+    flows:
+      - id: extension.mcp
+        title: MCP extensions
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/cli/mcp_extensions.md
+          - docs/integration/mcp.md
+        entrypoints:
+          - CLI MCP commands
+          - MCP server registration
+          - MCP tool call path
+        contracts:
+          - MCP registration and read-only calls return stable tool envelopes.
+          - MCP server integration remains available in nightly.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_mcp_acceptance.py
+              - tests/unit_tests/cli/test_mcp_commands.py
+              - tests/unit_tests/tools/mcp_tools/test_mcp_manager.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_mcp_acceptance.py
+              - tests/unit_tests/cli/test_mcp_commands.py
+              - tests/unit_tests/tools/mcp_tools/test_mcp_manager.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_mcp_server.py
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.skills
+        title: Skills lifecycle and execution permissions
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/cli/skill_command.md
+          - docs/skills/introduction.md
+          - docs/skills/init.md
+          - docs/skills/build_kb.md
+          - docs/skills/storage_classify.md
+          - docs/skills/extract_knowledge.md
+          - docs/skills/memory_organization.md
+          - docs/skills/session_summarize.md
+        entrypoints:
+          - CLI skill commands
+          - Skill manager
+          - Skill execution permissions
+          - "Built-in skills: /init, /build-kb, storage-classify, extract-knowledge, memory-organization, session-summarize"
+        contracts:
+          - Skills can be discovered, loaded, and executed within permission boundaries.
+          - Project-local skill behavior and marketplace operations are tracked for stronger coverage.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/skill_tools/test_skill.py
+              - tests/unit_tests/cli/test_skill_commands.py
+              - tests/unit_tests/tools/permission/test_profiles.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/skill_tools/test_skill.py
+              - tests/unit_tests/cli/test_skill_commands.py
+              - tests/unit_tests/tools/permission/test_profiles.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/tools/test_skill.py
+              - tests/integration/tools/test_skill_execution.py
+              - tests/integration/tools/test_skill_execution.py::TestLocalSkillDiscoveryAndExecutionGate::test_skill_func_tool_exposes_load_skill
+              - tests/integration/tools/test_skill_execution.py::TestRealLLMSkillExecution::test_agent_invokes_local_skill
+            notes: >
+              Local skill discovery, permission filtering, and real-LLM skill execution are covered.
+              Marketplace install/update/remove/publish requires the external Town Backend and is
+              classified as an external dependency, not a nightly gap.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.plugins
+        title: Datus plugin discovery, dispatch, and agent integration
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/plugin/introduction.md
+          - docs/plugin/airflow.md
+          - docs/plugin/mwaa.md
+          - docs/plugin/s3.md
+          - docs/plugin/eks.md
+          - docs/plugin/k8s.md
+          - docs/plugin/flink.md
+        entrypoints:
+          - "CLI: datus <plugin> subcommand dispatch"
+          - Plugin profile resolution and project pins
+          - Plugin-bundled skill discovery
+          - System-prompt injection
+          - Plugin CLI bash permissions
+          - Tool argument transformers
+        contracts:
+          - Installed datus.plugins entry points dispatch before argparse and fall through cleanly when absent.
+          - Active-profile resolution (--profile > project pin > default > sole > empty) stays deterministic.
+          - User permission rules always beat plugin-declared rules; plugin rules never escape their namespace.
+          - Tool argument transformers rewrite or deny matched tool calls fail-closed.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/plugins/test_registry.py
+              - tests/unit_tests/cli/test_plugin_dispatch.py
+              - tests/unit_tests/tools/middleware/test_tool_middleware.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/plugins/test_registry.py
+              - tests/unit_tests/cli/test_plugin_dispatch.py
+              - tests/unit_tests/tools/middleware/test_tool_middleware.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/plugins/test_sql_policy_plugin.py::test_managed_sql_policy_enforces_sql_semantic_and_api_reads
+              - tests/integration/plugins/test_dashboard_bootstrap_plugin.py::test_dashboard_bootstrap_installs_plugin_and_exports_verified_superset_queries
+            notes: >
+              P0 installs two real source packages only into isolated managed plugin stores (with no
+              globally installed fallback), exercises fresh-process entry-point discovery and CLI
+              dispatch, verifies bundled skill delivery, user permission precedence, a tool transformer,
+              and real Superset API/export behavior.
+          weekly_benchmark:
+            status: not_applicable
+        gaps: []
+
+      - id: extension.auto_memory
+        title: Auto memory
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/integration/memory.md
+        entrypoints:
+          - Auto memory loader
+          - Agent inherited memory
+          - Memory filesystem tools
+        contracts:
+          - Memory load and inherited-memory overrides stay deterministic.
+          - Remember/forget/correct behaviors are tracked until full lifecycle coverage exists.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/utils/test_memory_loader.py
+              - tests/unit_tests/agent/node/test_agentic_node_inherited_memory.py
+              - tests/unit_tests/tools/func_tool/test_memory_filesystem_tools.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/utils/test_memory_loader.py
+              - tests/unit_tests/agent/node/test_agentic_node_inherited_memory.py
+              - tests/unit_tests/tools/func_tool/test_memory_filesystem_tools.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_auto_memory_agentic.py
+              - tests/integration/agent/test_auto_memory_agentic.py::TestAutoMemoryLoadAndInherit::test_chat_node_loads_own_memory_into_prompt
+              - tests/integration/agent/test_auto_memory_agentic.py::TestAutoMemoryRealLLM::test_loaded_memory_present_in_real_run
+            notes: >
+              Memory load, workspace isolation, and parent inheritance are covered, including a
+              real-LLM run that confirms loaded memory reaches the prompt. The LLM-driven
+              remember/forget/correct write lifecycle is scoped out: no such write tools exist yet
+              (memory filesystem tools are read-only); tracked for when the lifecycle ships.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.workflow_orchestration
+        title: Workflow orchestration and Workflow API
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/workflow/introduction.md
+          - docs/workflow/nodes.md
+          - docs/workflow/orchestration.md
+          - docs/workflow/api.md
+          - docs/configuration/workflow.md
+        entrypoints:
+          - Workflow runner
+          - Workflow API
+          - Node orchestration
+        contracts:
+          - Workflow graph execution and node routing stay compatible with documented configuration.
+          - Workflow API behavior is tracked until stronger integration coverage exists.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/test_workflow.py
+              - tests/unit_tests/agent/test_workflow_runner.py
+              - tests/integration/api/test_api.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/agent/test_workflow.py
+              - tests/unit_tests/agent/test_workflow_runner.py
+              - tests/integration/api/test_api.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/agent/test_workflow_orchestration.py
+              - tests/integration/agent/test_workflow_orchestration.py::TestWorkflowGraphAssembly::test_gen_sql_agentic_plan_is_multi_node
+              - tests/integration/agent/test_workflow_orchestration.py::TestWorkflowOrchestrationRealLLM::test_gen_sql_agentic_workflow_completes
+            notes: >
+              A multi-node workflow (gen_sql -> execute_sql -> output) is assembled and run end-to-end
+              through WorkflowRunner.run_stream with a real LLM, asserting multiple node executions and
+              successful completion with persisted state.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.vscode
+        title: VSCode extension integration
+        priority: p2
+        quality_sensitive: false
+        docs:
+          - docs/vscode_extension/introduction.md
+        entrypoints:
+          - VSCode extension
+        contracts:
+          - Documented VSCode integration remains tracked as an external/editor surface.
+        coverage:
+          pr_acceptance:
+            status: external
+            notes: VSCode integration is driven by a remote IDE front-end that owns its own runtime.
+          merge_queue:
+            status: external
+            notes: VSCode integration is driven by a remote IDE front-end that owns its own runtime.
+          nightly:
+            status: external
+            notes: >
+              Scoped out: the VSCode extension is a remote IDE front-end with no stable headless
+              automation path; tracked as an external editor surface rather than an automated flow.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.project_package
+        title: Project packaging and handover
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/cli/package_command.md
+        entrypoints:
+          - "CLI: datus package (interactive wizard)"
+          - "CLI: datus package --yes (non-interactive defaults)"
+          - "Receiver: scripts/init.sh, scripts/rebuild_kb.sh, scripts/install_plugins.sh"
+        contracts:
+          - "The generated conf/agent.yml pins home: . and a fixed project_name, so an unzipped package runs without touching the receiver's ~/.datus."
+          - "No credential ever ships: every secret-bearing field becomes a ${VAR} placeholder and a final content scan fails the build on any surviving secret."
+          - Component selection (subagents, skills, metric datasources, subject areas, plugins, reports, dashboards) determines exactly what the archive carries.
+          - Knowledge-base sources travel as YAML with a generated rebuild script; binary indexes never ship.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_package_builder.py
+              - tests/unit_tests/cli/test_package_cli.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_package_builder.py
+              - tests/unit_tests/cli/test_package_cli.py
+          nightly:
+            status: not_applicable
+            notes: >
+              Packaging is fully deterministic — no LLM call, no remote service, no network. The
+              unit tier builds real archives and re-opens them, so a nightly run would add no signal.
+          weekly_benchmark:
+            status: not_applicable
+        gaps: []
+
+      - id: extension.web_tools
+        title: Web search and fetch tools
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/configuration/web_tool.md
+        entrypoints:
+          - "Tool: web_search"
+          - "Tool: web_fetch"
+        contracts:
+          - The unified web tool group resolves provider configuration and exposes web_search/web_fetch to agents per permission policy.
+          - web_search/web_fetch results render through the canonical web_result schema regardless of backend (Tavily / Anthropic / OpenAI hosted).
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_web_tool.py
+              - tests/unit_tests/schemas/test_web_result.py
+              - tests/unit_tests/agent/node/test_agentic_node_web_tools.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_web_tool.py
+              - tests/unit_tests/schemas/test_web_result.py
+              - tests/unit_tests/agent/node/test_agentic_node_web_tools.py
+          nightly:
+            status: external
+            notes: >
+              Live web_search/web_fetch require real provider credentials (Tavily / Anthropic / OpenAI
+              hosted) and network egress, classified as an external dependency. Provider-agnostic result
+              parsing, rendering, and tool wiring/permission exposure are covered deterministically.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: extension.image_tool
+        title: Local image reading tool
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/configuration/image_tool.md
+        entrypoints:
+          - "Tool: read_image"
+        contracts:
+          - read_image validates and normalizes a local image without exposing encoded image bytes in normal tool output.
+          - The normalized image reaches the next model request and remains usable when an agent session is resumed.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_read_image.py
+              - tests/unit_tests/models/test_image_model_roundtrip.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/tools/func_tool/test_read_image.py
+              - tests/unit_tests/models/test_image_model_roundtrip.py
+          nightly:
+            status: external
+            notes: Live image interpretation depends on provider credentials and network access.
+          weekly_benchmark:
+            status: not_applicable
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+  quality_and_ops:
+    description: Validation, observability, provider compatibility, benchmark, and release-confidence operations.
+    flows:
+      - id: quality_and_ops.validation
+        title: Validation framework
+        priority: p1
+        quality_sensitive: false
+        docs:
+          - docs/integration/validation.md
+        entrypoints:
+          - Validation hooks
+          - Validation report generation
+        contracts:
+          - Built-in validation checks and reports remain deterministic.
+          - Validation target extraction stays compatible with documented usage.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/validation/test_builtin_checks.py
+              - tests/unit_tests/validation/test_report.py
+              - tests/unit_tests/validation/test_target_extractor.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/validation/test_builtin_checks.py
+              - tests/unit_tests/validation/test_report.py
+              - tests/unit_tests/validation/test_target_extractor.py
+          nightly:
+            status: not_applicable
+          weekly_benchmark:
+            status: not_applicable
+        gaps: []
+
+      - id: quality_and_ops.benchmark
+        title: Benchmark and evaluation
+        priority: p0
+        quality_sensitive: true
+        docs:
+          - docs/benchmark/benchmark_manual.md
+          - docs/configuration/benchmark.md
+        entrypoints:
+          - Benchmark CLI
+          - Weekly benchmark workflow
+          - Multi-round benchmark utilities
+        contracts:
+          - Benchmark configuration remains parseable and runnable.
+          - Weekly benchmark reports quality, efficiency, and diagnostics for selected scenarios.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/test_multi_round_benchmark.py
+              - tests/unit_tests/utils/test_benchmark_utils.py
+              - tests/unit_tests/utils/test_benchmark_evaluation.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/test_multi_round_benchmark.py
+              - tests/unit_tests/utils/test_benchmark_utils.py
+              - tests/unit_tests/utils/test_benchmark_evaluation.py
+          nightly:
+            status: external
+            notes: datus-benchmark weekly/manual workflow owns full benchmark execution.
+          weekly_benchmark:
+            status: covered
+            notes: datus-benchmark weekly workflow runs the scenario-level benchmark.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/263
+
+      - id: quality_and_ops.observability
+        title: Observability and trace correlation
+        priority: p1
+        quality_sensitive: true
+        docs:
+          - docs/develop/observability.md
+          - docs/training/llm_trace_usage.md
+        entrypoints:
+          - Langfuse tracing
+          - LangSmith tracing
+          - OTLP/Datadog tracing
+          - Nightly and benchmark artifacts
+        contracts:
+          - Tracing setup is optional and degrades safely when credentials are missing.
+          - Trace references can be correlated with nightly and benchmark artifacts.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/observability/test_manager.py
+              - tests/unit_tests/observability/test_openai_agents.py
+              - tests/unit_tests/ci/test_nightly_tracing_boundaries.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/observability/test_manager.py
+              - tests/unit_tests/observability/test_openai_agents.py
+              - tests/unit_tests/ci/test_nightly_tracing_boundaries.py
+          nightly:
+            status: covered
+            notes: Nightly sets the tracing environment and uploads trace-aware artifacts.
+          weekly_benchmark:
+            status: covered
+            notes: datus-benchmark collects Langfuse trace summaries after PR #36.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910
+
+      - id: quality_and_ops.provider_compatibility
+        title: Model/provider compatibility
+        priority: p0
+        quality_sensitive: false
+        docs:
+          - docs/configuration/agent.md
+          - docs/cli/other_commands.md
+        entrypoints:
+          - Provider catalog
+          - Model command
+          - Per-request model/language/effort override
+          - Provider health nightly tests
+        contracts:
+          - Provider catalog resolution and model filtering stay deterministic.
+          - Real provider health smoke is separated from deterministic harness correctness.
+        coverage:
+          pr_acceptance:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_provider_model_catalog.py
+              - tests/unit_tests/models/test_openai_compatible.py
+              - tests/unit_tests/models/test_litellm_adapter.py
+          merge_queue:
+            status: covered
+            nodeids:
+              - tests/unit_tests/cli/test_provider_model_catalog.py
+              - tests/unit_tests/models/test_openai_compatible.py
+              - tests/unit_tests/models/test_litellm_adapter.py
+          nightly:
+            status: covered
+            nodeids:
+              - tests/integration/models/test_qwen_model.py
+              - tests/integration/models/test_other_models.py
+              - tests/integration/models/test_deepseek_model.py
+          weekly_benchmark:
+            status: covered
+            notes: Weekly benchmark records model/target metadata for quality trend tracking.
+        gaps:
+          - https://github.com/Datus-ai/Datus-agent/issues/910

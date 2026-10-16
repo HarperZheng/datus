@@ -1,0 +1,1417 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Unit tests for AgenticNode skill integration.
+
+Tests the skill-related methods in the AgenticNode base class:
+- _setup_skill_func_tools()
+- _ensure_skill_tools_in_tools()
+- _finalize_system_prompt()
+- _get_available_skills_context()
+"""
+
+from unittest.mock import Mock, patch
+from xml.etree import ElementTree as ET
+
+import pytest
+
+from datus.agent.node.agentic_node import AgenticNode
+from datus.configuration.agent_config import AgentConfig
+from datus.tools.db_tools.config import SQLiteConfig
+from datus.tools.db_tools.sqlite_connector import SQLiteConnector
+from datus.tools.func_tool.database import DBFuncTool
+from datus.tools.permission.permission_config import PermissionConfig, PermissionLevel, PermissionRule
+from datus.tools.permission.permission_manager import PermissionManager
+from datus.tools.skill_tools.skill_config import SkillConfig
+from datus.tools.skill_tools.skill_func_tool import SkillFuncTool
+from datus.tools.skill_tools.skill_manager import SkillManager
+from datus.utils.constants import DBType
+
+# Globally patch LLMBaseModel.create_model to return None for all tests
+pytestmark = pytest.mark.usefixtures("mock_llm_model")
+
+
+@pytest.fixture
+def temp_skills_dir(tmp_path):
+    """Create a temporary skills directory with test skills."""
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+
+    # Create test skills
+    for skill_name, desc, tags in [
+        ("sql-analysis", "SQL analysis techniques", ["sql", "analysis"]),
+        ("report-generator", "Generate reports", ["report", "output"]),
+        ("data-profiler", "Profile data quality", ["data", "quality"]),
+    ]:
+        skill_dir = skills_dir / skill_name
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            f"""---
+name: {skill_name}
+description: {desc}
+tags: {tags}
+---
+
+# {skill_name.replace("-", " ").title()}
+
+{desc}
+
+## Instructions
+
+1. Do this
+2. Do that
+"""
+        )
+
+    return skills_dir
+
+
+@pytest.fixture
+def skill_config(temp_skills_dir):
+    """Create SkillConfig for testing."""
+    return SkillConfig(directories=[str(temp_skills_dir)])
+
+
+@pytest.fixture
+def permission_manager():
+    """Create PermissionManager for testing."""
+    config = PermissionConfig(
+        default_permission=PermissionLevel.ALLOW,
+        rules=[
+            PermissionRule(tool="skills", pattern="admin-*", permission=PermissionLevel.DENY),
+        ],
+    )
+    return PermissionManager(global_config=config)
+
+
+@pytest.fixture
+def skill_manager(skill_config, permission_manager):
+    """Create SkillManager for testing."""
+    return SkillManager(config=skill_config, permission_manager=permission_manager)
+
+
+@pytest.fixture
+def mock_llm_model():
+    """Patch LLMBaseModel.create_model to prevent model instantiation."""
+    with patch("datus.models.base.LLMBaseModel.create_model", return_value=None):
+        yield
+
+
+@pytest.fixture
+def mock_agent_config():
+    """Create a mock AgentConfig for testing."""
+    config = Mock(spec=AgentConfig)
+    config.agentic_nodes = {}
+    config.permissions_config = None
+    config.skills_config = None
+    config.prompt_version = None
+    config.project_root = "."
+    config.current_db_configs.return_value = {}
+
+    # Prevent model creation by returning None for active_model
+    config.active_model.return_value = None
+
+    return config
+
+
+class MinimalAgenticNode(AgenticNode):
+    """Minimal AgenticNode subclass for testing."""
+
+    def get_node_name(self) -> str:
+        return "test_node"
+
+    def setup_input(self, workflow):
+        pass
+
+    def update_context(self, result, workflow):
+        pass
+
+    def run(self):
+        pass
+
+    async def execute_stream(self, action_history_manager=None):
+        """Minimal implementation of abstract method."""
+        # Return empty async generator for testing
+        if False:
+            yield
+
+
+def create_test_node(node_id, mock_agent_config):
+    """Helper function to create test nodes with valid node_type."""
+    return MinimalAgenticNode(
+        node_id=node_id,
+        description="Test node",
+        node_type="chat",  # Use valid node type from NodeType.ACTION_TYPES
+        agent_config=mock_agent_config,
+    )
+
+
+class TestFinalizeSystemPrompt:
+    """Test suite for _finalize_system_prompt method."""
+
+    def test_no_skill_func_tool_only_appends_runtime_context(self, mock_agent_config, monkeypatch):
+        """Without skill_func_tool, finalization still appends shared runtime context."""
+        node = MinimalAgenticNode(
+            node_id="test1",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_func_tool = None
+        monkeypatch.setattr(node, "_inject_memory_context", lambda p, override_node_name=None: p)
+        monkeypatch.setattr(node, "_inject_response_language", lambda p: p)
+
+        base_prompt = "This is the base system prompt."
+        result = node._finalize_system_prompt(base_prompt)
+
+        assert result.startswith(base_prompt)
+        assert "Current context:" in result
+        assert "Current date:" in result
+        assert "Available datasources:" not in result
+        assert "Current sql files root directory:" not in result
+        assert "<available_skills>" not in result
+
+    def test_with_skill_func_tool_appends_xml(self, mock_agent_config, skill_manager):
+        """When skill_func_tool exists and _get_available_skills_context() returns XML, it's appended."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test2",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+
+        base_prompt = "This is the base system prompt."
+        result = node._finalize_system_prompt(base_prompt)
+
+        # Should append skills XML
+        assert result.startswith(base_prompt)
+        assert "<available_skills>" in result
+        assert "sql-analysis" in result
+        assert "native tool directly" in result
+
+    def test_with_skill_func_tool_empty_xml_appends_explicit_none_block(
+        self, mock_agent_config, skill_manager, monkeypatch
+    ):
+        """With skill tools active but no visible skills, the prompt must still
+        contain an explicit ``<available_skills>`` block stating that none are
+        available — prevents the LLM from hallucinating skill names (e.g. from
+        subagent types listed in the ``task()`` tool schema)."""
+        # Configure node with pattern that matches no skills
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "nonexistent-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test3",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+        monkeypatch.setattr(node, "_inject_memory_context", lambda p, override_node_name=None: p)
+        monkeypatch.setattr(node, "_inject_response_language", lambda p: p)
+
+        base_prompt = "This is the base system prompt."
+        result = node._finalize_system_prompt(base_prompt)
+
+        assert result.startswith(base_prompt)
+        assert "<available_skills>" in result
+        # Explicitly marked as empty, with anti-hallucination guidance.
+        assert "(none)" in result
+        assert "subagent" in result.lower()
+
+    def test_calls_ensure_skill_tools(self, mock_agent_config, skill_manager):
+        """Verify _ensure_skill_tools_in_tools() is called."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test4",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+        node.tools = []
+
+        # Patch _ensure_skill_tools_in_tools to verify it's called
+        with patch.object(node, "_ensure_skill_tools_in_tools", wraps=node._ensure_skill_tools_in_tools) as mock_ensure:
+            node._finalize_system_prompt("Base prompt")
+            mock_ensure.assert_called_once()
+
+
+class TestEnsureSkillToolsInTools:
+    """Test suite for _ensure_skill_tools_in_tools method."""
+
+    def test_no_skill_func_tool_does_nothing(self, mock_agent_config):
+        """When skill_func_tool is None, self.tools unchanged."""
+        node = MinimalAgenticNode(
+            node_id="test5",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_func_tool = None
+        node.tools = []
+
+        initial_tools = node.tools.copy()
+        node._ensure_skill_tools_in_tools()
+
+        assert node.tools == initial_tools
+
+    def test_adds_skill_tools_when_missing(self, mock_agent_config, skill_manager):
+        """When skill tools not in self.tools, adds them."""
+        node = MinimalAgenticNode(
+            node_id="test6",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+        node.tools = []
+
+        node._ensure_skill_tools_in_tools()
+
+        # Should have added skill tools
+        assert len(node.tools) == 1  # load_skill only
+        tool_names = [t.name for t in node.tools]
+        assert "load_skill" in tool_names
+
+    def test_idempotent_does_not_duplicate(self, mock_agent_config, skill_manager):
+        """Calling twice doesn't add duplicate tools."""
+        node = MinimalAgenticNode(
+            node_id="test7",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+        node.tools = []
+
+        # First call
+        node._ensure_skill_tools_in_tools()
+        first_count = len(node.tools)
+        first_tool_names = [t.name for t in node.tools]
+
+        # Second call
+        node._ensure_skill_tools_in_tools()
+        second_count = len(node.tools)
+        second_tool_names = [t.name for t in node.tools]
+
+        # Should be the same
+        assert first_count == second_count
+        assert first_tool_names == second_tool_names
+
+    def test_handles_none_tools_list(self, mock_agent_config, skill_manager):
+        """When self.tools is None, creates list and adds tools."""
+        node = MinimalAgenticNode(
+            node_id="test8",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+        node.tools = None
+
+        node._ensure_skill_tools_in_tools()
+
+        # Should have created tools list
+        assert isinstance(node.tools, list)
+        assert len(node.tools) == 1
+        tool_names = [t.name for t in node.tools]
+        assert "load_skill" in tool_names
+
+    def test_preserves_existing_tools(self, mock_agent_config, skill_manager):
+        """When self.tools has existing tools, they are preserved."""
+        node = MinimalAgenticNode(
+            node_id="test9",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+
+        # Add existing tool (using Mock)
+        existing_tool = Mock()
+        existing_tool.name = "existing_tool"
+        node.tools = [existing_tool]
+
+        node._ensure_skill_tools_in_tools()
+
+        # Should have both existing and skill tools
+        assert len(node.tools) == 2
+        tool_names = [t.name for t in node.tools]
+        assert "existing_tool" in tool_names
+        assert "load_skill" in tool_names
+
+
+class TestSetupSkillFuncTools:
+    """Test suite for _setup_skill_func_tools method."""
+
+    def test_no_skills_in_config_does_nothing(self, mock_agent_config):
+        """When node_config has no 'skills' key, skill_func_tool stays None."""
+        mock_agent_config.agentic_nodes = {"test_node": {}}
+
+        node = MinimalAgenticNode(
+            node_id="test10",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.skill_func_tool is None
+
+    def test_creates_skill_manager_when_none(self, mock_agent_config):
+        """When skills is set but skill_manager is None, creates a new SkillManager."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test11",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        # Should have created skill_manager with defaults
+        assert isinstance(node.skill_manager, SkillManager)
+
+    def test_uses_existing_skill_manager(self, mock_agent_config, skill_manager):
+        """When skill_manager already exists, doesn't create a new one."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "report-*"}}
+        mock_agent_config.skills_config = skill_manager.config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = MinimalAgenticNode(
+            node_id="test12",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        # Should use the skill manager created during _setup_skill_manager()
+        assert isinstance(node.skill_manager, SkillManager)
+
+    def test_creates_skill_func_tool(self, mock_agent_config, skill_manager):
+        """After setup, skill_func_tool is a SkillFuncTool instance."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "data-*"}}
+        mock_agent_config.skills_config = skill_manager.config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = MinimalAgenticNode(
+            node_id="test13",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_func_tool, SkillFuncTool)
+        assert node.skill_func_tool.node_name == "test_node"
+
+
+class TestAgenticNodeSkillDefaults:
+    """Test suite for default skill behavior in AgenticNode."""
+
+    def test_base_node_no_skills_by_default(self, mock_agent_config):
+        """AgenticNode with no skills config has skill_func_tool = None."""
+        mock_agent_config.agentic_nodes = {"test_node": {}}
+
+        node = MinimalAgenticNode(
+            node_id="test14",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.skill_func_tool is None
+
+    def test_node_with_skills_config_activates(self, mock_agent_config):
+        """AgenticNode with skills: "report-*" in node_config has skill_func_tool set."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "report-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test15",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_func_tool, SkillFuncTool)
+
+
+class TestGetAvailableSkillsContext:
+    """Test suite for _get_available_skills_context method."""
+
+    def test_no_skill_manager_returns_empty(self, mock_agent_config):
+        """When skill_manager is None, returns empty string."""
+        node = MinimalAgenticNode(
+            node_id="test16",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = None
+
+        result = node._get_available_skills_context()
+        assert result == ""
+
+    def test_with_skill_manager_returns_xml(self, mock_agent_config, skill_manager):
+        """When skill_manager exists, returns XML context."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test17",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+
+        result = node._get_available_skills_context()
+
+        assert "<available_skills>" in result
+        assert "sql-analysis" in result
+        assert "load_skill" in result
+
+    def test_respects_skill_patterns(self, mock_agent_config, skill_manager):
+        """XML context respects skill patterns from node config."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "report-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test18",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+
+        result = node._get_available_skills_context()
+
+        # Should only include report-* skills
+        assert "report-generator" in result
+        assert "sql-analysis" not in result
+        assert "data-profiler" not in result
+
+    def test_empty_pattern_returns_all_skills(self, mock_agent_config, skill_manager):
+        """When skills config is empty string, returns all skills (pattern=None)."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": ""}}
+
+        node = MinimalAgenticNode(
+            node_id="test19",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+
+        result = node._get_available_skills_context()
+        # Empty pattern string means patterns=None, which returns all skills
+        assert "<available_skills>" in result
+        assert "sql-analysis" in result
+        assert "report-generator" in result
+        assert "data-profiler" in result
+
+
+class TestSkillManagerSetup:
+    """Test suite for _setup_skill_manager method."""
+
+    def test_no_agent_config_does_nothing(self):
+        """When agent_config is None, skill_manager stays None."""
+        node = MinimalAgenticNode(
+            node_id="test20",
+            description="Test node",
+            node_type="chat",
+            agent_config=None,
+        )
+
+        assert node.skill_manager is None
+
+    def test_no_skills_config_does_nothing(self, mock_agent_config):
+        """When agent_config has no skills_config, skill_manager stays None."""
+        mock_agent_config.skills_config = None
+
+        node = MinimalAgenticNode(
+            node_id="test21",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.skill_manager is None
+
+    def test_creates_skill_manager_with_config(self, mock_agent_config, skill_config, permission_manager):
+        """When skills_config is present, creates SkillManager."""
+        mock_agent_config.skills_config = skill_config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = MinimalAgenticNode(
+            node_id="test22",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_manager, SkillManager)
+        assert node.skill_manager.get_skill_count() == 3
+
+
+@pytest.fixture
+def scoped_skill_manager(tmp_path, permission_manager):
+    """A SkillManager whose directory contains skills with allowed_agents scoping."""
+    skills_dir = tmp_path / "scoped_skills"
+    skills_dir.mkdir()
+
+    # Skill only for the "gen_dashboard" subagent.
+    scoped = skills_dir / "scoped-dashboard"
+    scoped.mkdir()
+    (scoped / "SKILL.md").write_text(
+        """---
+name: scoped-dashboard
+description: Scoped dashboard workflow
+allowed_agents:
+  - gen_dashboard
+---
+
+# Scoped Dashboard
+Body for the subagent only.
+"""
+    )
+
+    # Skill unrestricted (no allowed_agents), visible to every agent.
+    shared = skills_dir / "shared-helper"
+    shared.mkdir()
+    (shared / "SKILL.md").write_text(
+        """---
+name: shared-helper
+description: Shared across agents
+---
+
+# Shared Helper
+Body visible to everyone.
+"""
+    )
+
+    config = SkillConfig(directories=[str(skills_dir)])
+    return SkillManager(config=config, permission_manager=permission_manager)
+
+
+class TestAllowedAgentsInAgenticNode:
+    """Agent-scoped skills must be filtered out of a node's <available_skills> XML."""
+
+    def test_disallowed_agent_hides_scoped_skill(self, mock_agent_config, scoped_skill_manager):
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "*"}}
+
+        node = MinimalAgenticNode(
+            node_id="scoped1",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = scoped_skill_manager
+
+        xml = node._get_available_skills_context()
+        # test_node is not in any skill's allowed_agents → scoped-dashboard hidden.
+        assert "scoped-dashboard" not in xml
+        # Unrestricted skill still visible.
+        assert "shared-helper" in xml
+
+    def test_allowed_agent_sees_scoped_skill(self, mock_agent_config, scoped_skill_manager):
+        mock_agent_config.agentic_nodes = {"gen_dashboard": {"skills": "*"}}
+
+        class DashboardNode(MinimalAgenticNode):
+            def get_node_name(self) -> str:
+                return "gen_dashboard"
+
+        node = DashboardNode(
+            node_id="scoped2",
+            description="Dashboard node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = scoped_skill_manager
+
+        xml = node._get_available_skills_context()
+        assert "scoped-dashboard" in xml
+        assert "shared-helper" in xml
+
+    def test_alias_capable_subclass_without_NODE_NAME_resolves_via_base(
+        self, mock_agent_config, tmp_path, permission_manager
+    ):
+        """Regression guard for CodeRabbit review: an alias-capable subclass
+        that overrides ``get_node_name()`` but hasn't declared ``NODE_NAME``
+        must still resolve ``get_node_class_name()`` to a stable class-level
+        identifier (derived via the base ``AgenticNode.get_node_name``), not
+        the alias. Mirrors the real ``ExploreAgenticNode`` shape prior to the
+        fix (override returns alias, no class constant)."""
+        skills_dir = tmp_path / "explore_skills"
+        skills_dir.mkdir()
+        scoped = skills_dir / "explore-guide"
+        scoped.mkdir()
+        # The class below is ``MockedExploreAgenticNode``; the base
+        # ``AgenticNode.get_node_name`` strips the ``AgenticNode`` suffix and
+        # lowercases, yielding ``"mockedexplore"`` as the canonical class id.
+        (scoped / "SKILL.md").write_text(
+            """---
+name: explore-guide
+description: Scoped to the explore subagent
+allowed_agents:
+  - mockedexplore
+---
+
+# Explore Guide
+"""
+        )
+
+        from datus.tools.skill_tools.skill_config import SkillConfig as _Cfg
+
+        manager = SkillManager(config=_Cfg(directories=[str(skills_dir)]), permission_manager=permission_manager)
+
+        mock_agent_config.agentic_nodes = {"my_explorer": {"skills": "*"}}
+
+        class MockedExploreAgenticNode(MinimalAgenticNode):
+            """No NODE_NAME; ``get_node_name`` returns the alias — same shape
+            as pre-fix ExploreAgenticNode. ``AgenticNode.get_node_name``
+            strips the ``AgenticNode`` suffix and lowercases, yielding
+            ``"mockedexplore"`` as the class-derived identifier."""
+
+            def get_node_name(self) -> str:  # returns the alias
+                return "my_explorer"
+
+        node = MockedExploreAgenticNode(
+            node_id="alias_no_nodename",
+            description="alias-capable no NODE_NAME",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = manager
+
+        # get_node_class_name must ignore the override and return the stable
+        # class-derived name.
+        assert node.get_node_class_name() == "mockedexplore"
+
+        # ``allowed_agents: [mockedexplore]`` matches via class name even
+        # though the alias ``my_explorer`` is not whitelisted.
+        xml = node._get_available_skills_context()
+        assert "explore-guide" in xml
+
+    def test_custom_alias_with_matching_class_sees_scoped_skill(self, mock_agent_config, scoped_skill_manager):
+        """A subagent registered under a custom alias should still match a
+        class-scoped ``allowed_agents`` whitelist via its ``NODE_NAME``."""
+        mock_agent_config.agentic_nodes = {"my_dashboard": {"skills": "*"}}
+
+        class AliasedDashboardNode(MinimalAgenticNode):
+            NODE_NAME = "gen_dashboard"
+
+            def get_node_name(self) -> str:
+                return "my_dashboard"
+
+        node = AliasedDashboardNode(
+            node_id="scoped3",
+            description="Aliased dashboard node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = scoped_skill_manager
+
+        xml = node._get_available_skills_context()
+        assert "scoped-dashboard" in xml, "alias should inherit class-level scope"
+        assert "shared-helper" in xml
+
+
+class TestSkillIntegrationEdgeCases:
+    """Edge case tests for skill integration."""
+
+    def test_skill_func_tool_with_multiple_patterns(self, mock_agent_config, skill_manager):
+        """Test multiple skill patterns in node config."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*, report-*"}}
+
+        node = MinimalAgenticNode(
+            node_id="test23",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+
+        xml = node._get_available_skills_context()
+
+        # Should include both patterns
+        assert "sql-analysis" in xml
+        assert "report-generator" in xml
+        assert "data-profiler" not in xml
+
+    def test_finalize_prompt_with_existing_tools(self, mock_agent_config, skill_manager):
+        """Test that finalize_system_prompt preserves existing tools."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+        # BashTool is fail-closed when no permission manager exists; wire a
+        # permissive config so the lazy injector includes ``bash``.
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+        mock_agent_config.active_profile_name = "normal"
+        # Local web_search is mounted only when a Tavily key resolves; pin one so
+        # the count is deterministic without depending on the CI env (no keys).
+        mock_agent_config.tavily_api_key = "test-key"
+
+        node = MinimalAgenticNode(
+            node_id="test24",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.skill_func_tool = SkillFuncTool(manager=skill_manager, node_name="test_node")
+
+        # Add existing tools (using Mock)
+        existing_tool1 = Mock()
+        existing_tool1.name = "tool1"
+        existing_tool2 = Mock()
+        existing_tool2.name = "tool2"
+        node.tools = [existing_tool1, existing_tool2]
+
+        base_prompt = "Base prompt"
+        node._finalize_system_prompt(base_prompt)
+
+        # Should have all tools: 2 existing + 1 skill tool + 1 bash tool +
+        # 2 memory tools (this node is a main agent, so add_memory/edit_memory
+        # are lazy-injected alongside skills and bash) + 2 web tools
+        # (web_search/web_fetch, mounted unconditionally for the local backend).
+        assert len(node.tools) == 8
+        tool_names = [t.name for t in node.tools]
+        assert "tool1" in tool_names
+        assert "tool2" in tool_names
+        assert "load_skill" in tool_names
+        assert "bash" in tool_names
+        assert "add_memory" in tool_names
+        assert "edit_memory" in tool_names
+        assert "web_search" in tool_names
+        assert "web_fetch" in tool_names
+
+    def test_setup_exception_handling(self, mock_agent_config):
+        """Test that setup exceptions are handled gracefully."""
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "sql-*"}}
+
+        # Patch SkillFuncTool import to raise exception
+        with patch("datus.tools.skill_tools.skill_func_tool.SkillFuncTool", side_effect=Exception("Test error")):
+            node = MinimalAgenticNode(
+                node_id="test25",
+                description="Test node",
+                node_type="chat",
+                agent_config=mock_agent_config,
+            )
+
+            # Should handle exception gracefully
+            assert node.skill_func_tool is None
+
+
+class _DefaultSkillsNode(MinimalAgenticNode):
+    """Subclass that declares a class-level DEFAULT_SKILLS pattern."""
+
+    DEFAULT_SKILLS = "data-*"
+
+
+class TestDefaultSkillsFallback:
+    """``DEFAULT_SKILLS`` activates skill loading when yml omits ``skills:``."""
+
+    def test_default_skills_used_when_node_config_missing(self, mock_agent_config, skill_manager):
+        mock_agent_config.agentic_nodes = {}  # node missing entirely
+        mock_agent_config.skills_config = skill_manager.config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = _DefaultSkillsNode(
+            node_id="default_skills_1",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_func_tool, SkillFuncTool)
+        assert node.node_config["skills"] == "data-*"
+
+    def test_default_skills_used_when_skills_key_omitted(self, mock_agent_config, skill_manager):
+        mock_agent_config.agentic_nodes = {"test_node": {"max_turns": 10}}
+        mock_agent_config.skills_config = skill_manager.config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = _DefaultSkillsNode(
+            node_id="default_skills_2",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_func_tool, SkillFuncTool)
+        assert node.node_config["skills"] == "data-*"
+
+    def test_yml_override_wins_over_default(self, mock_agent_config, skill_manager):
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": "report-*"}}
+        mock_agent_config.skills_config = skill_manager.config
+        mock_agent_config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+
+        node = _DefaultSkillsNode(
+            node_id="default_skills_3",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert isinstance(node.skill_func_tool, SkillFuncTool)
+        assert node.node_config["skills"] == "report-*"
+
+    def test_explicit_empty_string_disables_default(self, mock_agent_config):
+        mock_agent_config.agentic_nodes = {"test_node": {"skills": ""}}
+
+        node = _DefaultSkillsNode(
+            node_id="default_skills_4",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.skill_func_tool is None
+
+
+class TestBuiltinNodeDefaultSkills:
+    """Built-in subagents declare DEFAULT_SKILLS that match their SKILL.md scope."""
+
+    def test_gen_job_defaults(self):
+        from datus.agent.node.gen_job_agentic_node import GenJobAgenticNode
+
+        assert GenJobAgenticNode.DEFAULT_SKILLS == "gen-table, data-migration"
+
+    def test_gen_table_defaults(self):
+        from datus.agent.node.gen_table_agentic_node import GenTableAgenticNode
+
+        assert GenTableAgenticNode.DEFAULT_SKILLS == "gen-table"
+
+    def test_semantic_modeling_defaults_derive_from_dosi_runtime(self):
+        from datus.agent.node.semantic_modeling_agentic_node import SemanticModelingAgenticNode
+
+        assert SemanticModelingAgenticNode.DEFAULT_SKILLS is None
+        assert SemanticModelingAgenticNode.REQUIRED_SKILLS is None
+
+    def test_gen_dashboard_leaves_defaults_unset(self):
+        """gen_dashboard injects {platform}-dashboard dynamically in setup, not via DEFAULT_SKILLS."""
+        from datus.agent.node.gen_dashboard_agentic_node import GenDashboardAgenticNode
+
+        assert GenDashboardAgenticNode.DEFAULT_SKILLS is None
+
+    def test_gen_skill_defaults(self):
+        from datus.agent.node.gen_skill_agentic_node import SkillCreatorAgenticNode
+
+        assert SkillCreatorAgenticNode.DEFAULT_SKILLS == "create-skill, optimize-skill"
+
+
+class TestMergeSkillPatterns:
+    """``_merge_skill_patterns`` (base class helper for dynamic injection)."""
+
+    def test_string_plus_list_merges_with_order_preserved(self):
+        result = AgenticNode._merge_skill_patterns("tenant-*, custom-skill", ["platform-workflow", "shared-validation"])
+        assert result == "tenant-*, custom-skill, platform-workflow, shared-validation"
+
+    def test_list_plus_list_merges(self):
+        result = AgenticNode._merge_skill_patterns(["a", "b"], ["c"])
+        assert result == "a, b, c"
+
+    def test_none_existing_returns_injected_only(self):
+        result = AgenticNode._merge_skill_patterns(None, ["a", "b"])
+        assert result == "a, b"
+
+    def test_duplicates_dropped_preserving_first_occurrence(self):
+        result = AgenticNode._merge_skill_patterns("a, b", ["b", "c"])
+        assert result == "a, b, c"
+
+    def test_whitespace_and_empty_entries_stripped(self):
+        result = AgenticNode._merge_skill_patterns("  a  ,, b ", ["c"])
+        assert result == "a, b, c"
+
+    def test_non_string_list_entries_ignored(self):
+        # Existing config could be a list from yaml; filter out non-string items.
+        result = AgenticNode._merge_skill_patterns(["a", 42, None, "b"], ["c"])
+        assert result == "a, b, c"
+
+
+class TestSkillAllowedAgentsConsistency:
+    """Every skill referenced by a built-in node must whitelist that node.
+
+    The node may expose the skill via ``DEFAULT_SKILLS`` (static) or inject it
+    at runtime (e.g. ``gen_dashboard`` picks ``{platform}-dashboard``). In both
+    cases, ``SKILL.md``'s ``allowed_agents`` is the authoritative permission
+    gate — a mismatch here means ``load_skill`` gets denied.
+    """
+
+    @staticmethod
+    def _read_skill_frontmatter(name: str) -> dict:
+        import pathlib
+
+        import yaml
+
+        project_root = pathlib.Path(__file__).resolve().parents[4]
+        skill_path = project_root / "datus" / "resources" / "skills" / name / "SKILL.md"
+        content = skill_path.read_text()
+        assert content.startswith("---\n"), f"skill {name} missing frontmatter"
+        _, fm, _ = content.split("---", 2)
+        return yaml.safe_load(fm)
+
+    @pytest.mark.parametrize(
+        "node_name,skills",
+        [
+            ("gen_job", ["gen-table", "table-validation", "data-migration"]),
+            ("gen_table", ["gen-table", "table-validation"]),
+            ("semantic_modeling", ["dosi-semantic-authoring"]),
+            ("gen_dashboard", ["bi-validation", "grafana-dashboard", "superset-dashboard"]),
+            ("gen_skill", ["create-skill", "optimize-skill"]),
+            ("scheduler", ["airflow-workflow", "scheduler-validation"]),
+        ],
+    )
+    def test_skill_frontmatter_whitelists_expected_node(self, node_name, skills):
+        for skill in skills:
+            fm = self._read_skill_frontmatter(skill)
+            allowed = fm.get("allowed_agents") or []
+            assert node_name in allowed, f"Skill '{skill}' must list '{node_name}' in allowed_agents — got {allowed}"
+
+    def test_dashboard_router_skill_is_not_exposed_to_chat(self):
+        """Dashboard routing is handled by task(type="gen_dashboard"), not a chat-visible skill."""
+        import pathlib
+
+        project_root = pathlib.Path(__file__).resolve().parents[4]
+        skills_dir = project_root / "datus" / "resources" / "skills"
+        manager = SkillManager(config=SkillConfig(directories=[str(skills_dir)]))
+
+        chat_names = {skill.name for skill in manager.get_available_skills("chat")}
+        assert "gen-dashboard" not in chat_names
+        assert "superset-dashboard" not in chat_names
+        assert "grafana-dashboard" not in chat_names
+
+        dashboard_names = {skill.name for skill in manager.get_available_skills("gen_dashboard")}
+        assert "superset-dashboard" in dashboard_names
+        assert "grafana-dashboard" in dashboard_names
+
+
+class TestBashToolToggle:
+    """``agent.bash.enabled`` controls whether ``BashTool`` is instantiated."""
+
+    def _wire_permissions(self, config):
+        """Give ``mock_agent_config`` a permissions section so that
+        ``_setup_permission_manager`` actually builds a ``PermissionManager``.
+
+        Required because BashTool now refuses to instantiate when no
+        permission enforcement is available (fail-closed).
+        """
+        config.permissions_config = PermissionConfig(default_permission=PermissionLevel.ALLOW)
+        config.active_profile_name = "normal"
+        return config
+
+    def test_bash_tool_created_by_default(self, mock_agent_config):
+        """Default behaviour (no explicit toggle) creates the BashTool."""
+        # Mock(spec=AgentConfig) makes ``bash_tool_enabled`` resolve to a
+        # truthy Mock — equivalent to the production default of ``True``.
+        self._wire_permissions(mock_agent_config)
+        node = MinimalAgenticNode(
+            node_id="bash_toggle_default",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        from datus.tools.func_tool.bash_tool import BashTool
+
+        assert isinstance(node.bash_tool, BashTool)
+        bash_names = {t.name for t in node.bash_tool.available_tools()}
+        assert "bash" in bash_names
+
+    def test_bash_tool_disabled_via_config(self, mock_agent_config):
+        """``bash_tool_enabled=False`` keeps ``BashTool`` out of the node."""
+        self._wire_permissions(mock_agent_config)
+        mock_agent_config.bash_tool_enabled = False
+
+        node = MinimalAgenticNode(
+            node_id="bash_toggle_off",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.bash_tool is None
+        # ``_ensure_bash_tool_in_tools`` must also short-circuit so the
+        # tool never sneaks into ``self.tools`` via the lazy injector.
+        node.tools = []
+        node._ensure_bash_tool_in_tools()
+        assert node.tools == []
+        # The registry must not carry a phantom ``bash_tools`` entry when
+        # the bash tool is disabled.
+        node._populate_tool_registry()
+        assert "bash_tools" not in node.tool_registry.to_dict().values()
+
+    def test_bash_tool_skipped_without_permission_manager(self, mock_agent_config):
+        """Without permission enforcement, BashTool must NOT be created.
+
+        ``_ensure_permission_hooks`` is a no-op when ``permission_manager``
+        is ``None``, so creating an ``bash`` tool would expose
+        unrestricted shell execution to the model. Fail closed instead.
+        """
+        # ``permissions_config = None`` short-circuits ``_setup_permission_manager``,
+        # so ``node.permission_manager`` stays ``None``.
+        mock_agent_config.permissions_config = None
+
+        node = MinimalAgenticNode(
+            node_id="bash_toggle_no_perm",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        assert node.permission_manager is None
+        assert node.bash_tool is None
+        # The lazy injector must also stay a no-op.
+        node.tools = []
+        node._ensure_bash_tool_in_tools()
+        assert node.tools == []
+
+    def test_bash_allowed_patterns_passed_through_to_tool(self, mock_agent_config):
+        """``agent_config.bash_allowed_patterns`` reaches the BashTool instance.
+
+        The API surface sets ``["datus*"]`` for web clients; the node must
+        hand it to the tool verbatim so the execution-layer whitelist gates
+        commands regardless of the permission profile.
+        """
+        self._wire_permissions(mock_agent_config)
+        mock_agent_config.bash_allowed_patterns = ["datus*"]
+
+        node = MinimalAgenticNode(
+            node_id="bash_patterns_passthrough",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        from datus.tools.func_tool.bash_tool import BashTool
+
+        assert isinstance(node.bash_tool, BashTool)
+        assert node.bash_tool.allowed_patterns == ["datus*"]
+        assert node.bash_tool._is_command_allowed("datus plugin list") is True
+        assert node.bash_tool._is_command_allowed("rm -rf /") is False
+
+    def test_non_list_bash_patterns_fall_back_to_unrestricted(self, mock_agent_config):
+        """A config without a usable ``bash_allowed_patterns`` (e.g. a Mock
+        or a legacy bootstrap) must not kill the tool — it falls back to the
+        unrestricted default gated by the permission profile."""
+        self._wire_permissions(mock_agent_config)
+        # Mock(spec=AgentConfig) resolves the attribute to a truthy Mock —
+        # exactly the non-list shape the fallback must absorb.
+
+        node = MinimalAgenticNode(
+            node_id="bash_patterns_fallback",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        from datus.tools.func_tool.bash_tool import BashTool
+
+        assert isinstance(node.bash_tool, BashTool)
+        assert node.bash_tool.allowed_patterns == ["*"]
+
+    def test_read_only_managed_config_wires_plugin_runtime_provider(self, mock_agent_config):
+        """Only managed/read-only AgentConfig instances bridge plugin CLI config."""
+        self._wire_permissions(mock_agent_config)
+        mock_agent_config.config_mutable = False
+
+        node = MinimalAgenticNode(
+            node_id="bash_managed_plugin_context",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        from datus.tools.func_tool.bash_tool import BashTool
+
+        assert isinstance(node.bash_tool, BashTool)
+        assert node.bash_tool.execution_context_provider.__name__ == "_managed_plugin_context"
+
+    def test_mutable_local_config_does_not_wire_runtime_provider(self, mock_agent_config):
+        self._wire_permissions(mock_agent_config)
+        mock_agent_config.config_mutable = True
+
+        node = MinimalAgenticNode(
+            node_id="bash_local_plugin_context",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+
+        from datus.tools.func_tool.bash_tool import BashTool
+
+        assert isinstance(node.bash_tool, BashTool)
+        assert node.bash_tool.execution_context_provider is None
+
+
+@pytest.fixture
+def bound_db_tool(tmp_path):
+    """Use the real primary-connector contract without any remote database."""
+    connector = SQLiteConnector(SQLiteConfig(db_path=str(tmp_path / "skills.sqlite")))
+    tool = DBFuncTool(connector)
+    yield tool
+    connector.close()
+
+
+@pytest.fixture
+def database_skill_manager(temp_skills_dir, skill_manager):
+    """Discover dialect skills from local files as installed adapters would."""
+    for db_type in ("sqlite", "duckdb", "oracle", "postgresql", "custom-db"):
+        skill_dir = temp_skills_dir / f"db-{db_type}-sql"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: db-{db_type}-sql\ndescription: {db_type} SQL rules\n---\n\n{db_type} dialect instructions.\n"
+        )
+    skill_manager.refresh()
+    return skill_manager
+
+
+class TestRequiredSkillsInjection:
+    """``REQUIRED_SKILLS`` host-injection primitive (``_inject_required_skills``)."""
+
+    def _make_node(self, mock_agent_config, skill_manager, required):
+        node = MinimalAgenticNode(
+            node_id="required_skills_node",
+            description="Test node",
+            node_type="chat",
+            agent_config=mock_agent_config,
+        )
+        node.skill_manager = skill_manager
+        node.__class__ = type(
+            "RequiredSkillsNode",
+            (MinimalAgenticNode,),
+            {"REQUIRED_SKILLS": required, "get_node_name": lambda self: "test_node"},
+        )
+        return node
+
+    def test_required_skill_content_is_injected(self, mock_agent_config, skill_manager, monkeypatch):
+        node = self._make_node(mock_agent_config, skill_manager, "sql-analysis")
+        monkeypatch.setattr(node, "_inject_memory_context", lambda p, override_node_name=None: p)
+        monkeypatch.setattr(node, "_inject_response_language", lambda p: p)
+
+        result = node._finalize_system_prompt("base prompt")
+
+        assert '<required_skill name="sql-analysis">' in result
+        assert "SQL analysis techniques" in result
+        assert "</required_skill>" in result
+
+    def test_multiple_required_skills_all_injected(self, mock_agent_config, skill_manager):
+        node = self._make_node(mock_agent_config, skill_manager, "sql-analysis, data-profiler")
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="sql-analysis">' in result
+        assert '<required_skill name="data-profiler">' in result
+
+    def test_missing_required_skill_raises(self, mock_agent_config, skill_manager):
+        from datus.utils.exceptions import DatusException
+
+        node = self._make_node(mock_agent_config, skill_manager, "no-such-skill")
+
+        with pytest.raises(DatusException, match="no-such-skill"):
+            node._inject_required_skills("base prompt")
+
+    def test_no_required_skills_leaves_prompt_unchanged(self, mock_agent_config, skill_manager):
+        node = self._make_node(mock_agent_config, skill_manager, None)
+
+        assert node._inject_required_skills("base prompt") == "base prompt"
+
+    def test_get_required_skills_parses_comma_separated_string(self, mock_agent_config, skill_manager):
+        node = self._make_node(mock_agent_config, skill_manager, " sql-analysis ,, data-profiler ")
+
+        assert node._get_required_skills() == ["sql-analysis", "data-profiler"]
+
+    def test_installed_database_skill_is_injected(
+        self,
+        mock_agent_config,
+        skill_manager,
+        temp_skills_dir,
+        bound_db_tool,
+        monkeypatch,
+    ):
+        skill_dir = temp_skills_dir / "db-oracle-sql"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: db-oracle-sql
+description: Oracle SQL generation rules
+---
+
+# Oracle SQL
+
+Use FETCH FIRST instead of LIMIT.
+"""
+        )
+        skill_manager.refresh()
+        mock_agent_config.current_db_configs.return_value = {
+            "oracle_prod": {"type": "oracle"},
+            "postgres_prod": {"type": "postgresql"},
+        }
+        node = self._make_node(mock_agent_config, skill_manager, None)
+
+        monkeypatch.setattr(bound_db_tool.connector, "get_type", lambda: "oracle")
+        node.db_func_tool = bound_db_tool
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="db-oracle-sql">' in result
+        assert "Use FETCH FIRST instead of LIMIT." in result
+        assert "db-postgresql-sql" not in result
+
+    def test_database_skill_connector_failure_leaves_prompt_unchanged(
+        self, mock_agent_config, database_skill_manager, bound_db_tool
+    ):
+        node = self._make_node(mock_agent_config, database_skill_manager, None)
+        node.db_func_tool = bound_db_tool
+        with patch.object(bound_db_tool.connector, "get_type", side_effect=RuntimeError("connector unavailable")):
+            assert node._inject_required_skills("base prompt") == "base prompt"
+
+    def test_database_skill_outside_node_scope_is_skipped(
+        self,
+        mock_agent_config,
+        skill_manager,
+        temp_skills_dir,
+        bound_db_tool,
+        monkeypatch,
+    ):
+        skill_dir = temp_skills_dir / "db-oracle-sql"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            """---
+name: db-oracle-sql
+description: Oracle SQL generation rules
+allowed_agents:
+  - another_node
+---
+
+# Oracle SQL
+
+Use FETCH FIRST instead of LIMIT.
+"""
+        )
+        skill_manager.refresh()
+        mock_agent_config.current_db_configs.return_value = {"oracle_prod": {"type": "oracle"}}
+        node = self._make_node(mock_agent_config, skill_manager, None)
+        monkeypatch.setattr(bound_db_tool.connector, "get_type", lambda: "oracle")
+        node.db_func_tool = bound_db_tool
+
+        assert node._inject_required_skills("base prompt") == "base prompt"
+
+    @pytest.mark.parametrize("node_name", ["ask_metrics", "gen_report"])
+    @pytest.mark.parametrize("required", [None, "sql-analysis"])
+    def test_nodes_without_db_tools_skip_dialect_skills(
+        self, mock_agent_config, database_skill_manager, node_name, required, monkeypatch
+    ):
+        mock_agent_config.current_db_configs.return_value = {"sqlite": {"type": DBType.SQLITE}}
+        node = self._make_node(mock_agent_config, database_skill_manager, required)
+        monkeypatch.setattr(node, "get_node_name", lambda: node_name)
+        node.db_func_tool = None
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="db-' not in result
+        if required:
+            assert f'<required_skill name="{required}">' in result
+        else:
+            assert result == "base prompt"
+
+    @pytest.mark.parametrize(
+        ("db_type", "expected"),
+        [(DBType.SQLITE, "sqlite"), (DBType.DUCKDB, "duckdb"), (" ORACLE ", "oracle"), ("CUSTOM_DB", "custom-db")],
+    )
+    def test_only_bound_connector_dialect_is_injected(
+        self, mock_agent_config, database_skill_manager, bound_db_tool, monkeypatch, db_type, expected
+    ):
+        mock_agent_config.current_db_configs.return_value = {
+            "oracle": {"type": "oracle"},
+            "postgres": {"type": "postgresql"},
+            "sqlite": {"type": DBType.SQLITE},
+            "another_sqlite": {"type": DBType.SQLITE},
+        }
+        mock_agent_config.current_datasource = "postgres"
+        node = self._make_node(mock_agent_config, database_skill_manager, None)
+        node.db_func_tool = bound_db_tool
+        monkeypatch.setattr(bound_db_tool.connector, "get_type", lambda: db_type)
+
+        result = node._inject_required_skills("base prompt")
+        skills = ET.fromstring(f"<prompt>{result}</prompt>").findall("required_skill")
+
+        assert [skill.attrib["name"] for skill in skills] == [f"db-{expected}-sql"]
+        assert f"{expected} dialect instructions." in skills[0].text
+
+    def test_real_connector_type_wins_over_changed_config(
+        self, mock_agent_config, database_skill_manager, bound_db_tool
+    ):
+        node = self._make_node(mock_agent_config, database_skill_manager, None)
+        node.db_func_tool = bound_db_tool
+        mock_agent_config.current_datasource = "duckdb"
+        mock_agent_config.current_db_configs.return_value = {"duckdb": {"type": DBType.DUCKDB}}
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="db-sqlite-sql">' in result
+        assert 'name="db-duckdb-sql"' not in result
+        mock_agent_config.current_db_configs.assert_not_called()
+
+    def test_required_and_bound_dialect_skill_is_injected_once(
+        self, mock_agent_config, database_skill_manager, bound_db_tool
+    ):
+        node = self._make_node(mock_agent_config, database_skill_manager, "db-sqlite-sql, db-sqlite-sql")
+        node.db_func_tool = bound_db_tool
+        mock_agent_config.current_db_configs.return_value = {"sqlite": {"type": DBType.SQLITE}}
+
+        result = node._inject_required_skills("base prompt")
+
+        assert result.count('<required_skill name="db-sqlite-sql">') == 1
+
+    def test_missing_optional_bound_dialect_skill_is_skipped(self, mock_agent_config, skill_manager, bound_db_tool):
+        node = self._make_node(mock_agent_config, skill_manager, "sql-analysis")
+        node.db_func_tool = bound_db_tool
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="sql-analysis">' in result
+        assert '<required_skill name="db-' not in result
+
+    def test_missing_explicit_skill_still_fails_with_db_tools(
+        self, mock_agent_config, database_skill_manager, bound_db_tool
+    ):
+        from datus.utils.exceptions import DatusException
+
+        node = self._make_node(mock_agent_config, database_skill_manager, "no-such-skill")
+        node.db_func_tool = bound_db_tool
+
+        with pytest.raises(DatusException, match="no-such-skill"):
+            node._inject_required_skills("base prompt")
+
+    @pytest.mark.parametrize("db_type", [None, "", "   "])
+    def test_empty_bound_type_does_not_fall_back_to_config(
+        self, mock_agent_config, database_skill_manager, bound_db_tool, monkeypatch, db_type
+    ):
+        mock_agent_config.current_db_configs.return_value = {"sqlite": {"type": DBType.SQLITE}}
+        node = self._make_node(mock_agent_config, database_skill_manager, "sql-analysis")
+        node.db_func_tool = bound_db_tool
+        monkeypatch.setattr(bound_db_tool.connector, "get_type", lambda: db_type)
+
+        result = node._inject_required_skills("base prompt")
+
+        assert '<required_skill name="sql-analysis">' in result
+        assert '<required_skill name="db-' not in result
+
+    def test_unbound_db_tool_does_not_fall_back_to_config(
+        self, mock_agent_config, database_skill_manager, bound_db_tool, monkeypatch
+    ):
+        mock_agent_config.current_db_configs.return_value = {"sqlite": {"type": DBType.SQLITE}}
+        node = self._make_node(mock_agent_config, database_skill_manager, None)
+        node.db_func_tool = bound_db_tool
+        monkeypatch.setattr(bound_db_tool, "_primary_connector", None)
+
+        assert node._inject_required_skills("base prompt") == "base prompt"

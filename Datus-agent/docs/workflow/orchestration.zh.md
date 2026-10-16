@@ -1,0 +1,199 @@
+# 工作流编排
+
+在 Datus Agent 中，工作流编排用于定义、管理并执行一组节点以完成数据分析任务。本文介绍工作流的结构、配置与执行方式，帮助你把自然语言请求自动转换为 SQL 与结果。
+
+## 核心概念
+
+### 1. 工作流定义
+工作流是一组按序执行的节点：
+
+- **目标明确**：每个工作流解决某类问题
+- **顺序清晰**：节点按预设顺序执行
+- **数据共享**：通过共享上下文在节点之间传递信息
+
+### 2. 工作流配置
+Datus 提供多种内置工作流模板：
+
+```yaml
+workflow:
+  fixed:
+    - schema_linking
+    - gen_sql
+    - execute_sql
+    - output
+
+  gen_sql_agentic:
+    - gen_sql
+    - execute_sql
+    - output
+```
+
+> 说明：以上为内置模板。要自定义或新增工作流，请在 `agent.yml` 配置（见下文“自定义工作流”）。
+
+## 内置工作流类型
+
+### 1. Fixed（固定）
+**目的**：确定性路径、可预期的 SQL 生成
+
+**节点序列**：
+```
+Schema Linking → Generate SQL → Execute SQL → Output
+```
+
+**特性**：
+- 可预期：始终遵循同一执行路径
+- 快速：采用直接的生成与执行路径
+- 简单：易理解、易排错
+- 可靠：适合明确问题
+
+**适用**：简单查询、需求明确、性能敏感
+
+**示例**：
+```
+User: "List all customers from California"
+Process:
+1. Schema Linking：定位 customers（含 state）
+2. Generate SQL：SELECT * FROM customers WHERE state = 'CA'
+3. Execute SQL：返回结果
+4. Output：展示
+```
+
+### 2. Gen SQL Agentic
+**目的**：通过数据库、语义层、指标检索及其他配置的工具生成 SQL
+
+**节点序列**：
+```text
+Generate SQL → Execute SQL → Output
+```
+
+`gen_sql` agent 可以通过 `context_search_tools.search_metrics` 检索指标，并在启用
+`date_parsing_tools.parse_temporal_expressions` 后解析时间表达式。
+
+**示例**：
+```text
+User: "Show monthly active users for the last quarter"
+Process:
+1. Gen SQL 调用指标检索工具找到 monthly_active_users 定义
+2. Gen SQL 调用日期解析工具确定“last quarter”范围
+3. Gen SQL 按指标口径生成查询
+4. Execute SQL 执行
+5. Output 展示分月 MAU
+```
+
+## 工作流配置
+
+### 自定义工作流
+在 `agent.yml` 中新增模板：
+```yaml
+agent:
+  workflow:
+    plan: custom_analytics
+
+    custom_analytics:
+      - schema_linking
+      - gen_sql
+      - execute_sql
+      - compare
+      - output
+
+    data_exploration:
+      - schema_linking
+      - gen_sql
+      - execute_sql
+      - output
+```
+
+### 高级特性
+
+#### 并行执行
+```yaml
+agent:
+  workflow:
+    plan: bird_para
+
+    bird_para:
+      - schema_linking
+      - parallel:
+        - gen_sql
+        - gen_sql
+      - selection
+      - execute_sql
+      - output
+```
+
+#### 子工作流
+```yaml
+agent:
+  workflow:
+    plan: main_workflow
+
+    main_workflow:
+      - schema_linking
+      - parallel:
+        - subworkflow1
+        - subworkflow2
+      - selection
+      - execute_sql
+      - output
+
+    subworkflow1:
+      - gen_sql
+
+    subworkflow2:
+      - gen_sql
+```
+
+#### 子工作流（独立配置）
+```yaml
+agent:
+  workflow:
+    plan: multi_agent
+
+    multi_agent:
+      - schema_linking
+      - parallel:
+        - agent1_workflow
+        - agent2_workflow
+      - selection
+      - output
+
+    agent1_workflow:
+      steps:
+        - gen_sql
+      config: multi/agent1.yaml
+
+    agent2_workflow:
+      steps:
+        - gen_sql
+      config: multi/agent2.yaml
+```
+
+### 工作流参数
+```bash
+# 使用内置工作流
+datus-agent run --datasource <your_datasource> --task "your query" --task_db_name <database> --workflow fixed
+# 使用自定义工作流
+datus-agent run --datasource <your_datasource> --task "your query" --task_db_name <database> --workflow custom_analytics
+```
+
+**可用参数**：
+
+| 参数 | 描述 | 默认 | 取值 |
+|---|---|---|---|
+| `--workflow` | 执行的工作流类型 | `fixed` | `fixed`、`empty`、`chat_agentic`、`gen_sql_agentic` 或自定义 |
+| `--datasource` | 数据库数据源 | 必填 | 已配置数据源 |
+| `--task_db_name` | 任务使用的目标数据库名 | 必填 | 已配置数据库名 |
+| `--task` | 自然语言任务 | 必填 | 文本 |
+| `--max_steps` | 最大工作流步数 | `20` | 整数 |
+
+## 调试与监控
+```bash
+# 详细日志
+datus-agent --debug run --datasource <your_datasource> --task "your query" --task_db_name <database>
+# 保存 LLM 输入输出 trace
+datus-agent --save_llm_trace run --datasource <your_datasource> --task "your query" --task_db_name <database>
+```
+
+## 结语
+
+工作流编排是 Datus Agent 智能 SQL 生成能力的基石。理解不同工作流类型与适用场景，能帮助你高效、可靠地解决复杂的数据分析问题。

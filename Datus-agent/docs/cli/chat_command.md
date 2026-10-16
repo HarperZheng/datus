@@ -1,0 +1,103 @@
+# Chat Command `/`
+
+## 1. Overview
+
+The Chat Command `/` is the heart of Datus-CLI. It enables you to converse with the AI agent in a multi-turn session, describe tasks in natural language, and receive reasoning steps and SQL code suggestions. Think of it as your copilot for exploring data, drafting SQL, and planning workflows — all directly in the CLI.
+
+You can chat with Datus in any format — plain English, bullet points, or sketches of logic — and freely edit or follow up on its responses. The agent keeps track of your instructions and previous outputs, so you can iteratively refine results without starting over.
+
+---
+
+## 2. Basic Usage
+
+Start a new chat session by entering `/` followed by your message:
+
+```text
+/ How many orders were placed last week?
+```
+
+The agent will respond with its reasoning process and a proposed SQL query. You can then follow up naturally:
+
+```text
+/ Filter only for VIP customers
+```
+
+Datus streams the output as it thinks — showing each action's execution result in real time. If the result contains SQL, it will:
+
+- Automatically highlight the SQL in the output
+- Copy the SQL to your clipboard for quick use
+- Finally produce a Markdown-formatted summary of the result
+
+![Reasoning progress](../assets/reasoning_progress.png)
+
+![Result of query](../assets/result_query.png)
+
+![Details of function calling](../assets/function_calling_details.png)
+
+---
+
+## 3. Advanced Features
+
+### Context Injection
+
+Context Injection allows you to pull existing tables, metrics or files into your conversation. There are two ways to do this:
+
+#### Browse Mode
+Type `@` and press Tab to browse your context tree step by step. You can navigate by category (table / file / metrics) and drill down the directory-like structure to select the exact item you need.
+
+#### Fuzzy Search Mode
+Type `@` followed by some keywords, then press Tab to trigger a fuzzy search. Datus will suggest context items ranked by textual similarity, letting you quickly find what you need without knowing the exact path.
+
+This is the fastest way to ground your prompts with precise context.
+
+![Context injection browse mode](../assets/context_browse.png)
+
+![Context injection fuzzy search](../assets/context_fuzzy.png)
+
+### Interrupt Execution
+
+Press **ESC** or **Ctrl+C** while the agent is running to gracefully interrupt the current execution. The agent will finish its current step, then stop and return control to you.
+
+After an interrupt, the session remains intact — you can continue typing new instructions, refine your question, or provide additional context. Nothing is lost.
+
+### Toggle Trace Display
+
+Press **Ctrl+O** while the agent is running to toggle the trace display mode between **compact** (progress only) and **verbose** (full step details). This lets you control how much detail you see during execution without interrupting the agent.
+
+### Switch Permission Mode
+
+Press **Ctrl+P** to cycle the permission mode through **normal → auto → dangerous → normal**. The shortcut remains active while the agent is running, and the new mode applies to subsequent tool permission checks in the current conversation.
+
+### Mid-run Message Insertion
+
+While the agent is running, you don't have to wait for it to finish before adding more context. Type into the input box and press **Enter** — the text is queued and delivered to the model right before its next LLM turn, so it influences the run already in progress rather than starting a new one.
+
+How it works:
+
+- A **pinned preview** appears above the bottom status bar showing every queued message. The preview collapses to zero rows when the queue is drained.
+- At each LLM turn, every queued message is drained, appended to the model input as `user` items, and persisted to the session history.
+- If the run finishes its final turn while items are still queued, the residue **auto-continues** in a fresh run so nothing you typed is silently dropped.
+- Inserted messages are kept in the rendered transcript across `Ctrl+O` verbose/compact toggles and on `/resume`, so you always see what you injected.
+
+This complements — rather than replaces — `ESC` / `Ctrl+C` (interrupt) and `/chat/stop`. Use insertion when you want to **steer** the current run with new context; use interrupt when you want to **abort** it.
+
+### Session Commands
+
+- `/clear`: Clear the current session context and start fresh
+- `/compact`: Compress previous turns to reduce memory usage while preserving context
+  - Runs a **major compact**: the whole session is summarized by the model into a single recap, with the full history saved to a JSONL file for recovery
+  - Auto-trigger: a major compact also runs automatically when the model context usage exceeds 90% (configurable); separately, a lighter **minor compact** archives eligible old tool output during the same check before each model request, including the first request
+  - See [Context Compaction](../configuration/compact.md) for the major/minor difference and tunable parameters
+- `/chat_info`: Show the current active context (messages, tables, metrics)
+- `/resume [session_id]`: Resume a previous chat session
+  - Without arguments: displays a table of all available sessions (sorted by last modified time), then prompts you to pick one by number
+  - With a session ID: directly resumes that specific session
+  - After resuming, the full conversation history is replayed so you can see what was discussed, and you can continue chatting from where you left off
+  - If the session has high token usage (>50k tokens), a hint is shown suggesting `/compact` to reduce context size
+- `/rewind [turn_number]`: Rewind the current session to a specific user turn, creating a new branched session
+  - Displays a numbered table of all user turns in the current session
+  - You select a turn number — the session is cloned up to (and including) that turn's assistant response, producing a new session
+  - The original session is preserved; the rewound copy becomes your active session
+  - Without arguments: shows the turn table and prompts for a turn number
+  - With a turn number: directly rewinds to that turn
+  - Useful when you want to retry a question with different phrasing or explore an alternative path without losing the original conversation

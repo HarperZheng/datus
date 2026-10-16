@@ -1,0 +1,438 @@
+const fs = require('fs');
+const path = require('path');
+
+const DEFAULT_MAX_FINDINGS = 25;
+const DEFAULT_MAX_SUMMARIES = 12;
+
+function stripAnsi(text) {
+  return String(text || '').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
+function findLatestNightlyLog(workspace = '.') {
+  const files = fs
+    .readdirSync(workspace)
+    .filter((file) => file.startsWith('test_output_nightly_') && file.endsWith('.log'))
+    .sort();
+
+  if (files.length === 0) {
+    const fallback = path.join(workspace, 'test_output_nightly.log');
+    return fs.existsSync(fallback) ? fallback : '';
+  }
+
+  return path.join(workspace, files[files.length - 1]);
+}
+
+function readLatestNightlyLog(workspace = '.') {
+  const logFile = findLatestNightlyLog(workspace);
+  if (!logFile) {
+    return { logFile: '', logContent: '' };
+  }
+
+  try {
+    return { logFile, logContent: fs.readFileSync(logFile, 'utf8') };
+  } catch {
+    return { logFile, logContent: '' };
+  }
+}
+
+function readNightlyManifest(workspace = '.') {
+  const manifestPath = path.join(workspace, 'nightly-manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readFailureClassification(workspace = '.') {
+  const classificationPath = path.join(workspace, 'nightly-failure-classification.json');
+  if (!fs.existsSync(classificationPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(classificationPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readProviderCoverageManifest(workspace = '.') {
+  const manifestPath = path.join(workspace, 'provider-coverage-manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readNightlyProcessDiagnostics(workspace = '.') {
+  const diagnosticsPath = path.join(workspace, 'nightly-process-diagnostics.json');
+  if (!fs.existsSync(diagnosticsPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(diagnosticsPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function pushUnique(items, item) {
+  const value = String(item || '').trim();
+  if (value && !items.includes(value)) {
+    items.push(value);
+  }
+}
+
+function isPytestSummary(line) {
+  return /^=+\s+.*\b(passed|failed|error|errors|skipped|xfailed|xpassed|deselected|rerun|reruns)\b.*\s+=+$/.test(
+    line,
+  );
+}
+
+function cleanPytestSummary(line) {
+  return line.replace(/^=+\s*/, '').replace(/\s*=+$/, '').trim();
+}
+
+function summarizeNightlyLog(logContent, options = {}) {
+  const maxFindings = options.maxFindings || DEFAULT_MAX_FINDINGS;
+  const maxSummaries = options.maxSummaries || DEFAULT_MAX_SUMMARIES;
+  const lines = stripAnsi(logContent).replace(/\r/g, '').split('\n');
+  const failures = [];
+  const warnings = [];
+  const knownWarnings = [];
+  const summaries = [];
+
+  let captureKnownWarnings = false;
+  let captureUnregisteredWarnings = false;
+  let captureKnownReruns = false;
+  let captureUnregisteredReruns = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      captureKnownWarnings = false;
+      captureUnregisteredWarnings = false;
+      captureKnownReruns = false;
+      captureUnregisteredReruns = false;
+      continue;
+    }
+
+    if (/^Registered log warning patterns observed:/.test(line)) {
+      captureKnownWarnings = true;
+      captureUnregisteredWarnings = false;
+      captureKnownReruns = false;
+      captureUnregisteredReruns = false;
+      continue;
+    }
+    if (/^Unregistered log warning patterns observed:/.test(line)) {
+      pushUnique(warnings, line);
+      captureKnownWarnings = false;
+      captureUnregisteredWarnings = true;
+      captureKnownReruns = false;
+      captureUnregisteredReruns = false;
+      continue;
+    }
+    if (/^Registered reruns observed:/.test(line)) {
+      captureKnownWarnings = false;
+      captureUnregisteredWarnings = false;
+      captureKnownReruns = true;
+      captureUnregisteredReruns = false;
+      continue;
+    }
+    if (/^Unregistered reruns observed:/.test(line)) {
+      pushUnique(warnings, line);
+      captureKnownWarnings = false;
+      captureUnregisteredWarnings = false;
+      captureKnownReruns = false;
+      captureUnregisteredReruns = true;
+      continue;
+    }
+    if (
+      line.startsWith('- ') &&
+      (captureKnownWarnings ||
+        captureUnregisteredWarnings ||
+        captureKnownReruns ||
+        captureUnregisteredReruns)
+    ) {
+      if (captureKnownWarnings || captureKnownReruns) {
+        pushUnique(knownWarnings, line);
+      } else {
+        pushUnique(warnings, line);
+      }
+      continue;
+    }
+
+    if (isPytestSummary(line)) {
+      pushUnique(summaries, cleanPytestSummary(line));
+      continue;
+    }
+
+    if (/^(FAILED|ERROR)\s+.+::/.test(line) || /^FAILED\s+tests\//.test(line) || /^ERROR\s+tests\//.test(line)) {
+      pushUnique(failures, line);
+      continue;
+    }
+
+    if (
+      /^::error::/.test(line) ||
+      /^Timed out /.test(line) ||
+      /^Host port is already in use /.test(line) ||
+      /^No container found /.test(line) ||
+      /^Docker .* required/.test(line) ||
+      /^Knowledge base .*missing/.test(line) ||
+      /^Knowledge base .*empty/.test(line)
+    ) {
+      pushUnique(failures, line);
+      continue;
+    }
+
+    if (/^WARNING: .+ failed with exit code \d+/.test(line)) {
+      pushUnique(warnings, line);
+    }
+  }
+
+  return {
+    failures: failures.slice(0, maxFindings),
+    warnings: warnings.slice(0, maxFindings),
+    knownWarnings: knownWarnings.slice(0, maxFindings),
+    summaries: summaries.slice(-maxSummaries),
+    truncatedFailures: Math.max(0, failures.length - maxFindings),
+    truncatedWarnings: Math.max(0, warnings.length - maxFindings),
+    truncatedKnownWarnings: Math.max(0, knownWarnings.length - maxFindings),
+  };
+}
+
+function fencedList(items, emptyText) {
+  if (!items.length) {
+    return emptyText;
+  }
+  return ['```text', ...items, '```'].join('\n');
+}
+
+function formatCounts(counts = {}) {
+  return Object.entries(counts)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join(', ');
+}
+
+function summarizeClassification(classification, options = {}) {
+  const maxFindings = options.maxFindings || 8;
+  if (!classification || !classification.summary) {
+    return null;
+  }
+
+  const blockingCounts = classification.summary.blocking_category_counts || {};
+  const categoryCounts = classification.summary.category_counts || {};
+  const diagnosticCounts = {};
+  for (const [category, count] of Object.entries(categoryCounts)) {
+    const diagnosticCount = Number(count) - Number(blockingCounts[category] || 0);
+    if (diagnosticCount > 0) {
+      diagnosticCounts[category] = diagnosticCount;
+    }
+  }
+  const blockingText = formatCounts(blockingCounts);
+  const diagnosticText = formatCounts(diagnosticCounts);
+  const findings = Array.isArray(classification.findings) ? classification.findings : [];
+  const blockingFindings = findings.filter((finding) => finding && finding.blocking);
+  const warningFindings = findings.filter((finding) => finding && !finding.blocking);
+  const formatFinding = (finding) => {
+    const category = finding.category || 'unknown_failure';
+    const title = finding.title || 'Unclassified finding';
+    const details = finding.details || {};
+    const suite = details.suite ? ` suite=${details.suite}` : '';
+    const exitCode = details.exit_code != null ? ` exit_code=${details.exit_code}` : '';
+    const nodeid = details.nodeid ? ` nodeid=${details.nodeid}` : '';
+    const entryId = details.entry_id ? ` entry=${details.entry_id}` : '';
+    return `[${category}] ${title}${suite}${exitCode}${nodeid}${entryId}`;
+  };
+  const selectedBlockingFindings = blockingFindings.slice(0, maxFindings).map(formatFinding);
+  const selectedDiagnosticFindings = warningFindings.slice(0, maxFindings).map(formatFinding);
+
+  return {
+    blockingText,
+    diagnosticText,
+    blockingFindings: selectedBlockingFindings,
+    diagnosticFindings: selectedDiagnosticFindings,
+    omittedBlocking: Math.max(0, blockingFindings.length - selectedBlockingFindings.length),
+    omittedDiagnostics: Math.max(0, warningFindings.length - selectedDiagnosticFindings.length),
+  };
+}
+
+function summarizeProviderCoverage(providerCoverage) {
+  if (!providerCoverage || !providerCoverage.summary) {
+    return null;
+  }
+
+  const summary = providerCoverage.summary;
+  const providersTotal = summary.providers_total || 0;
+  const deterministicCovered = summary.deterministic_covered || 0;
+  const liveDeclared = summary.live_provider_health_declared || 0;
+  const liveCollected = summary.live_provider_health_collected || 0;
+  const liveMissing = Array.isArray(summary.live_provider_health_missing)
+    ? summary.live_provider_health_missing.length
+    : 0;
+  const errorCount = summary.coverage_error_count || 0;
+  const errorText = errorCount > 0 ? `, coverage errors: ${errorCount}` : '';
+
+  return `${providersTotal} providers, ${deterministicCovered} deterministic covered, ${liveDeclared} live smoke declared, ${liveCollected} live smoke collected, ${liveMissing} live smoke missing/undeclared${errorText}`;
+}
+
+function summarizeTraceDiagnostics(processDiagnostics) {
+  if (!processDiagnostics || !processDiagnostics.summary) {
+    return null;
+  }
+
+  const summary = processDiagnostics.summary;
+  const caseCount = summary.case_count || 0;
+  const traceReferenceCount = summary.trace_reference_count || 0;
+  const fetchStatusText = formatCounts(summary.trace_fetch_status_counts || {});
+  const findingText = formatCounts(summary.finding_type_counts || {});
+  const failedSpanCount = summary.failed_span_count || 0;
+  const avgDuration = summary.avg_duration_seconds;
+  const tokenUsage = summary.token_usage || {};
+  const totalTokens = tokenUsage.total || tokenUsage.total_tokens || 0;
+  const durationText = avgDuration != null ? `, avg trace duration: ${avgDuration}s` : '';
+  const tokenText = totalTokens > 0 ? `, total tokens: ${totalTokens}` : '';
+  const failedSpanText = failedSpanCount > 0 ? `, failed spans: ${failedSpanCount}` : '';
+
+  return {
+    headline: `${caseCount} expected/traced cases, ${traceReferenceCount} trace refs${fetchStatusText ? ` (${fetchStatusText})` : ''}${durationText}${tokenText}${failedSpanText}`,
+    findingText,
+  };
+}
+
+function buildNightlyFeishuMessage({
+  status,
+  runNumber,
+  runUrl,
+  date,
+  workspace = '.',
+  logContent = null,
+} = {}) {
+  const content = logContent == null ? readLatestNightlyLog(workspace).logContent : logContent;
+  const report = summarizeNightlyLog(content);
+  const manifest = readNightlyManifest(workspace);
+  const classification = readFailureClassification(workspace);
+  const providerCoverage = readProviderCoverageManifest(workspace);
+  const processDiagnostics = readNightlyProcessDiagnostics(workspace);
+  const classificationSummary = summarizeClassification(classification);
+  const providerCoverageSummary = summarizeProviderCoverage(providerCoverage);
+  const traceDiagnosticsSummary = summarizeTraceDiagnostics(processDiagnostics);
+  const normalizedStatus = status || 'UNKNOWN';
+  const isPassed = normalizedStatus === 'PASSED';
+
+  const lines = [
+    `## Daily Nightly Test Report - ${date || new Date().toISOString().split('T')[0]}`,
+    '',
+    `**Status:** ${normalizedStatus}`,
+    `**Runs Details:** [${runNumber || 'run'}](${runUrl || ''})`,
+    '',
+  ];
+
+  if (isPassed && report.failures.length === 0) {
+    lines.push('**Result:** No blocking failures detected. Passing case logs are omitted.');
+  } else if (report.failures.length === 0) {
+    lines.push('**Result:** Nightly did not complete successfully. No pytest failure nodeids were found in the log summary.');
+  }
+
+  if (manifest && manifest.summary) {
+    const counts = manifest.summary.status_counts || {};
+    const countText = formatCounts(counts);
+    lines.push(
+      `**Manifest:** ${manifest.summary.suite_count || 0} suites, ${
+        manifest.summary.collected_nodeid_count || 0
+      } collected nodeids${countText ? ` (${countText})` : ''}.`,
+    );
+  }
+
+  if (classificationSummary) {
+    lines.push(`**Blocking:** ${classificationSummary.blockingText || 'no blocking classified failures'}.`);
+    if (classificationSummary.diagnosticText) {
+      lines.push(`**Diagnostics:** ${classificationSummary.diagnosticText}.`);
+    }
+  }
+
+  if (providerCoverageSummary) {
+    lines.push(`**Provider Coverage:** ${providerCoverageSummary}.`);
+  }
+
+  if (traceDiagnosticsSummary) {
+    lines.push(`**Trace Diagnostics:** ${traceDiagnosticsSummary.headline}.`);
+    if (traceDiagnosticsSummary.findingText) {
+      lines.push(`**Trace Findings:** ${traceDiagnosticsSummary.findingText}.`);
+    }
+  }
+
+  if (classificationSummary && classificationSummary.blockingFindings.length > 0) {
+    lines.push(
+      '',
+      '### Blocking Failures',
+      fencedList(classificationSummary.blockingFindings, 'No blocking classified failures.'),
+    );
+    if (classificationSummary.omittedBlocking > 0) {
+      lines.push(`_... ${classificationSummary.omittedBlocking} more blocking finding(s) omitted._`);
+    }
+  }
+
+  if (classificationSummary && classificationSummary.diagnosticFindings.length > 0) {
+    lines.push(
+      '',
+      '### Diagnostic Signals',
+      fencedList(classificationSummary.diagnosticFindings, 'No diagnostic signals.'),
+    );
+    if (classificationSummary.omittedDiagnostics > 0) {
+      lines.push(`_... ${classificationSummary.omittedDiagnostics} more diagnostic signal(s) omitted._`);
+    }
+  }
+
+  if (
+    report.failures.length > 0 &&
+    (!classificationSummary || classificationSummary.blockingFindings.length === 0)
+  ) {
+    lines.push('', '### Failures / Errors', fencedList(report.failures, 'No failures detected.'));
+    if (report.truncatedFailures > 0) {
+      lines.push(`_... ${report.truncatedFailures} more failure/error lines omitted._`);
+    }
+  }
+
+  if (report.warnings.length > 0) {
+    lines.push('', '### Warnings', fencedList(report.warnings, 'No warnings detected.'));
+    if (report.truncatedWarnings > 0) {
+      lines.push(`_... ${report.truncatedWarnings} more warning lines omitted._`);
+    }
+  }
+
+  if (report.summaries.length > 0) {
+    lines.push('', '### Pytest Summaries', fencedList(report.summaries, 'No pytest summaries found.'));
+  }
+
+  lines.push('', 'Detailed log is available in the nightly artifact.', '', '---');
+  lines.push('*This is an automated report generated by the nightly test workflow.*');
+
+  return lines.join('\n');
+}
+
+module.exports = {
+  buildNightlyFeishuMessage,
+  findLatestNightlyLog,
+  readFailureClassification,
+  readLatestNightlyLog,
+  readNightlyProcessDiagnostics,
+  readProviderCoverageManifest,
+  summarizeClassification,
+  summarizeProviderCoverage,
+  summarizeTraceDiagnostics,
+  stripAnsi,
+  summarizeNightlyLog,
+};

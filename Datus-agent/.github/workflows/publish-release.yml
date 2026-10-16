@@ -1,0 +1,437 @@
+name: "Publish And Finalize Release"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "datus-agent version to publish, for example 0.3.8 or 0.3.8rc1"
+        required: true
+        type: string
+      ref:
+        description: "Release branch, tag, or SHA to publish. Defaults to the selected workflow ref."
+        required: false
+        default: ""
+        type: string
+      repository:
+        description: "Package index target"
+        required: true
+        default: "pypi"
+        type: choice
+        options:
+          - pypi
+          - testpypi
+      check_adapter_latest:
+        description: "Require adapter core lower bounds to match latest PyPI releases"
+        required: false
+        default: true
+        type: boolean
+      create_main_metadata_pr:
+        description: "Create or update a main metadata sync PR after a stable PyPI publish"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: publish-release-${{ inputs.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, publish, and finalize stable releases
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.repository }}
+    env:
+      RELEASE_REF: ${{ inputs.ref || github.ref_name }}
+      VERSION: ${{ inputs.version }}
+      TAG_NAME: v${{ inputs.version }}
+      TARGET_REPOSITORY: ${{ inputs.repository }}
+      DIST_ARTIFACT_NAME: datus-agent-release-dist-${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install publish tooling
+        run: python -m pip install --upgrade pip build packaging twine
+
+      - name: Classify release version
+        id: release_version
+        shell: bash
+        run: |
+          python - <<'PY' >> "${GITHUB_OUTPUT}"
+          import os
+          from packaging.version import Version
+
+          version = Version(os.environ["VERSION"])
+          print(f"is_prerelease={'true' if version.is_prerelease else 'false'}")
+          PY
+
+      - name: Check release readiness
+        shell: bash
+        env:
+          CHECK_ADAPTER_LATEST: ${{ inputs.check_adapter_latest }}
+        run: |
+          set -euo pipefail
+          args=(--expected-version "${VERSION}")
+          if [[ "${CHECK_ADAPTER_LATEST}" == "true" ]]; then
+            args+=(--check-adapter-latest)
+          fi
+          python ci/check_release_readiness.py "${args[@]}"
+
+      - name: Check release source and tag state
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ steps.release_version.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin --prune --tags main
+
+          release_sha="$(git rev-parse HEAD)"
+          echo "release_sha=${release_sha}" >> "$GITHUB_OUTPUT"
+
+          remote_branch_sha="$(git ls-remote --heads origin "${RELEASE_REF}" | awk '{print $1}')"
+          if [[ -n "${remote_branch_sha}" && "${remote_branch_sha}" != "${release_sha}" ]]; then
+            echo "::error::Release ref ${RELEASE_REF} is at ${remote_branch_sha}, but checked out ${release_sha}"
+            exit 1
+          fi
+
+          if [[ "${TARGET_REPOSITORY}" != "pypi" ]]; then
+            echo "Skipping stable tag validation for ${TARGET_REPOSITORY}"
+            exit 0
+          fi
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            echo "Skipping stable tag validation for prerelease ${VERSION}"
+            exit 0
+          fi
+
+          if git rev-parse --verify --quiet "refs/tags/${TAG_NAME}" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "${TAG_NAME}")"
+            if [[ "${tag_sha}" != "${release_sha}" ]]; then
+              echo "::error::Tag ${TAG_NAME} already points to ${tag_sha}, expected ${release_sha}"
+              exit 1
+            fi
+            echo "Tag ${TAG_NAME} already points to the release commit"
+          fi
+
+      - name: Build release distributions
+        run: python -m build --outdir dist-release
+
+      - name: Validate release distributions
+        run: python -m twine check dist-release/*
+
+      - name: Upload release distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIST_ARTIFACT_NAME }}
+          path: dist-release/*
+          retention-days: 30
+
+      - name: Publish release distributions
+        shell: bash
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          TEST_PYPI_API_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${TARGET_REPOSITORY}" == "testpypi" ]]; then
+            repository_url="https://test.pypi.org/legacy/"
+            package_json_url="https://test.pypi.org/pypi/datus-agent/${VERSION}/json"
+            token="${TEST_PYPI_API_TOKEN}"
+          else
+            repository_url="https://upload.pypi.org/legacy/"
+            package_json_url="https://pypi.org/pypi/datus-agent/${VERSION}/json"
+            token="${PYPI_API_TOKEN}"
+          fi
+
+          if [[ -z "${token}" ]]; then
+            echo "::error::Missing PyPI token for ${TARGET_REPOSITORY}"
+            exit 1
+          fi
+
+          echo "::add-mask::${token}"
+          upload_required=true
+          set +e
+          python - "$package_json_url" "$VERSION" dist-release <<'PY'
+          import hashlib
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          MATCHED_EXISTING_RELEASE = 42
+          url, version, dist_dir = sys.argv[1:]
+          try:
+              with urllib.request.urlopen(url, timeout=20) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  raise SystemExit(0)
+              raise
+          except urllib.error.URLError as exc:
+              print(f"::error::Failed to inspect existing package release: {exc}")
+              raise SystemExit(1)
+
+          if payload.get("info", {}).get("version") != version:
+              print("::error::Package index returned unexpected version metadata")
+              raise SystemExit(1)
+
+          remote_hashes = {
+              file["filename"]: file.get("digests", {}).get("sha256")
+              for file in payload.get("urls", [])
+              if file.get("filename")
+          }
+          local_hashes = {}
+          for path in sorted(Path(dist_dir).glob("*")):
+              if path.is_file():
+                  local_hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+          if remote_hashes == local_hashes:
+              print(f"datus-agent {version} already exists and matches local distributions")
+              raise SystemExit(MATCHED_EXISTING_RELEASE)
+
+          print(
+              "::error::datus-agent "
+              f"{version} already exists, but uploaded files do not match local distributions"
+          )
+          print(f"Remote files: {sorted(remote_hashes)}")
+          print(f"Local files: {sorted(local_hashes)}")
+          raise SystemExit(1)
+          PY
+          package_check_status=$?
+          set -e
+          if [[ "${package_check_status}" -eq 42 ]]; then
+            upload_required=false
+          elif [[ "${package_check_status}" -ne 0 ]]; then
+            exit "${package_check_status}"
+          fi
+
+          if [[ "${upload_required}" == "false" ]]; then
+            echo "datus-agent ${VERSION} already exists on ${TARGET_REPOSITORY} with matching file hashes; skipping upload"
+            exit 0
+          fi
+
+          python -m twine upload \
+            --non-interactive \
+            --repository-url "${repository_url}" \
+            --username "__token__" \
+            --password "${token}" \
+            dist-release/*
+
+      - name: Verify published package is visible
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["VERSION"]
+          repository = os.environ["TARGET_REPOSITORY"]
+          host = "test.pypi.org" if repository == "testpypi" else "pypi.org"
+          url = f"https://{host}/pypi/datus-agent/{version}/json"
+          wait_seconds = 300
+          sleep_seconds = 10
+          max_attempts = wait_seconds // sleep_seconds
+          last_error = None
+
+          for attempt in range(1, max_attempts + 1):
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  if payload.get("info", {}).get("version") == version:
+                      print(
+                          f"datus-agent {version} is visible on {repository} "
+                          f"after {attempt} attempt(s)"
+                      )
+                      raise SystemExit(0)
+                  last_error = (
+                      "Package index returned version "
+                      f"{payload.get('info', {}).get('version')!r}"
+                  )
+              except (urllib.error.URLError, TimeoutError) as exc:
+                  last_error = str(exc)
+              print(
+                  "Package visibility check attempt "
+                  f"{attempt}/{max_attempts} failed for {url}: {last_error}"
+              )
+              if attempt < max_attempts:
+                  time.sleep(sleep_seconds)
+
+          raise SystemExit(
+              f"datus-agent {version} is not visible on {repository} "
+              f"after waiting {wait_seconds} seconds. Last error: {last_error}"
+          )
+          PY
+
+      - name: Clean install published package smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .published-package-smoke
+          source .published-package-smoke/bin/activate
+          python -m pip install --upgrade pip
+          if [[ "${TARGET_REPOSITORY}" == "testpypi" ]]; then
+            python -m pip install \
+              --index-url https://test.pypi.org/simple/ \
+              --extra-index-url https://pypi.org/simple \
+              "datus-agent==${VERSION}"
+          else
+            python -m pip install "datus-agent==${VERSION}"
+          fi
+
+          python - <<'PY'
+          import datus
+
+          print(f"datus import smoke passed: {datus.__version__}")
+          PY
+          datus --version
+          datus-agent --version
+          datus-api --version
+          datus-gateway --version
+          datus bootstrap-kb --help >/dev/null
+          datus platform-doc --help >/dev/null
+          datus probe-llm --help >/dev/null
+
+      - name: Create or verify release tag
+        if: ${{ inputs.repository == 'pypi' && steps.release_version.outputs.is_prerelease != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin --tags
+
+          release_sha="$(git rev-parse HEAD)"
+          if git rev-parse --verify --quiet "refs/tags/${TAG_NAME}" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "${TAG_NAME}")"
+            if [[ "${tag_sha}" != "${release_sha}" ]]; then
+              echo "::error::Tag ${TAG_NAME} already points to ${tag_sha}, expected ${release_sha}"
+              exit 1
+            fi
+            echo "Tag ${TAG_NAME} already points to the release commit"
+          else
+            git tag -a "${TAG_NAME}" -m "datus-agent ${VERSION}"
+            git push origin "${TAG_NAME}"
+          fi
+
+      - name: Dispatch docs deploy
+        if: ${{ inputs.repository == 'pypi' && steps.release_version.outputs.is_prerelease != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run deploy-docs.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f version="${TAG_NAME}"
+
+      - name: Create or update main metadata sync PR
+        if: ${{ inputs.repository == 'pypi' && inputs.create_main_metadata_pr && steps.release_version.outputs.is_prerelease != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ steps.source.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin --prune main
+
+          sync_branch="sync/release-${VERSION}-metadata-to-main"
+          merged_tree="$(git merge-tree --write-tree origin/main "${SOURCE_SHA}" | sed -n '1p')"
+          existing_sync_sha="$(git ls-remote --heads origin "${sync_branch}" | awk '{print $1}')"
+          if [[ -n "${existing_sync_sha}" ]]; then
+            git fetch origin "refs/heads/${sync_branch}:refs/remotes/origin/${sync_branch}"
+          fi
+
+          git checkout -B "${sync_branch}" origin/main
+          git checkout "${merged_tree}" -- pyproject.toml requirements.txt requirements-test.txt uv.lock
+          if git diff --cached --quiet -- pyproject.toml requirements.txt requirements-test.txt uv.lock; then
+            echo "Main already has release ${VERSION} metadata"
+            exit 0
+          fi
+
+          git add pyproject.toml requirements.txt requirements-test.txt uv.lock
+          git commit -m "chore: sync main release metadata to ${VERSION}"
+          if [[ -n "${existing_sync_sha}" ]]; then
+            git push \
+              --force-with-lease="refs/heads/${sync_branch}:${existing_sync_sha}" \
+              --set-upstream origin "${sync_branch}"
+          else
+            git push --set-upstream origin "${sync_branch}"
+          fi
+
+          title="[Tool] Sync main release metadata to ${VERSION}"
+          body_file="$(mktemp)"
+          cat > "${body_file}" <<EOF
+          ## Summary
+
+          Sync main release metadata after publishing datus-agent ${VERSION}.
+
+          ## Changes
+
+          - merge release source metadata from ${SOURCE_SHA} onto the latest main branch
+          - update pyproject.toml, requirements.txt, requirements-test.txt, and uv.lock on main
+
+          ## Validation
+
+          - generated by the Publish And Finalize Release workflow after PyPI visibility and package smoke checks
+          EOF
+
+          if gh pr view "${sync_branch}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh pr edit "${sync_branch}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --body-file "${body_file}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${sync_branch}" \
+              --title "${title}" \
+              --body-file "${body_file}"
+          fi
+
+      - name: Record release summary
+        shell: bash
+        env:
+          IS_PRERELEASE: ${{ steps.release_version.outputs.is_prerelease }}
+        run: |
+          {
+            echo "### Release"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Prerelease: \`${IS_PRERELEASE}\`"
+            echo "- Repository: \`${TARGET_REPOSITORY}\`"
+            echo "- Source ref: \`${RELEASE_REF}\`"
+            echo "- Source SHA: \`${{ steps.source.outputs.release_sha }}\`"
+            if [[ "${TARGET_REPOSITORY}" == "pypi" && "${IS_PRERELEASE}" != "true" ]]; then
+              echo "- Tag: \`${TAG_NAME}\`"
+              echo "- Docs deploy: dispatched for \`${TAG_NAME}\`"
+              echo "- Main metadata sync: requested = \`${{ inputs.create_main_metadata_pr }}\`"
+            elif [[ "${TARGET_REPOSITORY}" == "pypi" ]]; then
+              echo "- Tag/docs/main metadata sync: skipped for prerelease"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

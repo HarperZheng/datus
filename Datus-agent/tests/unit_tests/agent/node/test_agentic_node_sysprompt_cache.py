@@ -1,0 +1,841 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Unit tests for the per-session system-prompt snapshot cache.
+
+Covers:
+- ``_get_session_system_prompt``: build-once / replay-verbatim across turns and
+  node instances, rebuild on a meta change (model switch), no caching without a
+  session id.
+- ``_system_prompt_snapshot_meta``: identity keys exclude per-turn live values
+  (datasource, profile, date) but DO include the response language and bound
+  database skill, which can change between Chat API requests.
+- ``_build_datasource_reminder``: live per-turn datasource + dialect line for
+  the user-message ``<system_reminder>`` envelope; never mentions the
+  permission profile.
+- ``_inject_runtime_context``: renders date-only shared runtime context
+  WITHOUT requiring a DB tool.
+- ``_inject_datasource_runtime_context``: renders datasource catalog +
+  workspace root only for DB-tool-capable nodes and WITHOUT the current
+  datasource selection.
+- Template hygiene: the active node templates no longer inline the per-turn
+  volatile variables.
+
+A lightweight fake node bypasses the heavy ``AgenticNode.__init__`` and wires a
+real :class:`SessionManager` over ``tmp_path`` — no LLM, no network.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Optional
+
+import pytest
+
+from datus.agent.node.agentic_node import AgenticNode
+from datus.models.session_manager import SessionManager
+from datus.tools.db_tools import ConnectorRegistry
+from datus.tools.db_tools.config import DuckDBConfig, SQLiteConfig
+from datus.tools.func_tool.database import DBFuncTool
+from datus.tools.skill_tools.skill_config import SkillConfig
+from datus.tools.skill_tools.skill_manager import SkillManager
+from datus.utils.constants import DBType
+from datus.utils.exceptions import DatusException, ErrorCode
+
+TEMPLATE_DIR = Path(__file__).resolve().parents[4] / "datus" / "prompts" / "prompt_templates"
+ACTIVE_TEMPLATES = [
+    "chat_system_1.2.j2",
+    "gen_sql_system_1.2.j2",
+    "explore_system_1.0.j2",
+    "gen_report_system_1.0.j2",
+    "ask_metrics_system_1.0.j2",
+]
+# Deliverable templates never inlined the datasource selection; they are held
+# to the same no-volatile-variables bar but don't point to <system_reminder>.
+DELIVERABLE_TEMPLATES = [
+    "gen_table_system_1.0.j2",
+    "gen_dashboard_system_1.0.j2",
+    "gen_job_system_1.0.j2",
+    "scheduler_system_1.0.j2",
+]
+
+
+def _agent_config(*, current_datasource=None, services=None, model="gpt-4.1", language=None):
+    return SimpleNamespace(
+        prompt_version="1.2",
+        language=language,
+        current_datasource=current_datasource,
+        services=services,
+        active_model=lambda: SimpleNamespace(type="openai", model=model),
+    )
+
+
+class _SnapshotNode(AgenticNode):
+    """Minimal node exposing the real snapshot/reminder/runtime-context methods."""
+
+    def __init__(self, session_manager: SessionManager, agent_config, *, db_func_tool=None, node_config=None):
+        self.session_id = "chat_session_x"
+        self._session_manager = session_manager
+        self.agent_config = agent_config
+        # Real nodes get this from ``AgenticNode.__init__``, which this fake
+        # skips; the snapshot identity reads it to resolve the template name.
+        self.node_config = node_config if node_config is not None else {}
+        self.db_func_tool = db_func_tool
+        self.build_count = 0
+        self.lazy_mount_count = 0
+        # Lazy-tool wiring runs on the cache-hit path too; give the ensure
+        # methods the attributes they gate on (all "nothing to mount" here).
+        self.skill_func_tool = None
+        self.bash_tool = None
+        self.memory_func_tool = None
+        self._is_subagent = True
+        self._node_model_name = None
+
+    def _ensure_lazy_tools_mounted(self) -> None:
+        self.lazy_mount_count += 1
+        super()._ensure_lazy_tools_mounted()
+
+    def get_node_name(self) -> str:
+        return "chat"
+
+    def _resolve_workspace_root(self) -> str:
+        return "/tmp/ws"
+
+    def _get_system_prompt(
+        self,
+        prompt_version: Optional[str] = None,
+        template_context: Optional[dict] = None,
+    ) -> str:
+        # Each rebuild is observable and uniquely tagged so replay vs rebuild
+        # is unambiguous in assertions.
+        self.build_count += 1
+        return f"SYS#{self.build_count}"
+
+
+@pytest.fixture
+def session_manager(tmp_path):
+    manager = SessionManager(session_dir=str(tmp_path))
+    yield manager
+    manager.close_all_sessions()
+
+
+class TestGetSessionSystemPrompt:
+    def test_first_turn_builds_and_persists(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config())
+        prompt = node._get_session_system_prompt(prompt_version="1.2")
+        assert prompt == "SYS#1"
+        assert node.build_count == 1
+        # Snapshot file now persists the exact prompt for replay.
+        snapshot = session_manager.load_system_prompt_snapshot(node.session_id)
+        assert snapshot["prompt"] == "SYS#1"
+        assert snapshot["model_name"] == "openai:gpt-4.1"
+
+    def test_second_turn_replays_verbatim(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config())
+        first = node._get_session_system_prompt(prompt_version="1.2")
+        second = node._get_session_system_prompt(prompt_version="1.2")
+        assert first == second == "SYS#1"
+        # The expensive builder ran exactly once across both turns.
+        assert node.build_count == 1
+
+    def test_new_node_instance_replays_snapshot(self, session_manager):
+        """API per-request nodes and /resume reuse the snapshot of the session."""
+        node1 = _SnapshotNode(session_manager, _agent_config())
+        first = node1._get_session_system_prompt(prompt_version="1.2")
+
+        node2 = _SnapshotNode(session_manager, _agent_config())
+        node2.session_id = node1.session_id
+        second = node2._get_session_system_prompt(prompt_version="1.2")
+
+        assert second == first == "SYS#1"
+        assert node2.build_count == 0
+
+    def test_model_switch_rebuilds(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config(model="gpt-4.1"))
+        first = node._get_session_system_prompt(prompt_version="1.2")
+        assert first == "SYS#1"
+        # Switch model → meta mismatch → rebuild and overwrite.
+        node.agent_config = _agent_config(model="gpt-5")
+        second = node._get_session_system_prompt(prompt_version="1.2")
+        assert second == "SYS#2"
+        assert node.build_count == 2
+        # The overwritten snapshot now replays for the new model.
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#2"
+        assert node.build_count == 2
+
+    def test_prompt_version_change_rebuilds(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config())
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#1"
+        assert node._get_session_system_prompt(prompt_version="1.3") == "SYS#2"
+
+    def test_no_session_id_skips_cache(self, session_manager, tmp_path):
+        node = _SnapshotNode(session_manager, _agent_config())
+        node.session_id = ""
+        node._get_session_system_prompt(prompt_version="1.2")
+        node._get_session_system_prompt(prompt_version="1.2")
+        # Without a session id there is no snapshot to replay → always rebuilds,
+        # and nothing is written to disk.
+        assert node.build_count == 2
+        assert list(tmp_path.glob("*.sysprompt.json")) == []
+
+    def test_datasource_switch_does_not_rebuild(self, session_manager):
+        """Without DB tools, datasource changes do not affect the system prompt."""
+        node = _SnapshotNode(session_manager, _agent_config(current_datasource="main"))
+        node._get_session_system_prompt(prompt_version="1.2")
+        node.agent_config = _agent_config(current_datasource="dev")
+        node._get_session_system_prompt(prompt_version="1.2")
+        assert node.build_count == 1
+
+    def test_cache_hit_mounts_lazy_tools(self, session_manager):
+        """A replayed prompt advertises skill/bash/memory tools — the hit path
+        must run the (skipped) build's tool-mounting side effect."""
+        node1 = _SnapshotNode(session_manager, _agent_config())
+        node1._get_session_system_prompt(prompt_version="1.2")
+
+        # Fresh instance resuming the session: pure cache hit, no build.
+        node2 = _SnapshotNode(session_manager, _agent_config())
+        node2.session_id = node1.session_id
+        node2._get_session_system_prompt(prompt_version="1.2")
+        assert node2.build_count == 0
+        assert node2.lazy_mount_count == 1
+
+    def test_language_switch_rebuilds(self, session_manager):
+        """``language`` is a per-request Chat API field: a user switching the UI
+        language mid-session must not keep replaying the old directive."""
+        node = _SnapshotNode(session_manager, _agent_config(language="en"))
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#1"
+        node.agent_config = _agent_config(language="zh-CN")
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#2"
+        # The rebuilt snapshot replays for the new language.
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#2"
+        assert node.build_count == 2
+
+    def test_same_language_replays(self, session_manager):
+        """The common case — every request carries the same code — stays a hit."""
+        node = _SnapshotNode(session_manager, _agent_config(language="zh-CN"))
+        node._get_session_system_prompt(prompt_version="1.2")
+        node.agent_config = _agent_config(language="zh-CN")
+        node._get_session_system_prompt(prompt_version="1.2")
+        assert node.build_count == 1
+
+    def test_node_model_override_switch_rebuilds(self, session_manager):
+        """A node-level model override change must invalidate the snapshot."""
+        node = _SnapshotNode(session_manager, _agent_config())
+        node._node_model_name = "gpt-5-mini"
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#1"
+        node._node_model_name = "gpt-5"
+        assert node._get_session_system_prompt(prompt_version="1.2") == "SYS#2"
+        assert node.build_count == 2
+
+
+class _DialectSnapshotNode(_SnapshotNode):
+    """Exercise real skill injection through the existing snapshot test node."""
+
+    REQUIRED_SKILLS = "snapshot-guide"
+
+    def __init__(self, session_manager, agent_config, skill_manager, *, db_func_tool=None):
+        super().__init__(session_manager, agent_config, db_func_tool=db_func_tool)
+        self.skill_manager = skill_manager
+
+    def _get_system_prompt(self, prompt_version=None, template_context=None):
+        prompt = super()._get_system_prompt(prompt_version, template_context)
+        return self._inject_required_skills(prompt)
+
+
+@pytest.fixture
+def snapshot_skills(tmp_path):
+    skills_dir = tmp_path / "snapshot_skills"
+    for name in ("snapshot-guide", "db-sqlite-sql", "db-duckdb-sql"):
+        skill_dir = skills_dir / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} rules\n---\n\nInstructions for {name}.\n"
+        )
+    return SkillManager(config=SkillConfig(directories=[str(skills_dir)]))
+
+
+@pytest.fixture
+def snapshot_db_tools(tmp_path):
+    connectors = {
+        "sqlite_a": ConnectorRegistry.create_connector(DBType.SQLITE, SQLiteConfig(db_path=str(tmp_path / "a.sqlite"))),
+        "sqlite_b": ConnectorRegistry.create_connector(DBType.SQLITE, SQLiteConfig(db_path=str(tmp_path / "b.sqlite"))),
+        "duckdb": ConnectorRegistry.create_connector(
+            DBType.DUCKDB, DuckDBConfig(db_path=str(tmp_path / "c.duckdb"), enable_external_access=False)
+        ),
+    }
+    tools = {name: DBFuncTool(connector) for name, connector in connectors.items()}
+    yield tools
+    for connector in connectors.values():
+        connector.close()
+
+
+class TestBoundDatabaseSkillSnapshot:
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [("sqlite_a", "duckdb"), ("duckdb", "sqlite_a"), ("sqlite_a", None), (None, "sqlite_a")],
+    )
+    def test_bound_skill_change_rebuilds_snapshot(
+        self, session_manager, snapshot_skills, snapshot_db_tools, before, after
+    ):
+        cfg = _agent_config(current_datasource="sqlite_a")
+        first_node = _DialectSnapshotNode(
+            session_manager, cfg, snapshot_skills, db_func_tool=snapshot_db_tools.get(before)
+        )
+        first = first_node._get_session_system_prompt("1.2")
+        # The API creates a fresh node for each request. Keep the config selection
+        # fixed to verify that the actual bound connector determines the identity.
+        next_node = _DialectSnapshotNode(
+            session_manager, cfg, snapshot_skills, db_func_tool=snapshot_db_tools.get(after)
+        )
+        second = next_node._get_session_system_prompt("1.2")
+
+        assert next_node.build_count == 1
+        assert second != first
+        assert '<required_skill name="snapshot-guide">' in second
+        if after is None:
+            assert '<required_skill name="db-' not in second
+        else:
+            dialect = snapshot_db_tools[after].connector.get_type().value
+            assert f'<required_skill name="db-{dialect}-sql">' in second
+            other_dialect = "duckdb" if dialect == "sqlite" else "sqlite"
+            assert f'<required_skill name="db-{other_dialect}-sql">' not in second
+        snapshot = session_manager.load_system_prompt_snapshot(next_node.session_id)
+        assert snapshot["prompt"] == second
+        assert next_node._get_session_system_prompt("1.2") == second
+        assert next_node.build_count == 1
+
+    def test_same_dialect_across_datasources_reuses_snapshot(self, session_manager, snapshot_skills, snapshot_db_tools):
+        first_node = _DialectSnapshotNode(
+            session_manager,
+            _agent_config(current_datasource="sqlite_a"),
+            snapshot_skills,
+            db_func_tool=snapshot_db_tools["sqlite_a"],
+        )
+        first = first_node._get_session_system_prompt("1.2")
+        next_node = _DialectSnapshotNode(
+            session_manager,
+            _agent_config(current_datasource="sqlite_b"),
+            snapshot_skills,
+            db_func_tool=snapshot_db_tools["sqlite_b"],
+        )
+
+        assert next_node._get_session_system_prompt("1.2") == first
+        assert next_node.build_count == 0
+        assert '<required_skill name="db-sqlite-sql">' in first
+        assert '<required_skill name="db-duckdb-sql">' not in first
+
+    def test_without_db_tools_datasource_changes_reuse_prompt_without_dialect_skills(
+        self, session_manager, snapshot_skills
+    ):
+        services = SimpleNamespace(
+            datasources={"sqlite_a": SimpleNamespace(type=DBType.SQLITE), "duckdb": SimpleNamespace(type=DBType.DUCKDB)}
+        )
+        first_node = _DialectSnapshotNode(
+            session_manager, _agent_config(current_datasource="sqlite_a", services=services), snapshot_skills
+        )
+        first = first_node._get_session_system_prompt("1.2")
+        next_node = _DialectSnapshotNode(
+            session_manager, _agent_config(current_datasource="duckdb", services=services), snapshot_skills
+        )
+
+        assert next_node._get_session_system_prompt("1.2") == first
+        assert next_node.build_count == 0
+        assert '<required_skill name="db-' not in first
+        assert '<required_skill name="snapshot-guide">' in first
+
+    def test_legacy_snapshot_without_bound_skill_identity_rebuilds_once(
+        self, session_manager, snapshot_skills, snapshot_db_tools
+    ):
+        node = _DialectSnapshotNode(
+            session_manager, _agent_config(), snapshot_skills, db_func_tool=snapshot_db_tools["sqlite_a"]
+        )
+        legacy_meta = node._system_prompt_snapshot_meta("1.2")
+        legacy_meta.pop("database_skill", None)
+        session_manager.save_system_prompt_snapshot(node.session_id, "Legacy prompt", legacy_meta)
+
+        prompt = node._get_session_system_prompt("1.2")
+
+        assert prompt != "Legacy prompt"
+        assert '<required_skill name="db-sqlite-sql">' in prompt
+        assert node._get_session_system_prompt("1.2") == prompt
+        assert node.build_count == 1
+
+
+class TestSnapshotMeta:
+    def test_meta_is_exactly_the_identity_keys(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config(current_datasource="main"))
+        meta = node._system_prompt_snapshot_meta("1.2")
+        assert meta == {
+            "node_name": "chat",
+            "system_prompt_template": "chat_system",
+            "prompt_version": "1.2",
+            "model_name": "openai:gpt-4.1",
+            "language": "",
+            "database_skill": "",
+        }
+
+    def test_the_template_is_part_of_the_identity(self, session_manager):
+        """``node_name`` does not imply it any more.
+
+        The node name used to decide the template outright, so listing it was
+        enough; ``system_prompt`` decides now and can change while the node name
+        does not — a sub-agent retyped from chat to ask_metrics is the case.
+        """
+        retyped = _SnapshotNode(
+            session_manager,
+            _agent_config(current_datasource="main"),
+            node_config={"system_prompt": "ask_metrics"},
+        )
+        meta = retyped._system_prompt_snapshot_meta("1.2")
+
+        assert meta["node_name"] == "chat"
+        assert meta["system_prompt_template"] == "ask_metrics_system"
+
+    def test_a_template_name_that_resolves_to_nothing_falls_back_to_the_node(self, session_manager, monkeypatch):
+        """A host may still send an UNSANITIZED sub-agent name as ``system_prompt``.
+
+        The template on disk is named after the SANITIZED one, so any character
+        outside [A-Za-z0-9_-] makes the configured name resolve to nothing while
+        the node name resolves fine. ``/`` stands in for the whole class here;
+        a sub-agent named in Chinese is the case that prompted this.
+
+        The base used to raise here; its two subclasses have always fallen back.
+        """
+        asked = []
+
+        class _PromptManager:
+            def render_template(self, template_name, version=None, **kwargs):
+                asked.append(template_name)
+                if template_name != "chat_system":
+                    raise FileNotFoundError(template_name)
+                return "SYS"
+
+        monkeypatch.setattr("datus.agent.node.agentic_node.get_prompt_manager", lambda **_kwargs: _PromptManager())
+        node = _SnapshotNode(session_manager, _agent_config(), node_config={"system_prompt": "sales/report"})
+        node._finalize_system_prompt = lambda prompt, memory_node_name_override=None: prompt
+
+        assert AgenticNode._get_system_prompt(node) == "SYS"
+        assert asked == ["sales/report_system", "chat_system"]
+
+    def test_a_failing_fallback_render_is_still_wrapped(self, session_manager, monkeypatch):
+        """The fallback path must produce the same exception type as the main one.
+
+        It runs inside an ``except`` block, and the sibling ``except Exception``
+        of the same ``try`` cannot see what is raised there — so a Jinja error on
+        the fallback template would otherwise reach the caller raw.
+        """
+
+        class _PromptManager:
+            def render_template(self, template_name, version=None, **kwargs):
+                if template_name != "chat_system":
+                    raise FileNotFoundError(template_name)
+                raise ValueError("undefined variable in template")
+
+        monkeypatch.setattr("datus.agent.node.agentic_node.get_prompt_manager", lambda **_kwargs: _PromptManager())
+        node = _SnapshotNode(session_manager, _agent_config(), node_config={"system_prompt": "missing"})
+
+        with pytest.raises(DatusException) as excinfo:
+            AgenticNode._get_system_prompt(node)
+        assert excinfo.value.code is ErrorCode.COMMON_CONFIG_ERROR
+
+    def test_the_node_name_is_the_fallback(self, session_manager):
+        """Unchanged for the CLI, which names its nodes after the template."""
+        node = _SnapshotNode(session_manager, _agent_config())
+        assert node._system_prompt_template_name() == "chat_system"
+
+    def test_a_retyped_sub_agent_rebuilds_rather_than_replaying(self, session_manager):
+        """The whole point of carrying it: the snapshot must not survive."""
+        cfg = _agent_config()
+        before = _SnapshotNode(session_manager, cfg)
+        assert before._get_session_system_prompt("1.2") == "SYS#1"
+        # Same session id, same node name, different template.
+        after = _SnapshotNode(session_manager, cfg, node_config={"system_prompt": "ask_metrics"})
+
+        assert after._get_session_system_prompt("1.2") == "SYS#1"
+        assert after.build_count == 1, "the stale snapshot was replayed instead of rebuilt"
+
+    def test_meta_falls_back_to_agent_config_version(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config())
+        meta = node._system_prompt_snapshot_meta(None)
+        assert meta["prompt_version"] == "1.2"
+
+    def test_meta_survives_broken_model_resolution(self, session_manager):
+        def boom():
+            raise RuntimeError("no model configured")
+
+        cfg = _agent_config()
+        cfg.active_model = boom
+        node = _SnapshotNode(session_manager, cfg)
+        meta = node._system_prompt_snapshot_meta("1.2")
+        assert meta["model_name"] == ""
+
+    def test_meta_normalizes_language(self, session_manager):
+        """Unset and whitespace-only both collapse to the same identity, so a
+        blank per-request override never spuriously invalidates the snapshot."""
+        assert _SnapshotNode(session_manager, _agent_config())._system_prompt_snapshot_meta("1.2")["language"] == ""
+        node = _SnapshotNode(session_manager, _agent_config(language="  "))
+        assert node._system_prompt_snapshot_meta("1.2")["language"] == ""
+        node = _SnapshotNode(session_manager, _agent_config(language=" zh-CN "))
+        assert node._system_prompt_snapshot_meta("1.2")["language"] == "zh-CN"
+
+    def test_meta_prefers_node_model_override(self, session_manager):
+        """``node_config.model`` pins the effective model — it is the identity,
+        not the agent-level target."""
+        node = _SnapshotNode(session_manager, _agent_config(model="gpt-4.1"))
+        node._node_model_name = "gpt-5-mini"
+        meta = node._system_prompt_snapshot_meta("1.2")
+        assert meta["model_name"] == "node:gpt-5-mini"
+
+
+class TestDatasourceReminder:
+    def test_requires_db_tool(self, session_manager):
+        cfg = _agent_config(current_datasource="main")
+        without = _SnapshotNode(session_manager, cfg, db_func_tool=None)
+        assert without._build_datasource_reminder() == ""
+
+        with_db = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        line = with_db._build_datasource_reminder()
+        assert "Current datasource: main" in line
+        assert "authoritative" in line
+
+    def test_dialect_included_when_available(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        line = node._build_datasource_reminder()
+        assert "Current datasource: main (dialect: snowflake)" in line
+        assert "generate SQL for THIS dialect" in line
+
+    def test_empty_without_current_datasource(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config(current_datasource=None), db_func_tool=object())
+        assert node._build_datasource_reminder() == ""
+
+    def test_never_mentions_permission_profile(self, session_manager):
+        """The profile is enforced by permission hooks, never prompted."""
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="duckdb")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        cfg.active_profile_name = "dangerous"
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        line = node._build_datasource_reminder()
+        assert "profile" not in line.lower()
+        assert "dangerous" not in line
+
+    def test_merges_catalog_database_schema_details(self, session_manager):
+        """The reminder absorbs the legacy Database Context fields in one line."""
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        db_tool = SimpleNamespace(connector=SimpleNamespace(database_name="proddb"))
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=db_tool)
+
+        user_input = SimpleNamespace(catalog="c1", database="", db_schema="s1")
+        line = node._build_datasource_reminder(user_input)
+
+        assert "Current datasource: main (dialect: snowflake, catalog: c1, database: proddb, schema: s1)" in line
+
+    def test_explicit_database_overrides_connector_default(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="duckdb")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        db_tool = SimpleNamespace(connector=SimpleNamespace(database_name="default_db"))
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=db_tool)
+
+        user_input = SimpleNamespace(database="explicit_db")
+        line = node._build_datasource_reminder(user_input)
+
+        assert "database: explicit_db" in line
+        assert "default_db" not in line
+
+    def test_connector_sql_generation_context_is_included(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="dws")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        requested_databases = []
+
+        class Connector:
+            database_name = "customer_db"
+
+            def get_sql_generation_context(self, database_name=""):
+                requested_databases.append(database_name)
+                return {"compatibility_mode": "TD"}
+
+        node = _SnapshotNode(
+            session_manager,
+            cfg,
+            db_func_tool=SimpleNamespace(connector=Connector()),
+        )
+
+        line = node._build_datasource_reminder(SimpleNamespace(db_schema="test"))
+
+        assert (
+            "Current datasource: main "
+            "(dialect: dws, database: customer_db, compatibility mode: TD, schema: test)" in line
+        )
+        assert requested_databases == ["customer_db"]
+
+    def test_connector_sql_generation_context_ignores_whitespace_mode(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="dws")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        requested_databases = []
+
+        class Connector:
+            database_name = "customer_db"
+
+            def get_sql_generation_context(self, database_name=""):
+                requested_databases.append(database_name)
+                return {"compatibility_mode": "   "}
+
+        node = _SnapshotNode(
+            session_manager,
+            cfg,
+            db_func_tool=SimpleNamespace(connector=Connector()),
+        )
+
+        line = node._build_datasource_reminder(SimpleNamespace(db_schema="test"))
+
+        assert "Current datasource: main (dialect: dws, database: customer_db, schema: test)" in line
+        assert "compatibility mode:" not in line
+        assert requested_databases == ["customer_db"]
+
+    def test_connector_sql_generation_context_failure_is_non_blocking(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="dws")})
+        cfg = _agent_config(current_datasource="main", services=services)
+
+        class Connector:
+            database_name = "customer_db"
+
+            def get_sql_generation_context(self, database_name=""):
+                raise RuntimeError("catalog unavailable")
+
+        node = _SnapshotNode(
+            session_manager,
+            cfg,
+            db_func_tool=SimpleNamespace(connector=Connector()),
+        )
+
+        line = node._build_datasource_reminder()
+
+        assert "Current datasource: main (dialect: dws, database: customer_db)" in line
+        assert "compatibility mode" not in line
+
+    def test_connector_sql_generation_context_tracks_datasource_switch(self, session_manager):
+        services = SimpleNamespace(
+            datasources={
+                "warehouse_td": SimpleNamespace(type="dws"),
+                "warehouse_ora": SimpleNamespace(type="dws"),
+            }
+        )
+        cfg = _agent_config(current_datasource="warehouse_td", services=services)
+
+        def connector(database_name, compatibility_mode):
+            return SimpleNamespace(
+                database_name=database_name,
+                get_sql_generation_context=lambda **_kwargs: {"compatibility_mode": compatibility_mode},
+            )
+
+        db_tool = SimpleNamespace(connector=connector("sales_td", "TD"))
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=db_tool)
+
+        assert "database: sales_td, compatibility mode: TD" in node._build_datasource_reminder()
+
+        cfg.current_datasource = "warehouse_ora"
+        db_tool.connector = connector("sales_ora", "ORA")
+
+        switched = node._build_datasource_reminder()
+        assert "Current datasource: warehouse_ora" in switched
+        assert "database: sales_ora, compatibility mode: ORA" in switched
+        assert "TD" not in switched
+
+    def test_enhanced_message_carries_reminder_in_envelope(self, session_manager):
+        """The reminder rides inside the existing <system_reminder> envelope."""
+        from datus.utils.message_utils import extract_enhanced_context, extract_user_input
+
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        node.plan_mode_active = False
+        node._plan_just_confirmed = False
+        node.plan_file_path = None
+
+        user_input = SimpleNamespace(user_message="show me revenue", plan_mode=False)
+        message = node._build_enhanced_message(user_input)
+
+        enhanced = extract_enhanced_context(message)
+        assert "Current datasource: main (dialect: snowflake)" in enhanced
+        assert extract_user_input(message) == "show me revenue"
+        # Merged design: the dialect value is stated exactly once — no
+        # separate legacy "Database Context" block when the reminder is present.
+        assert "Database Context" not in enhanced
+        assert enhanced.lower().count("dialect:") == 1
+
+    def test_legacy_database_context_when_reminder_absent(self, session_manager):
+        """Nodes without a DB tool keep the legacy Database Context block."""
+        from datus.utils.message_utils import extract_enhanced_context
+
+        cfg = _agent_config(current_datasource="main")
+        cfg.db_type = "sqlite"
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=None)
+        node.plan_mode_active = False
+        node._plan_just_confirmed = False
+        node.plan_file_path = None
+
+        user_input = SimpleNamespace(user_message="hello", plan_mode=False, database="db1")
+        message = node._build_enhanced_message(user_input)
+
+        enhanced = extract_enhanced_context(message)
+        assert "Database Context" in enhanced
+        assert "**Dialect**: sqlite" in enhanced
+        assert "Current datasource:" not in enhanced
+
+
+class TestInjectRuntimeContext:
+    def test_appends_date_without_db_tool(self, session_manager):
+        node = _SnapshotNode(session_manager, _agent_config(), db_func_tool=None)
+        out = node._inject_runtime_context("BASE")
+        assert out.startswith("BASE")
+        assert "Current context:" in out
+        assert re.search(r"Current date: \d{4}-\d{2}-\d{2}", out)
+        assert "Available datasources:" not in out
+        assert "Current sql files root directory:" not in out
+
+    def test_runtime_context_render_failure_returns_base_prompt(self, session_manager, monkeypatch):
+        from datus.agent.node import agentic_node as agentic_node_module
+
+        calls = []
+
+        class RaisingPromptManager:
+            def render_template(self, **kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("template unavailable")
+
+        monkeypatch.setattr(
+            agentic_node_module,
+            "get_prompt_manager",
+            lambda **_: RaisingPromptManager(),
+        )
+
+        node = _SnapshotNode(session_manager, _agent_config(), db_func_tool=None)
+        node._runtime_context_current_date = lambda: "2024-06-15"
+
+        assert node._inject_runtime_context("BASE") == "BASE"
+        assert calls == [
+            {
+                "template_name": "runtime_context",
+                "version": None,
+                "current_date": "2024-06-15",
+            }
+        ]
+
+    def test_skips_datasource_runtime_context_without_db_tool(self, session_manager):
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=None)
+        assert node._inject_datasource_runtime_context("BASE") == "BASE"
+
+    def test_appends_datasource_catalog_and_workspace_for_db_tool(self, session_manager):
+        services = SimpleNamespace(
+            datasources={"main": SimpleNamespace(type="snowflake"), "dev": SimpleNamespace(type="duckdb")}
+        )
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        out = node._inject_datasource_runtime_context("BASE")
+        assert out.startswith("BASE")
+        assert "Datasource context:" in out
+        assert "Current date:" not in out
+        assert "Available datasources:" in out
+        assert "main (snowflake)" in out
+        assert "dev (duckdb)" in out
+        assert "/tmp/ws" in out
+
+    def test_datasource_runtime_context_render_failure_returns_base_prompt(self, session_manager, monkeypatch):
+        from datus.agent.node import agentic_node as agentic_node_module
+
+        calls = []
+
+        class RaisingPromptManager:
+            def render_template(self, **kwargs):
+                calls.append(kwargs)
+                raise RuntimeError("template unavailable")
+
+        monkeypatch.setattr(
+            agentic_node_module,
+            "get_prompt_manager",
+            lambda **_: RaisingPromptManager(),
+        )
+
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+
+        assert node._inject_datasource_runtime_context("BASE") == "BASE"
+        assert calls == [
+            {
+                "template_name": "datasource_runtime_context",
+                "version": None,
+                "available_datasources": {"main": "snowflake"},
+                "workspace_root": "/tmp/ws",
+            }
+        ]
+
+    def test_does_not_pin_current_datasource_selection(self, session_manager):
+        """The frozen prompt lists the catalog but never the live selection."""
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="snowflake")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=object())
+        out = node._inject_datasource_runtime_context("BASE")
+        assert "Current datasource:" not in out
+
+    def test_runtime_context_date_hook_is_overridable(self, session_manager):
+        """Subclasses (GenSQL/AskMetrics) pin a reference date into the snapshot."""
+        services = SimpleNamespace(datasources={"main": SimpleNamespace(type="duckdb")})
+        cfg = _agent_config(current_datasource="main", services=services)
+        node = _SnapshotNode(session_manager, cfg, db_func_tool=None)
+        node._runtime_context_current_date = lambda: "1999-12-31"
+        out = node._inject_runtime_context("BASE")
+        assert "Current date: 1999-12-31" in out
+
+
+class TestReferenceDateOverrides:
+    def test_gen_sql_uses_date_parsing_reference_date(self):
+        from datus.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+        node = GenSQLAgenticNode.__new__(GenSQLAgenticNode)
+        node.date_parsing_tools = SimpleNamespace(reference_date="2024-06-15")
+        assert node._runtime_context_current_date() == "2024-06-15"
+
+    def test_ask_metrics_uses_input_reference_date(self):
+        from datus.agent.node.ask_metrics_agentic_node import AskMetricsAgenticNode
+
+        node = AskMetricsAgenticNode.__new__(AskMetricsAgenticNode)
+        node.input = SimpleNamespace(reference_date="2024-06-15")
+        assert node._runtime_context_current_date() == "2024-06-15"
+
+
+class TestTemplateHygiene:
+    """The active templates must not inline per-turn volatile variables."""
+
+    @pytest.mark.parametrize("template", ACTIVE_TEMPLATES + DELIVERABLE_TEMPLATES)
+    def test_no_inline_volatile_variables(self, template):
+        source = (TEMPLATE_DIR / template).read_text(encoding="utf-8")
+        assert "{{ current_date }}" not in source
+        assert "{{ active_profile }}" not in source
+        assert "Current datasource: {{ datasource }}" not in source
+
+    @pytest.mark.parametrize("template", ACTIVE_TEMPLATES)
+    def test_points_to_system_reminder(self, template):
+        source = (TEMPLATE_DIR / template).read_text(encoding="utf-8")
+        assert "<system_reminder>" in source
+
+    def test_runtime_context_partial_has_no_current_selection(self):
+        source = (TEMPLATE_DIR / "runtime_context_1.0.j2").read_text(encoding="utf-8")
+        assert "{{ current_date }}" in source
+        assert "available_datasources" not in source
+        assert "workspace_root" not in source
+        assert "Current datasource: {{ datasource }}" not in source
+
+    def test_datasource_runtime_context_partial_has_no_current_selection(self):
+        source = (TEMPLATE_DIR / "datasource_runtime_context_1.0.j2").read_text(encoding="utf-8")
+        assert "{{ current_date }}" not in source
+        assert "available_datasources" in source
+        assert "workspace_root" in source
+        assert "Current datasource: {{ datasource }}" not in source

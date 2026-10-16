@@ -1,0 +1,653 @@
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from datus.agent.node import Node
+from datus.agent.plan import generate_workflow
+from datus.agent.workflow import Workflow
+from datus.configuration.node_type import NodeType
+from datus.schemas.base import BaseResult
+from datus.schemas.node_models import SQLContext, SqlTask
+from datus.utils.exceptions import DatusException
+
+
+class TestWorkflowNode:
+    """Test suite for the Node class."""
+
+    def test_node_initialization(self):
+        """Test that a Node initializes with the correct attributes."""
+        node = Node.new_instance(
+            node_id="test_node",
+            description="Test node",
+            node_type=NodeType.TYPE_GEN_SQL,
+            input_data=None,
+        )
+
+        assert node.id == "test_node"
+        assert node.description == "Test node"
+        assert node.type == NodeType.TYPE_GEN_SQL
+        assert node.input is None
+        assert node.status == "pending"
+        assert node.result is None
+        assert node.start_time is None
+        assert node.end_time is None
+        assert node.dependencies == []
+        assert node.metadata == {}
+
+    def test_node_state_transitions(self):
+        """Test node state transitions (start, complete, fail)."""
+        from datus.schemas.node_models import BaseResult
+
+        node = Node.new_instance("test_node", "Test node", NodeType.TYPE_GEN_SQL)
+
+        # Test start transition
+        node.start()
+        assert node.status == "running"
+        assert isinstance(node.start_time, float)
+
+        # Test complete transition
+        result = BaseResult(success=True)
+        node.complete(result)
+        assert node.status == "completed"
+        assert node.result == result
+        assert isinstance(node.end_time, float)
+
+        # Test fail transition
+        node = Node.new_instance("test_node", "Test node", NodeType.TYPE_GEN_SQL)
+        error_msg = "Test error"
+        node.fail(error_msg)
+        assert node.status == "failed"
+        assert node.result.success is False
+        assert node.result.error == error_msg
+        assert isinstance(node.end_time, float)
+
+    def test_node_dependencies(self):
+        """Test adding dependencies to a node."""
+        node = Node.new_instance("test_node", "Test node", NodeType.TYPE_GEN_SQL)
+
+        # Test adding dependencies
+        node.add_dependency("dep_1")
+        node.add_dependency("dep_2")
+        assert "dep_1" in node.dependencies
+        assert "dep_2" in node.dependencies
+
+        # Test duplicate dependency
+        node.add_dependency("dep_1")
+        assert len(node.dependencies) == 2
+
+    def test_node_to_dict(self):
+        """Test converting a node to dictionary representation."""
+        node = Node.new_instance(
+            node_id="test_node",
+            description="Test node",
+            node_type=NodeType.TYPE_GEN_SQL,
+            input_data=None,
+        )
+
+        node_dict = node.to_dict()
+        assert node_dict["id"] == "test_node"
+        assert node_dict["description"] == "Test node"
+        assert node_dict["type"] == NodeType.TYPE_GEN_SQL
+        assert node_dict["status"] == "pending"
+        assert node_dict["result"] is None
+        assert node_dict["dependencies"] == []
+        assert node_dict["metadata"] == {}
+
+    def test_control_node_types(self):
+        """Test initialization of different control node types."""
+        # Test HITL node type
+        hitl_node = Node.new_instance(
+            node_id="hitl_node",
+            description="HITL node",
+            node_type=NodeType.TYPE_HITL,
+            input_data=None,
+        )
+        assert hitl_node.type == NodeType.TYPE_HITL
+
+        # Test subworkflow node type
+        subworkflow_node = Node.new_instance(
+            node_id="subworkflow_node",
+            description="Subworkflow node",
+            node_type=NodeType.TYPE_SUBWORKFLOW,
+            input_data=None,
+        )
+        assert subworkflow_node.type == NodeType.TYPE_SUBWORKFLOW
+
+    def test_node_run_failure(self):
+        """Test node run failure scenarios."""
+        import pytest
+
+        # Test failure when node type is invalid - should raise ValueError during creation
+        with pytest.raises(ValueError, match="Invalid node type"):
+            Node.new_instance(
+                node_id="invalid_node",
+                description="Invalid node",
+                node_type="invalid_type",
+                input_data=None,
+            )
+
+
+class TestWorkflow:
+    """Test suite for the Workflow class."""
+
+    def test_init_tools_uses_task_datasource_not_database_name(self, monkeypatch, real_agent_config):
+        captured = {}
+
+        def fake_db_function_tools(agent_config, database_name="", sub_agent_name=None, *, datasource=""):
+            captured["datasource"] = datasource
+            return []
+
+        monkeypatch.setattr("datus.tools.func_tool.db_function_tools", fake_db_function_tools)
+        Workflow(
+            name="test_workflow",
+            task=SqlTask(task="query", datasource="starrocks", database_name="analytics"),
+            agent_config=real_agent_config,
+        )
+
+        assert captured["datasource"] == "starrocks"
+
+    def test_create_default_workflow(self, real_agent_config):
+        """Test the default workflow creation with core nodes using plan._create_default_workflow."""
+
+        # Initialize with specified parameters
+        task_text = (
+            "Calculate the total annual revenue from 1992 to 1997 for each "
+            "combination of customer city and supplier city, where the customer is "
+            "located in the U.S. cities 'UNITED KI1' or 'UNITED KI5', "
+            "and the supplier is also located in these two cities. "
+            "The results should be sorted in ascending order by year and, "
+            "within each year, in descending order by revenue."
+        )
+
+        # Create workflow using plan.py's method
+        task = SqlTask(task=task_text)
+        workflow = generate_workflow(task, "fixed", agent_config=real_agent_config)
+
+        # Verify core nodes exist
+        expected_nodes = [
+            ("node_0", "Beginning of the workflow", NodeType.TYPE_BEGIN),
+            ("node_1", "Understand the query and find related schemas", NodeType.TYPE_SCHEMA_LINKING),
+            ("node_2", "SQL generation with conversational AI and tool calling", NodeType.TYPE_GEN_SQL),
+            ("node_3", "Execute SQL query", NodeType.TYPE_EXECUTE_SQL),
+            ("node_4", "Return the results to the user", NodeType.TYPE_OUTPUT),
+        ]
+
+        # Check node properties
+        for node_id, description, node_type in expected_nodes:
+            node = workflow.get_node(node_id)
+            assert node.id == node_id
+            assert node.description == description
+            assert node.type == node_type
+
+        # Verify workflow metadata
+        assert workflow.status == "pending"
+        assert workflow.current_node_index == 0
+        assert len(workflow.nodes) == 5
+
+        # workflow.save(self.WORKFLOW_SAVE_PATH)
+
+    # def test_e2e_workflow(self):
+    #    """Test the end-to-end workflow execution."""
+    #    # Initialize with specified parameters
+    #    task = "Calculate the total annual revenue from 1992 to 1997 for each combination of
+    #    customer city and supplier city, where the customer is located in the U.S.
+    #    cities 'UNITED KI1' or 'UNITED KI5', and the supplier is also located in these two cities.
+    #    The results should be sorted in ascending order by year and,
+    #    within each year, in descending order by revenue."
+    #
+    #    # Create workflow using plan.py's method
+    #    workflow = Workflow("nl2sql_workflow", "Test a e2e workflow")
+    #    nodes = _create_default_workflow(task)
+    #    for node in nodes:
+    #        workflow.add_node(node)
+
+    def test_workflow_save_load(self, tmp_path, real_agent_config):
+        """Test saving and loading a workflow with multiple nodes."""
+        # Create a workflow with multiple nodes
+        workflow = Workflow(
+            name="test_workflow", task=SqlTask(task="Test workflow save/load"), agent_config=real_agent_config
+        )
+
+        node1 = Node.new_instance(
+            node_id="node1",
+            description="First node",
+            node_type=NodeType.TYPE_GEN_SQL,
+            input_data=None,
+        )
+
+        node2 = Node.new_instance(
+            node_id="node2",
+            description="Second node",
+            node_type=NodeType.TYPE_EXECUTE_SQL,
+            input_data=None,
+        )
+
+        workflow.add_node(node1)
+        workflow.add_node(node2)
+        workflow.move_node("node2", 0)
+        workflow.status = "running"
+        workflow.current_node_index = 1
+        workflow.metadata = {"test_key": "test_value"}
+
+        # Save workflow to temporary file
+        save_path = tmp_path / "test_workflow.yaml"
+        # save_path = "./tests/test_workflow.yaml"
+        workflow.save(str(save_path))
+
+        # Load workflow from file
+        loaded_workflow = Workflow.load(str(save_path), agent_config=real_agent_config)
+
+        # Verify all properties are correctly restored
+        assert loaded_workflow.name == "test_workflow"
+        assert loaded_workflow.task.task == "Test workflow save/load"
+        assert loaded_workflow.status == "running"
+        assert loaded_workflow.current_node_index == 1
+        assert loaded_workflow.metadata == {"test_key": "test_value"}
+
+        # Verify nodes are correctly restored
+        assert len(loaded_workflow.nodes) == 2
+        assert "node1" in loaded_workflow.nodes
+        assert "node2" in loaded_workflow.nodes
+        assert loaded_workflow.node_order == ["node2", "node1"]
+
+        # Verify node properties
+        loaded_node1 = loaded_workflow.nodes["node1"]
+        assert loaded_node1.description == "First node"
+        assert loaded_node1.type == NodeType.TYPE_GEN_SQL
+
+        loaded_node2 = loaded_workflow.nodes["node2"]
+        assert loaded_node2.description == "Second node"
+        assert loaded_node2.type == NodeType.TYPE_EXECUTE_SQL
+
+    def test_workflow_save_can_add_versioned_compatibility_envelope(self, tmp_path: Path, real_agent_config) -> None:
+        """Workflow.save wraps the payload in a versioned envelope for benchmark runs."""
+        import yaml
+
+        workflow = Workflow(
+            name="benchmark_workflow",
+            task=SqlTask(task="Test benchmark trajectory", artifact_profile="benchmark_v1"),
+            agent_config=real_agent_config,
+        )
+        save_path = tmp_path / "benchmark_workflow.yaml"
+
+        workflow.save(str(save_path), schema_version=1)
+
+        payload = yaml.safe_load(save_path.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 1
+        assert payload["workflow"]["name"] == "benchmark_workflow"
+        assert "artifact_type" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Helper: create a Workflow with _init_tools patched out
+# ---------------------------------------------------------------------------
+
+
+def _make_workflow(name="wf", task_text="test task"):
+    task = SqlTask(task=task_text)
+    with patch.object(Workflow, "_init_tools", lambda self: setattr(self, "tools", [])):
+        wf = Workflow(name=name, task=task, agent_config=None)
+    return wf
+
+
+def _make_node(node_id, node_type=NodeType.TYPE_GEN_SQL, description="desc"):
+    return Node.new_instance(
+        node_id=node_id,
+        description=description,
+        node_type=node_type,
+        input_data=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Workflow initialization
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowInit:
+    def test_defaults_on_creation(self):
+        wf = _make_workflow()
+        assert wf.name == "wf"
+        assert wf.status == "pending"
+        assert wf.current_node_index == 0
+        assert wf.nodes == {}
+        assert wf.node_order == []
+        assert wf.completion_time is None
+        assert wf.metadata == {}
+
+    def test_creation_time_set(self):
+        before = time.time()
+        wf = _make_workflow()
+        after = time.time()
+        assert before <= wf.creation_time <= after
+
+
+# ---------------------------------------------------------------------------
+# add_node / remove_node / move_node
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowNodeManagement:
+    def test_add_node_appends_by_default(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        n2 = _make_node("n2")
+        wf.add_node(n1)
+        wf.add_node(n2)
+        assert wf.node_order == ["n1", "n2"]
+        assert "n1" in wf.nodes
+        assert "n2" in wf.nodes
+
+    def test_add_node_at_position(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        n2 = _make_node("n2")
+        wf.add_node(n1)
+        wf.add_node(n2, position=0)
+        assert wf.node_order[0] == "n2"
+
+    def test_add_node_invalid_position_type_raises(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        with pytest.raises(ValueError):
+            wf.add_node(n1, position="bad")
+
+    def test_add_node_sets_workflow_reference(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        wf.add_node(n1)
+        assert n1.workflow is wf
+
+    def test_remove_node_success(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        wf.add_node(n1)
+        result = wf.remove_node("n1")
+        assert result is True
+        assert "n1" not in wf.nodes
+        assert "n1" not in wf.node_order
+
+    def test_remove_node_missing_returns_false(self):
+        wf = _make_workflow()
+        result = wf.remove_node("nonexistent")
+        assert result is False
+
+    def test_remove_node_cleans_dependencies(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        n2 = _make_node("n2")
+        wf.add_node(n1)
+        wf.add_node(n2)
+        n2.add_dependency("n1")
+        wf.remove_node("n1")
+        assert "n1" not in n2.dependencies
+
+    def test_move_node_success(self):
+        wf = _make_workflow()
+        for i in range(3):
+            wf.add_node(_make_node(f"n{i}"))
+        result = wf.move_node("n0", 2)
+        assert result is True
+        assert wf.node_order[2] == "n0"
+
+    def test_move_node_invalid_position_returns_false(self):
+        wf = _make_workflow()
+        wf.add_node(_make_node("n0"))
+        result = wf.move_node("n0", 99)
+        assert result is False
+
+    def test_move_node_not_found_returns_false(self):
+        wf = _make_workflow()
+        wf.add_node(_make_node("n0"))
+        result = wf.move_node("missing", 0)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# get_node / get_current_node / get_next_node / advance_to_next_node
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowNavigation:
+    def test_get_node_returns_correct_node(self):
+        wf = _make_workflow()
+        n1 = _make_node("n1")
+        wf.add_node(n1)
+        assert wf.get_node("n1") is n1
+
+    def test_get_node_missing_returns_none(self):
+        wf = _make_workflow()
+        assert wf.get_node("missing") is None
+
+    def test_get_current_node_first(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        wf.add_node(n0)
+        assert wf.get_current_node() is n0
+
+    def test_get_current_node_empty_returns_none(self):
+        wf = _make_workflow()
+        assert wf.get_current_node() is None
+
+    def test_get_next_node(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        n1 = _make_node("n1")
+        wf.add_node(n0)
+        wf.add_node(n1)
+        assert wf.get_next_node() is n1
+
+    def test_get_next_node_at_last_returns_none(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        wf.add_node(n0)
+        assert wf.get_next_node() is None
+
+    def test_advance_to_next_node(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        n1 = _make_node("n1")
+        wf.add_node(n0)
+        wf.add_node(n1)
+        result = wf.advance_to_next_node()
+        assert result is n1
+        assert wf.current_node_index == 1
+
+    def test_advance_to_next_node_at_end_completes(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        wf.add_node(n0)
+        result = wf.advance_to_next_node()
+        assert result is None
+        assert wf.status == "completed"
+        assert isinstance(wf.completion_time, float)
+
+    def test_get_last_node_by_type(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0", NodeType.TYPE_GEN_SQL)
+        n1 = _make_node("n1", NodeType.TYPE_EXECUTE_SQL)
+        n2 = _make_node("n2", NodeType.TYPE_GEN_SQL)
+        wf.add_node(n0)
+        wf.add_node(n1)
+        wf.add_node(n2)
+        wf.current_node_index = 3  # past all nodes
+        result = wf.get_last_node_by_type(NodeType.TYPE_GEN_SQL)
+        assert result is n2
+
+    def test_get_last_node_by_type_not_found_returns_none(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0", NodeType.TYPE_GEN_SQL)
+        wf.add_node(n0)
+        wf.current_node_index = 1
+        result = wf.get_last_node_by_type(NodeType.TYPE_EXECUTE_SQL)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# is_complete
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowComplete:
+    def test_is_complete_when_status_completed(self):
+        wf = _make_workflow()
+        wf.status = "completed"
+        assert wf.is_complete() is True
+
+    def test_is_complete_when_index_past_end(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        wf.add_node(n0)
+        wf.current_node_index = 5
+        assert wf.is_complete() is True
+
+    def test_not_complete_at_start(self):
+        wf = _make_workflow()
+        wf.add_node(_make_node("n0"))
+        assert wf.is_complete() is False
+
+
+# ---------------------------------------------------------------------------
+# pause / resume / reset
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowLifecycle:
+    def test_pause_sets_status(self):
+        wf = _make_workflow()
+        wf.pause()
+        assert wf.status == "paused"
+
+    def test_resume_sets_status(self):
+        wf = _make_workflow()
+        wf.status = "paused"
+        wf.resume()
+        assert wf.status == "running"
+
+    def test_reset_clears_state(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        n0.status = "completed"
+        n0.result = BaseResult(success=True)
+        wf.add_node(n0)
+        wf.current_node_index = 1
+        wf.status = "completed"
+        wf.reset()
+        assert wf.current_node_index == 0
+        assert wf.status == "pending"
+        assert n0.status == "pending"
+        assert n0.result is None
+
+
+# ---------------------------------------------------------------------------
+# get_last_sqlcontext / get_task
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowContextAccess:
+    def test_get_last_sqlcontext_success(self):
+        wf = _make_workflow()
+        ctx = SQLContext(sql_query="SELECT 1", sql_return="1")
+        wf.context.sql_contexts.append(ctx)
+        result = wf.get_last_sqlcontext()
+        assert result is ctx
+
+    def test_get_last_sqlcontext_empty_raises(self):
+        wf = _make_workflow()
+        with pytest.raises(DatusException):
+            wf.get_last_sqlcontext()
+
+    def test_get_task_with_task(self):
+        wf = _make_workflow(task_text="hello world")
+        assert wf.get_task() == "hello world"
+
+    def test_get_task_none_when_no_task(self):
+        with patch.object(Workflow, "_init_tools", lambda self: setattr(self, "tools", [])):
+            wf = Workflow(name="no_task", task=None, agent_config=None)
+        assert wf.get_task() is None
+
+
+# ---------------------------------------------------------------------------
+# get_final_result / to_dict
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowSerialization:
+    def test_get_final_result_includes_completed_nodes(self):
+        wf = _make_workflow(task_text="query")
+        n0 = _make_node("n0")
+        n0.status = "completed"
+        n0.result = BaseResult(success=True)
+        wf.add_node(n0)
+        result = wf.get_final_result()
+        assert result["name"] == "wf"
+        assert result["status"] == "pending"
+        assert "n0" in result["nodes"]
+
+    def test_get_final_result_final_result_key_when_last_completed(self):
+        wf = _make_workflow(task_text="query")
+        n0 = _make_node("n0")
+        n0.status = "completed"
+        n0.result = BaseResult(success=True)
+        wf.add_node(n0)
+        result = wf.get_final_result()
+        assert "final_result" in result
+
+    def test_to_dict_contains_expected_keys(self):
+        wf = _make_workflow()
+        d = wf.to_dict()
+        for key in ("name", "status", "nodes", "node_order", "task", "current_node_index", "creation_time"):
+            assert key in d
+
+    def test_global_config_setter_propagates_to_nodes(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        wf.add_node(n0)
+        new_config = MagicMock()
+        wf.global_config = new_config
+        assert n0.global_config is new_config
+
+
+# ---------------------------------------------------------------------------
+# display (smoke test - just must not raise)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowDisplay:
+    def test_display_does_not_raise(self):
+        wf = _make_workflow()
+        n0 = _make_node("n0")
+        n0.status = "completed"
+        wf.add_node(n0)
+        with patch("datus.agent.workflow.logger.info") as mock_log:
+            wf.display()
+        assert mock_log.call_count == 3
+        assert wf.node_order == ["n0"]
+
+
+# ---------------------------------------------------------------------------
+# _task_datasource resolution
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowTaskDatasource:
+    @staticmethod
+    def _workflow_with_task(task):
+        with patch.object(Workflow, "_init_tools", lambda self: setattr(self, "tools", [])):
+            return Workflow(name="wf", task=task, agent_config=None)
+
+    def test_returns_task_datasource_when_set(self):
+        wf = self._workflow_with_task(SqlTask(task="t", datasource="starrocks"))
+        assert wf._task_datasource() == "starrocks"
+
+    def test_falls_back_to_global_config_current_datasource(self):
+        wf = self._workflow_with_task(SqlTask(task="t", datasource=""))
+        wf._global_config = MagicMock(current_datasource="duckdb")
+        assert wf._task_datasource() == "duckdb"
+
+    def test_returns_empty_when_no_datasource_anywhere(self):
+        wf = self._workflow_with_task(SqlTask(task="t", datasource=""))
+        wf._global_config = None
+        assert wf._task_datasource() == ""
