@@ -619,6 +619,63 @@ class TestDbConfigToConnectionConfigAdapterBranch:
         # Port stays as original value since conversion fails silently
         assert "port" in result
 
+    def test_clickhouse_opted_in_rerouted_to_compat_proxy(self):
+        """A ClickHouse datasource with ch233_compat: true rides the in-process
+        compat proxy, so execute_sql shares the engine's CH<23.5 rewriting."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="clickhouse",
+            host="203.0.113.21",
+            port="8123",
+            username="user",
+            password="pass",
+            database="yunnan0508",
+            extra={"ch233_compat": True},
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result["host"] == "127.0.0.1"
+        assert isinstance(result["port"], int) and result["port"] != 8123
+        # The switch must be stripped before ClickHouseConfig (extra="forbid").
+        assert "ch233_compat" not in result
+
+    def test_clickhouse_without_switch_stays_native(self):
+        """Opt-in: a ClickHouse datasource without ch233_compat keeps the native path."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="clickhouse",
+            host="203.0.113.21",
+            port="8123",
+            username="user",
+            password="pass",
+            database="yunnan0508",
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result["host"] == "203.0.113.21"
+        assert result["port"] == 8123
+
+    def test_clickhouse_local_not_rerouted(self):
+        """Local ClickHouse addresses bypass the compat proxy like any local upstream."""
+        mgr = self._make_manager()
+        cfg = _cfg(
+            type="clickhouse",
+            host="127.0.0.1",
+            port="8123",
+            username="user",
+            database="db",
+            extra={"ch233_compat": True},
+        )
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result["host"] == "127.0.0.1"
+        assert result["port"] == 8123
+
+    def test_non_clickhouse_adapter_not_rerouted(self):
+        """Only ClickHouse entries are eligible for compat rerouting."""
+        mgr = self._make_manager()
+        cfg = _cfg(type="postgresql", host="203.0.113.22", port="5432", database="mydb")
+        result = mgr._db_config_to_connection_config(cfg)
+        assert result["host"] == "203.0.113.22"
+        assert result["port"] == 5432
+
 
 @pytest.mark.ci
 class TestDbManagerInstanceCaching:

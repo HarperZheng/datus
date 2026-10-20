@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import yaml
 
+from datus.tools.semantic_tools.dosi.ch_compat import reroute_entry
 from datus.tools.semantic_tools.dosi.config import DosiConfig
 from datus.tools.semantic_tools.dosi.dialects import normalize_dialect
 from datus.tools.semantic_tools.dosi.model import (
@@ -294,6 +295,11 @@ class EngineHandle:
             # engine owns the file-path contract.
             entry["uri"] = source
             entry.pop("path", None)
+        # CH <23.5 compat aspect: route the engine's HTTP traffic through the
+        # in-process proxy (strips session_timezone, rewrites dateTrunc). The
+        # decision lives in ch_compat and is shared with db_manager's connector
+        # path — one rewriting point for every ClickHouse consumer.
+        entry = reroute_entry(entry)
         dialect = normalize_dialect(entry.get("type"))
         if dialect:
             entry["type"] = dialect

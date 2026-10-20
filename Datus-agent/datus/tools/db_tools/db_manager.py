@@ -12,6 +12,7 @@ from sqlalchemy.engine.url import URL, make_url
 
 from datus.configuration.agent_config import DbConfig
 from datus.tools.db_tools.config import DuckDBConfig, SQLiteConfig
+from datus.tools.semantic_tools.dosi.ch_compat import reroute_entry
 from datus.utils.constants import DBType
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
@@ -490,6 +491,11 @@ class DBManager:
                     filtered_config["port"] = int(filtered_config["port"])
                 except (ValueError, TypeError):
                     pass
+
+            # CH <23.5 compat: every connector query (execute_sql, catalog,
+            # migration) rides the same in-process proxy the dosi engine uses —
+            # address swap only; all SQL rewriting stays in ch_compat.
+            filtered_config = reroute_entry(filtered_config, db_type=db_config.type)
 
             return filtered_config
 

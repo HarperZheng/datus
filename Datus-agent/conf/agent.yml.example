@@ -311,6 +311,19 @@ agent:
         username: ${STARROCKS_USER}
         password: ${STARROCKS_PASSWORD}
         database: ${STARROCKS_DATABASE}
+      clickhouse:
+        type: clickhouse
+        host: ${CLICKHOUSE_HOST}
+        port: ${CLICKHOUSE_PORT}
+        username: ${CLICKHOUSE_USER}
+        password: ${CLICKHOUSE_PASSWORD}
+        database: ${CLICKHOUSE_DATABASE}
+        # CH <23.5 compat proxy switch. true (or on/yes/1) routes this
+        # datasource through the in-process proxy that strips the
+        # session_timezone param and rewrites uppercase dateTrunc();
+        # off/false/no/0 or omitting the key keeps the native path.
+        # Flip to off or delete the key after upgrading ClickHouse >= 23.5.
+        ch233_compat: true
     # Dosi is the built-in semantic runtime.
     # Default selection across BI and Scheduler follows one rule:
     # explicit call-site arg → ``./.datus/config.yml`` project pin → YAML
