@@ -1,0 +1,1080 @@
+version: 0.2.0.dev0
+semantic_model:
+- name: fne_fund_main
+  description: 非税收入资金链（缴款→清分→划拨→缴库）：核心骨架（paybook_full_high / funddivide_transfer /
+    treasury_transfer_dedup）+ 同主题补充（transfer_new / agen_treasury_high）+ 查询型维度（dim_agen
+    / dim_subject），共 7 个 dataset、9 条实测验证关系（R1-R4 主链 + D5-D9 维度）
+  ai_context:
+    instructions: 金额指标一律锚定单 dataset（跨边求和会因 M:N 扇出膨胀）；测试环境放宽规则允许 to 侧非唯一的关系用于行级钻取，预期基数已写入各关系
+      ai_context；生产化时按 28 号标准 §七 复验升级；fbustype（业务类型：1=直缴、2=汇缴）仅存在于 paybook_full_high
+      数据集，仅缴款/清分/清分率类指标可按业务类型切片，禁止对其他 dataset（funddivide_transfer / treasury_transfer_dedup
+      / transfer_new / agen_treasury_high）的指标按业务类型分组或过滤
+  datasets:
+  - name: paybook_full_high
+    source: yunnan0508.fne_paybook_full_high
+    description: 缴款书全生命周期宽表（缴款+清分事实，PAYBOOK+ITEM+状态），1,272 行，明细行粒度
+    ai_context:
+      instructions: 分析缴款/清分/归属/科目/项目层级用；金额可直 SUM，笔数必须 uniqExact(fid)：147 个 fid 存在生命周期多版本重复，fid
+        非唯一键；主时间轴 fill_date=toDate(ffilldate)，day 粒度；与汇缴（une_）口径不混算；R1 边（被 funddivide_transfer.fpaybooksubid
+        引用）实测 JOIN 1,130 行；fbustype：1=直缴、2=汇缴，表内混合存在（全表实测 1=1,063 行/2=209 行）；凡用户提及"直缴"必须按
+        fbustype='1' 收窄，禁止将全表 SUM(famt) 表述为直缴金额
+    fields:
+    - name: fid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fid
+      label: 缴款明细ID
+      description: 缴款明细生命周期ID；147 个 fid 有多版本重复（共 1,272 行），非唯一键；笔数口径 uniqExact(fid)
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fpid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fpid
+      label: 缴款主单ID
+      description: 缴款通知书主单ID，同主单可有多明细行
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: famt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: famt
+      label: 缴款金额
+      description: 缴款通知书明细金额（元）
+      datatype: Decimal
+    - name: fimamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fimamt
+      label: 清分金额
+      description: 该明细行已清分金额（元）
+      datatype: Decimal
+    - name: fill_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(ffilldate)
+      dimension:
+        is_time: true
+      label: 缴款通知书填开日
+      description: 缴款通知书填开日期（ffilldate 字符串转 Date），本表主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: fchgagenidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenidcode
+      label: 执收单位ID
+      description: 执收单位唯一编码，连接 dim_agen.fagenidcode
+    - name: fchgagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenname
+      label: 执收单位名称
+      description: 执收单位名称（内联）
+      ai_context:
+        synonyms:
+        - 执收单位
+    - name: fchgrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgrgncode
+      label: 执收单位区划代码
+      description: 执收单位所在区划代码
+    - name: frecrgnname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecrgnname
+      label: 归属区划名称
+      description: 资金归属区划名称（内联，州市/区县）
+      ai_context:
+        synonyms:
+        - 州市
+        - 区县
+        - 区划
+    - name: frecrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecrgncode
+      label: 归属区划代码
+      description: 资金归属区划代码
+    - name: fsubcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubcode
+      label: 科目代码
+      description: 预算科目代码，连接 dim_subject.fsubcode
+    - name: fsubname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubname
+      label: 科目名称
+      description: 预算科目名称（内联）
+    - name: fitemidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fitemidcode
+      label: 项目ID
+      description: 非税收入项目ID
+    - name: fitemname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fitemname
+      label: 项目名称
+      description: 非税收入项目名称（内联）
+    - name: fcollectid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fcollectid
+      label: 汇总批次ID
+      description: 清分汇总批次ID；空串表示尚未入批次
+    - name: fistransfer
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fistransfer
+      label: 划拨标志
+      description: 是否已划拨：1=已划拨
+    - name: fstate
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fstate
+      label: 缴款书状态
+      description: 缴款书生命周期状态
+    - name: fbustype
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fbustype
+      label: 业务类型
+      description: 缴款业务类型：1=直缴，2=汇缴（集中汇缴，fne_ 表内混合存在）；String 型，
+        过滤值必须带引号；用户问"直缴/汇缴"必须按本字段切片或过滤，禁止把全表 SUM 当直缴
+      ai_context:
+        synonyms:
+        - 业务类型
+        - 缴款方式
+        - 直缴
+        - 汇缴
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","time_dimension":"fill_date"}'
+  - name: funddivide_transfer
+    source: yunnan0508.fne_funddivide_transfer
+    description: 汇总划拨批次宽表（清分→划拨环节），728 行
+    ai_context:
+      instructions: 汇总划拨批次明细；金额可直 SUM；fcollectid 非唯一（实测 160 个批次值参与 JOIN）；R1 边 fpaybooksubid=paybook_full_high.fid
+        实测 JOIN 1,130 行，R2 边 fcollectid=transfer_new.fcollectid 实测 160 行（to 侧生命周期多版本，测试环境放宽声明，金额指标一律锚定单
+        dataset 不做跨边求和）；划拨完成/未划拨用 fistransfer='1'/'!=1' 收窄；主时间轴 cleardate=toDate(fcleardate)，day
+        粒度
+    fields:
+    - name: fcollectid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fcollectid
+      label: 汇总批次ID
+      description: 清分汇总批次ID；生命周期多版本导致非唯一，批次数口径 uniqExact(fcollectid)
+    - name: fid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fid
+      label: 清分划拨明细ID
+      description: 清分划拨明细行ID
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fpaybooksubid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fpaybooksubid
+      label: 缴款明细ID
+      description: 外键：指向 paybook_full_high.fid（R1 边，实测 JOIN 1,130 行）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftransamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransamt
+      label: 划拨金额
+      description: 该批次明细划拨金额（元）
+      datatype: Decimal
+    - name: fimamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fimamt
+      label: 清分金额
+      description: 该批次明细清分金额（元）
+      datatype: Decimal
+    - name: cleardate
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(fcleardate)
+      dimension:
+        is_time: true
+      label: 清分日期
+      description: 清分日期（fcleardate 字符串转 Date），本表主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: fistransfer
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fistransfer
+      label: 划拨完成标志
+      description: 是否已划拨：1=已划拨，其他=未划拨
+    - name: ftransno
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransno
+      label: 划拨流水号
+      description: 划拨交易流水号（生命周期多版本）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fchgagenidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenidcode
+      label: 执收单位ID
+      description: 执收单位唯一编码，连接 dim_agen.fagenidcode
+    - name: fchgagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenname
+      label: 执收单位名称
+      description: 执收单位名称（内联）
+      ai_context:
+        synonyms:
+        - 执收单位
+    - name: fchgrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgrgncode
+      label: 执收单位区划代码
+    - name: frecrgnname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecrgnname
+      label: 归属区划名称
+      description: 资金归属区划名称（内联）
+      ai_context:
+        synonyms:
+        - 州市
+        - 区县
+        - 区划
+    - name: frecrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecrgncode
+      label: 归属区划代码
+    - name: frecsubcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecsubcode
+      label: 收款科目代码
+      description: 收款方预算科目代码，连接 dim_subject.fsubcode（D9 边）
+    - name: frecsubname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecsubname
+      label: 收款科目名称
+      description: 收款方预算科目名称（内联）
+    - name: fitemidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fitemidcode
+      label: 项目ID
+    - name: fitemname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fitemname
+      label: 项目名称
+      description: 非税收入项目名称（内联）
+    - name: ftransrecagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransrecagenname
+      label: 划入单位名称
+      description: 资金划入单位名称（内联）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","time_dimension":"cleardate"}'
+  - name: treasury_transfer_dedup
+    source: SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY fid) AS _rn FROM
+      yunnan0508.fne_treasury_transfer_new) WHERE _rn = 1
+    description: 缴库报文去重数据集：fne_treasury_transfer_new（505 行）按 fid 去重后 76 行
+    ai_context:
+      instructions: 物理表 505 行含 462 行生命周期冗余（33 个重复 fid 组），本数据集按 fid 去重后 76 行；缴库金额必须以本去重口径直
+        SUM（对账基准 29,535,106.14 / 76 行），直接 SUM 原始表会虚增约 44 倍；R3 边 ftranscollectid=funddivide_transfer.fcollectid
+        实测 460 行、R4 边 fpid=funddivide_transfer.fid 实测 476 行（to 侧非唯一，测试环境放宽声明）；主时间轴
+        msg_date=toDate(fmsgdate)，day 粒度；去重实现说明：规格原文为 LIMIT 1 BY fid（ClickHouse 方言扩展），因引擎查询源解析器不支持该语法，已等价改写为
+        ROW_NUMBER() OVER (PARTITION BY fid)=1，对账指纹一致（76 行 / 29,535,106.14）
+    fields:
+    - name: fid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fid
+      label: 缴库明细ID
+      description: 缴库报文明细ID，本数据集已按其去重（76 行唯一）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fpid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fpid
+      label: 缴库主单ID
+      description: 外键：指向 funddivide_transfer.fid（R4 边，实测 476 行，to 侧非唯一）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftranscollectid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftranscollectid
+      label: 划拨汇总批次ID
+      description: 外键：指向 funddivide_transfer.fcollectid（R3 边，实测 460 行）
+    - name: ftransno
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransno
+      label: 缴库批次号
+      description: 缴库划转流水号；批次口径 uniqExact(ftransno)
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftotalamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftotalamt
+      label: 缴库金额
+      description: 缴库报文总金额（元），去重口径直 SUM
+      datatype: Decimal
+    - name: famt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: famt
+      label: 缴库科目金额
+      description: 缴库报文科目级金额（元）
+      datatype: Decimal
+    - name: msg_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(fmsgdate)
+      dimension:
+        is_time: true
+      label: 报文日期
+      description: 缴库报文日期（fmsgdate 字符串转 Date），本表主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: fchgagenidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenidcode
+      label: 执收单位ID
+      description: 执收单位唯一编码，连接 dim_agen.fagenidcode
+    - name: fchgagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenname
+      label: 执收单位名称
+      description: 执收单位名称（内联）
+      ai_context:
+        synonyms:
+        - 执收单位
+    - name: fchgrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgrgncode
+      label: 执收单位区划代码
+    - name: frecrgncode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecrgncode
+      label: 归属区划代码
+    - name: fsubcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubcode
+      label: 科目代码
+    - name: fsubname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubname
+      label: 科目名称
+      description: 预算科目名称（内联）
+    - name: fsublevelname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsublevelname
+      label: 科目层级名称
+      description: 科目层级名称（内联）
+    - name: fstatus
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fstatus
+      label: 缴库状态
+      description: 缴库报文状态
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "time_dimension": "msg_date", "v": "1.11"}'
+  - name: transfer_new
+    source: yunnan0508.fne_transfer_new
+    description: 划拨指令生命周期表，129 行
+    ai_context:
+      instructions: 划拨指令生命周期记录，fcollectid 存在多版本（129 行，JOIN 实测 160 行命中），R2 边 to 侧非唯一，测试环境放宽声明；金额直
+        SUM；主时间轴 transdate=toDate(ftransdate)，day 粒度
+    fields:
+    - name: fcollectid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fcollectid
+      label: 汇总批次ID
+      description: 清分汇总批次ID；生命周期多版本非唯一，被 funddivide_transfer.fcollectid 引用（R2 边）
+    - name: fcollectpid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fcollectpid
+      label: 汇总父单ID
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftransamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransamt
+      label: 划拨金额
+      description: 划拨指令金额（元）
+      datatype: Decimal
+    - name: transdate
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(ftransdate)
+      dimension:
+        is_time: true
+      label: 划拨日期
+      description: 划拨指令日期（ftransdate 字符串转 Date），本表主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: fistransfer
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fistransfer
+      label: 划拨完成标志
+      description: 是否已划拨：1=已划拨
+    - name: ftransno
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransno
+      label: 划拨流水号
+      description: 划拨交易流水号（生命周期多版本）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftransrecagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransrecagenname
+      label: 划入单位名称
+      description: 资金划入单位名称（内联）
+    - name: ftransstats
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransstats
+      label: 划拨状态
+      description: 划拨指令生命周期状态
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","time_dimension":"transdate"}'
+  - name: agen_treasury_high
+    source: yunnan0508.fne_agen_treasury_high
+    description: 单位汇缴缴库宽表（F7 汇缴口径），20 行；无实测验证边，不声明 relationship
+    ai_context:
+      instructions: 汇缴口径（une_ 体系）的单位汇缴缴库事实，与直缴（fne_）口径不混算；无实测验证边，不与其他 dataset 建关系；小表（20
+        行）金额可直 SUM
+    fields:
+    - name: fid
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fid
+      label: 汇缴缴库明细ID
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftransno
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftransno
+      label: 缴库批次号
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fbatchno
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fbatchno
+      label: 汇总批次号
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: ftotalamt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftotalamt
+      label: 缴库总金额
+      description: 单位汇缴缴库总金额（元）
+      datatype: Decimal
+    - name: famt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: famt
+      label: 缴库科目金额
+      description: 单位汇缴缴库科目级金额（元）
+      datatype: Decimal
+    - name: fchgagenidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenidcode
+      label: 执收单位ID
+    - name: fchgagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagenname
+      label: 执收单位名称
+      description: 执收单位名称（内联）
+    - name: fchgrgnname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgrgnname
+      label: 执收区划名称
+      description: 执收单位区划名称（内联）
+    - name: fsubcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubcode
+      label: 科目代码
+    - name: fsubname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubname
+      label: 科目名称
+      description: 预算科目名称（内联）
+    - name: fsublevel
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsublevel
+      label: 科目层级
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: fsublevelname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsublevelname
+      label: 科目层级名称
+    - name: fstatus
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fstatus
+      label: 状态
+      description: 汇缴缴库状态
+    - name: ftotreasurystatus
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftotreasurystatus
+      label: 入库状态
+      description: 资金入库状态
+  - name: dim_agen
+    source: SELECT fagenidcode, fagencode, fagenname, flevel, ftypecode FROM (SELECT
+      fagenidcode, fagencode, fagenname, flevel, ftypecode, ROW_NUMBER() OVER (PARTITION
+      BY fagenidcode ORDER BY fupdatetime DESC) AS _rn FROM yunnan0508.fab_agen) WHERE
+      _rn = 1
+    description: 执收单位查询型维度：fab_agen 按 fagenidcode 去重取最新版本（fupdatetime DESC），295 行去重后
+      218 行
+    ai_context:
+      instructions: fab_agen 原始 295 行含多版本，直连会扇出约 4.4 倍，必须使用本去重数据集；与事实表的边（D5/D6/D7：fchgagenidcode=fagenidcode）实测验证连接，to
+        侧去重后唯一；去重实现说明：规格原文为 ORDER BY fupdatetime DESC LIMIT 1 BY fagenidcode，因引擎查询源解析器不支持
+        LIMIT 1 BY，已等价改写为 ROW_NUMBER() OVER (PARTITION BY fagenidcode ORDER BY fupdatetime
+        DESC)=1（多列去重单排序列技巧），对账指纹一致（218 行）
+    fields:
+    - name: fagenidcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fagenidcode
+      label: 单位ID
+      description: 执收单位唯一编码（去重键），被各事实表 fchgagenidcode 引用
+    - name: fagencode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fagencode
+      label: 单位代码
+    - name: fagenname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fagenname
+      label: 单位名称
+      description: 执收单位名称
+      ai_context:
+        synonyms:
+        - 执收单位
+        - 单位
+    - name: flevel
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: flevel
+      label: 单位层级
+      description: 单位层级（数值，越小越靠上级）
+      datatype: Integer
+    - name: ftypecode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: ftypecode
+      label: 单位类型代码
+      description: 单位类型编码
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "v": "1.11"}'
+  - name: dim_subject
+    source: SELECT fsubcode, fsubname, fyear, toString(flevel) AS fsublevel FROM (SELECT
+      fsubcode, fsubname, fyear, flevel, ROW_NUMBER() OVER (PARTITION BY fsubcode
+      ORDER BY fyear DESC) AS _rn FROM yunnan0508.fab_subject) WHERE _rn = 1
+    description: 预算科目查询型维度：fab_subject 按年度取最新版（fyear DESC 去重），539 个科目
+    ai_context:
+      instructions: 事实表 fsubid/frecsubcode 与 fab_subject.fid 不同（27 清单已验证），科目属性连接只能走科目代码（fsubcode/frecsubcode），D8/D9
+        边实测验证连接；同 fsubcode 多年度版本时本数据集取最新年度版；物理表无 fsublevelname 列，fsublevel 取自 toString(flevel)；去重实现说明：规格原文为
+        ORDER BY fyear DESC LIMIT 1 BY fsubcode，因引擎查询源解析器不支持 LIMIT 1 BY，已等价改写为 ROW_NUMBER()
+        OVER (PARTITION BY fsubcode ORDER BY fyear DESC)=1，对账指纹一致（539 行）
+    fields:
+    - name: fsubcode
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubcode
+      label: 科目代码
+      description: 预算科目代码（去重键），被事实表 fsubcode/frecsubcode 引用
+    - name: fsubname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsubname
+      label: 科目名称
+      description: 预算科目名称
+      ai_context:
+        synonyms:
+        - 预算科目
+        - 科目
+    - name: fyear
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fyear
+      label: 科目年度
+      description: 科目版本所属年度；本数据集每个科目取最新年度版
+      datatype: Integer
+    - name: fsublevel
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fsublevel
+      label: 科目层级
+      description: 科目层级（物理 flevel 数值转字符串）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "v": "1.11"}'
+  relationships:
+  - name: funddivide_to_paybook
+    from: funddivide_transfer
+    to: paybook_full_high
+    from_columns:
+    - fpaybooksubid
+    to_columns:
+    - fid
+    ai_context:
+      instructions: R1：清分划拨明细→缴款明细，实测 JOIN 1,130 行；to 侧 fid 存在 147 个生命周期多版本重复，测试环境放宽声明（行级钻取用途，金额指标一律锚定单
+        dataset）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: funddivide_to_transfer
+    from: funddivide_transfer
+    to: transfer_new
+    from_columns:
+    - fcollectid
+    to_columns:
+    - fcollectid
+    ai_context:
+      instructions: R2：清分划拨明细→划拨指令，实测 JOIN 160 行；to 侧 fcollectid 生命周期多版本非唯一，测试环境放宽声明
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: treasury_dedup_to_funddivide_collect
+    from: treasury_transfer_dedup
+    to: funddivide_transfer
+    from_columns:
+    - ftranscollectid
+    to_columns:
+    - fcollectid
+    ai_context:
+      instructions: R3：缴库报文→清分划拨批次，实测 JOIN 460 行；to 侧 fcollectid 非唯一，测试环境放宽声明
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: treasury_dedup_to_funddivide_pid
+    from: treasury_transfer_dedup
+    to: funddivide_transfer
+    from_columns:
+    - fpid
+    to_columns:
+    - fid
+    ai_context:
+      instructions: R4：缴库报文→清分划拨明细，实测 JOIN 476 行；to 侧 fid 非唯一，测试环境放宽声明
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: paybook_to_dim_agen
+    from: paybook_full_high
+    to: dim_agen
+    from_columns:
+    - fchgagenidcode
+    to_columns:
+    - fagenidcode
+    ai_context:
+      instructions: D5：缴款明细→执收单位维度，实测验证连接；to 侧 dim_agen 已按 fagenidcode 去重唯一
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: funddivide_to_dim_agen
+    from: funddivide_transfer
+    to: dim_agen
+    from_columns:
+    - fchgagenidcode
+    to_columns:
+    - fagenidcode
+    ai_context:
+      instructions: D6：清分划拨明细→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: treasury_dedup_to_dim_agen
+    from: treasury_transfer_dedup
+    to: dim_agen
+    from_columns:
+    - fchgagenidcode
+    to_columns:
+    - fagenidcode
+    ai_context:
+      instructions: D7：缴库报文→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: paybook_to_dim_subject
+    from: paybook_full_high
+    to: dim_subject
+    from_columns:
+    - fsubcode
+    to_columns:
+    - fsubcode
+    ai_context:
+      instructions: D8：缴款明细→预算科目维度，实测验证连接；科目属性只能走科目代码（fsubid 与 fab_subject.fid 不同）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  - name: funddivide_to_dim_subject
+    from: funddivide_transfer
+    to: dim_subject
+    from_columns:
+    - frecsubcode
+    to_columns:
+    - fsubcode
+    ai_context:
+      instructions: D9：清分划拨明细→预算科目维度（收款科目），实测验证连接
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","join_type":"left"}'
+  metrics:
+  - name: 非税缴款金额
+    description: 非税缴款金额（缴款通知书明细口径，paybook_full_high.famt 直 SUM）；全部业务类型，直缴口径=按 fbustype='1'
+      切片，汇缴口径=按 fbustype='2' 切片
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.famt)
+    ai_context:
+      instructions: 用 fill_date 作业务时间轴；按执收单位/科目/项目/归属区划/业务类型(fbustype)分组；与汇缴（une_）口径不混算；用户提及"直缴/汇缴"必须按
+        fbustype='1'/'2' 收窄，禁止将全类型 SUM 表述为直缴金额
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"pdaqokomvznqk2anu4rfdemm"}'
+  - name: 非税缴款笔数
+    description: 非税缴款笔数（fid 去重口径）；全部业务类型，直缴口径=按 fbustype='1' 切片
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT paybook_full_high.fid)
+    ai_context:
+      instructions: paybook_full_high 有 1,272 行但 147 个 fid 存在生命周期多版本重复，笔数必须 fid 去重，禁止
+        COUNT(*)；OSI 聚合白名单不含 uniqExact，故用 COUNT(DISTINCT fid)（ClickHouse 引擎编译为 uniqExact，口径一致，去重笔数
+        1,101）；时间轴同 非税缴款金额；用户提及"直缴/汇缴"必须按 fbustype='1'/'2' 收窄
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"x3qdjni9hn8h3icg8cg9m4g9"}'
+  - name: 清分金额
+    description: 清分金额（paybook_full_high.fimamt 直 SUM，明细行口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.fimamt)
+    ai_context:
+      instructions: 明细行 fimamt 直 SUM；全量对账基准 16,016,079,467.68；时间轴与缴款金额一致用 fill_date；可按
+        fbustype 切片，直缴清分金额需同时过滤 fbustype='1'
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","清分"],"unit":"元","uid":"pijjwlipxhhj3g6oosgj1h4m"}'
+  - name: 划拨金额
+    description: 划拨金额（funddivide_transfer.ftransamt 直 SUM，批次明细行口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(funddivide_transfer.ftransamt)
+    ai_context:
+      instructions: 批次明细行 ftransamt 直 SUM；划拨完成/未划拨金额用本指标按 fistransfer 收窄（见 derive
+        filter 指标）；时间轴 cleardate
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"gk53phzrrkgo7t13n9tc245l"}'
+  - name: 缴库金额
+    description: 缴库金额（treasury_transfer_dedup 按 fid 去重后 76 行 ftotalamt 直 SUM）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(treasury_transfer_dedup.ftotalamt)
+    ai_context:
+      instructions: 必须使用 treasury_transfer_dedup 去重口径：物理表 505 行含 462 行冗余，直接 SUM 虚增约
+        44 倍；全量对账基准 29,535,106.14（76 行）；业务时间轴 msg_date
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.msg_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","uid":"baxyufkxfxy2kufn8t6f0vy4"}'
+  - name: 汇总批次数
+    description: 清分汇总批次数（funddivide_transfer.fcollectid 去重口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT funddivide_transfer.fcollectid)
+    ai_context:
+      instructions: fcollectid 生命周期多版本非唯一，批次口径去重计数（COUNT(DISTINCT)，引擎编译为 uniqExact）；空串批次是否计入见
+        dataset 说明；时间轴 cleardate
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"个","uid":"hv4nn7pvs85tt3fue9ru05gx"}'
+  - name: 缴库批次数
+    description: 缴库批次数（treasury_transfer_dedup.ftransno 去重口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT treasury_transfer_dedup.ftransno)
+    ai_context:
+      instructions: 必须使用 treasury_transfer_dedup 去重口径，禁止对物理表计数；COUNT(DISTINCT) 引擎编译为
+        uniqExact，口径一致；业务时间轴 msg_date
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.msg_date","subject_path":["非税收入","资金链","缴库"],"unit":"个","uid":"xng92zl818ktmilh2qesjyx9"}'
+  - name: 非税缴款金额_同比
+    description: 非税缴款金额 的同比值（上一自然年同口径聚合）；全业务类型口径，直缴需另按 fbustype='1' 过滤
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.famt)
+    ai_context:
+      instructions: window 派生：offset 1 年的 period-over-period；查询粒度（month/quarter/year）运行时决定；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"vmke8ep5ak3p56rke8246tie"}'
+  - name: 非税缴款金额_环比
+    description: 非税缴款金额 的环比值（上一自然月同口径聚合）；全业务类型口径，直缴需另按 fbustype='1' 过滤
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.famt)
+    ai_context:
+      instructions: window 派生：offset 1 月的 period-over-period；查询粒度（month/quarter/year）运行时决定；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"y5lidl55ibttikipag7fsgbx"}'
+  - name: 清分金额_同比
+    description: 清分金额 的同比值（上一自然年同口径聚合）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.fimamt)
+    ai_context:
+      instructions: window 派生：offset 1 年的 period-over-period；时间轴与 清分金额 一致（fill_date）；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"tt3f4q7l4ei4gydhhm2wd39b"}'
+  - name: 清分金额_环比
+    description: 清分金额 的环比值（上一自然月同口径聚合）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(paybook_full_high.fimamt)
+    ai_context:
+      instructions: window 派生：offset 1 月的 period-over-period；时间轴与 清分金额 一致（fill_date）；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"rpbb4gu7pfkqsbqj41tcmrfo"}'
+  - name: 缴库金额_同比
+    description: 缴库金额 的同比值（上一自然年同口径聚合）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(treasury_transfer_dedup.ftotalamt)
+    ai_context:
+      instructions: window 派生：offset 1 年的 period-over-period；基于去重口径 缴库金额；时间轴 msg_date；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.msg_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","window":{"base":"缴库金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"fdzmc2182mlmuxx78lrk6jbr"}'
+  - name: 缴库金额_环比
+    description: 缴库金额 的环比值（上一自然月同口径聚合）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(treasury_transfer_dedup.ftotalamt)
+    ai_context:
+      instructions: window 派生：offset 1 月的 period-over-period；基于去重口径 缴库金额；时间轴 msg_date；缺失比较桶保留
+        NULL
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.msg_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","window":{"base":"缴库金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"ffym6g3w6lkef8cue1qbmcxf"}'
+  - name: 划拨完成金额
+    description: 已完成划拨金额（划拨金额按 funddivide_transfer.fistransfer='1' 收窄）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(CASE WHEN funddivide_transfer.fistransfer = '1' THEN funddivide_transfer.ftransamt
+          END)
+    ai_context:
+      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer='1' 表示该明细行已完成划拨
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
+        = ''1''"},"subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"rpj7qvvo5clow1kflbh3gaac"}'
+  - name: 未划拨金额
+    description: 未完成划拨金额（划拨金额按 funddivide_transfer.fistransfer!='1' 收窄）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(CASE WHEN funddivide_transfer.fistransfer != '1' THEN funddivide_transfer.ftransamt
+          END)
+    ai_context:
+      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer!='1' 表示该明细行尚未划拨
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_not_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
+        != ''1''"},"subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"vmihazae3pwvle6cm01lzmxh"}'
+  - name: 清分率
+    description: 清分率 = 清分金额 ÷ 非税缴款金额（两者同在 paybook_full_high 行内）；按 fbustype
+      分组时比值逐组成立；整体比值含全类型行，直缴清分率=查询时分子分母同时过滤 fbustype='1'
+    datatype: Float
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COALESCE(SUM(paybook_full_high.fimamt), 0) / COALESCE(SUM(paybook_full_high.famt),
+          0)
+    ai_context:
+      instructions: compose 派生：清分金额 / 非税缴款金额，两者同 dataset 行内计算安全；除零/空值按 fill=0 返回
+        0；直缴口径必须同时过滤 fbustype='1'，禁止只用全类型合计表述直缴清分率
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","derive":{"type":"compose","expr":"清分金额 / 非税缴款金额","fill":0},"dataset":"paybook_full_high","time_dimension":"paybook_full_high.fill_date","subject_path":["非税收入","资金链","清分"],"uid":"vu089fiu5h16kcr6xm19suzo"}'
