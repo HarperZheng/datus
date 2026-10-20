@@ -15,10 +15,13 @@ DEFAULT_FASTEMBED_REPO_ID = "qdrant/all-MiniLM-L6-v2-onnx"
 
 def resolve_fastembed_cache_dir() -> str:
     """Return the fastembed cache directory used by Datus defaults."""
-    if cache_path := os.getenv("FASTEMBED_CACHE_PATH"):
-        return str(Path(cache_path).expanduser().resolve())
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
-    return str((hf_home / "fastembed").resolve())
+    cache_path = "./build_scripts/cache/fastembed"
+    return str(Path(cache_path).expanduser().resolve())
+    # 下为原始实现，已被注释掉
+    # if cache_path := os.getenv("FASTEMBED_CACHE_PATH"):
+    #     return str(Path(cache_path).expanduser().resolve())
+    # hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
+    # return str((hf_home / "fastembed").resolve())
 
 
 def fastembed_environment_details(cache_dir: Optional[str] = None) -> str:

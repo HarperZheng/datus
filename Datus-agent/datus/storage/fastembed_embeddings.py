@@ -178,20 +178,30 @@ def check_snapshot(model_name: str, cache_dir: str) -> None:
 
     try:
         snapshot_download(repo_id, cache_dir=cache_dir, local_files_only=True)
-    except LocalEntryNotFoundError:
-        logger.info(f"Downloading {repo_id} to {cache_dir} via huggingface_hub")
-        try:
-            snapshot_download(repo_id, cache_dir=cache_dir, local_files_only=False)
-            logger.info(f"Model {repo_id} has been downloaded via huggingface_hub to {cache_dir}.")
-        except Exception as exc:
-            message = format_fastembed_download_error(
-                model_name=model_name,
-                repo_id=repo_id,
-                cache_dir=cache_dir,
-                cause=exc,
-            )
-            logger.error(message)
-            raise DatusException(ErrorCode.MODEL_EMBEDDING_ERROR, message=message) from exc
+    except LocalEntryNotFoundError as exc:
+        message = (
+              f"Embedding model '{repo_id}' is not cached locally under {cache_dir}. "
+              "Offline mode: no download will be attempted. "
+              "Run build_scripts/prefetch_model.sh to populate the cache, "
+              "or point FASTEMBED_CACHE_PATH at a directory containing the model."
+        )
+        logger.error(message)
+        raise DatusException(ErrorCode.MODEL_EMBEDDING_ERROR, message=message) from exc
+    # 下为原始实现，已被注释掉
+    # except LocalEntryNotFoundError:
+    #     logger.info(f"Downloading {repo_id} to {cache_dir} via huggingface_hub")
+    #     try:
+    #         snapshot_download(repo_id, cache_dir=cache_dir, local_files_only=False)
+    #         logger.info(f"Model {repo_id} has been downloaded via huggingface_hub to {cache_dir}.")
+    #     except Exception as exc:
+    #         message = format_fastembed_download_error(
+    #             model_name=model_name,
+    #             repo_id=repo_id,
+    #             cache_dir=cache_dir,
+    #             cause=exc,
+    #         )
+    #         logger.error(message)
+    #         raise DatusException(ErrorCode.MODEL_EMBEDDING_ERROR, message=message) from exc
 
 
 def has_local_snapshot(model_name: str, cache_dir: str) -> bool:
