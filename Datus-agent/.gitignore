@@ -68,7 +68,6 @@ conf/agent.yml.bak
 /quickstart/data_engineering/airflow/dags/*.py
 /.playwright-mcp/
 /.datus_test_data
-/subject/
 build/
 .datus/
 /build_scripts/cache/
