@@ -92,6 +92,18 @@ semantic_model:
           expression: fchgrgncode
       label: 执收单位区划代码
       description: 执收单位所在区划代码
+    - name: fchgrgnname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgrgnname
+      label: 执收区划名称
+      description: 执收单位所在区划名称（内联），String 型；实测 1,272 行 100% 非空，5 个 distinct 全分布：云南省本级 1,242 行/昆明市本级
+        17/五华区 7/官渡区 4/云龙县 2；与 fchgrgncode 一一对应，分组展示优先用本列；与归属区划 frecrgnname 实测 584 行不一致（区划间资金流入口径的近似基础；注意
+        frecrgnname 含空串与"中央"等特殊值，跨区归因口径需业务确认）
+      ai_context:
+        synonyms:
+        - 执收区划
     - name: frecrgnname
       expression:
         dialects:
@@ -111,6 +123,20 @@ semantic_model:
           expression: frecrgncode
       label: 归属区划代码
       description: 资金归属区划代码
+    - name: frecbankname
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecbankname
+      label: 收款银行名称
+      description: 缴款资金收款银行名称（内联），String 型；实测 1,272 行 100% 非空，9 个 distinct（trim 后仍 9 个，取值统一带尾部空格，过滤匹配时注意）：
+        中国建设银行 923 行/中国工商银行 125/中国银行 117/人民银行 80/中国邮政储蓄银行 14/中国农业银行 9/云南省农村信用社联合社 2/支付宝 1/中国光大银行 1；"各代理银行收入"
+        场景按本列分组；编码 frecbankcode 与 fpf_bank 维度表按 07 编码让位名称规则暂不建（出现按编码对齐需求时再建）
+      ai_context:
+        synonyms:
+        - 收款银行
+        - 代理银行
+        - 银行
     - name: fsubcode
       expression:
         dialects:
@@ -159,7 +185,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fstate
       label: 缴款书状态
-      description: 缴款书生命周期状态
+      description: 缴款书生命周期状态，String 型；实测分布：'3'=1257 行（主导状态）、''（空）=13 行、'2'=1 行、'1'=1 行；注意 3 是主导但非唯一状态，不能默认全表同值，过滤/分组时保留空串与其他码值的可能性
     - name: fbustype
       expression:
         dialects:
@@ -174,6 +200,111 @@ semantic_model:
         - 缴款方式
         - 直缴
         - 汇缴
+    - name: funds_nature
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.ffundsnaturecode
+      label: 资金性质
+      description: 资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空；实测码值（全表 1,272 行口径）：12=政府性基金预算收入
+        1,083 行/183.16 亿元（金额占比约 99.9%）、11=一般公共预算收入 97 行、2=财政专户管理资金 86 行、5=其他 6 行；直缴切片（fbustype='1'，1,063
+        行）分布为 12=895 行/160.47 亿元、11=84 行、2=78 行、5=6 行；与 funddivide_transfer.funds_nature（frecfundsnaturecode）同码表
+      ai_context:
+        synonyms:
+        - 资金性质
+        - 预算级次
+        - 基金
+        - 一般公共预算
+    - name: funds_nature_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.ffundsnaturename
+      label: 资金性质名称
+      description: 资金性质中文名称（内联展示列），与 funds_nature（ffundsnaturecode）一一对应，取值：政府性基金预算收入/一般公共预算收入/财政专户管理资金/其他；分组展示优先用本列，过滤按码列
+        funds_nature
+    - name: income_sort
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.fincomesortname
+      label: 收入分类
+      description: 收入分类名称（单列即名称，无配套码列）；实测分布：政府性基金收入 1,006 行/182.85 亿元、专项收入 142 行、行政事业性收费收入
+        109 行、罚没收入 9 行、空 6 行
+      ai_context:
+        synonyms:
+        - 收入分类
+        - 收入类别
+        - 罚没
+        - 专项收入
+    - name: pay_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.fpaycode
+      label: 票据关联码
+      description: 财政票据关联码（缴款码），String 型；100% 非空，1,272 行共 968 个 distinct；票据链（une_cbill_high.fpaycode）与资金链之间唯一验证连通的键（fpid
+        跨链实测 0 行命中）；为 fne_bill_link.yml 票据-资金桥接模型预铺桥键，本文件内不声明关系
+      ai_context:
+        synonyms:
+        - 票据关联
+        - 缴款码
+    - name: is_cleared
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.fisclear
+      label: 是否清分
+      description: 是否已清分标志（物理 fisclear 为 Nullable(UInt32)，实测值域仅 0/1 无 NULL）：1=已清分 757 行、0=未清分 515 行；F11
+        催缴欠缴场景过滤字段，用户问"未清分/欠缴"必须按 is_cleared='0' 过滤
+      datatype: Integer
+      ai_context:
+        synonyms:
+        - 清分状态
+        - 已清分
+        - 未清分
+    - name: is_received
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.fisreceived
+      label: 资金是否到账
+      description: 资金是否到账标志（物理 fisreceived 为 Nullable(UInt32)，实测值域仅 0/1 无 NULL）：1=已到账 874 行、0=未到账 398
+        行（其中填开日 2025 年 36 行）；F11 催缴欠缴场景过滤字段，用户问"未到账/欠缴"必须按 is_received='0' 过滤
+      datatype: Integer
+      ai_context:
+        synonyms:
+        - 到账状态
+        - 已到账
+        - 未到账
+        - 欠缴
+    - name: clear_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(paybook_full_high.fcleardate)
+      dimension:
+        is_time: true
+      label: 清分日期
+      description: 清分日期（fcleardate 字符串转 Date），本表二级时间轴（主时间轴仍是 fill_date，dataset 与指标 time_dimension 均不变）；实测
+        760/1,272 行非空；清分时效分析用（clear_date - fill_date 间隔），未清分行此值为空
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: budget_agen
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: paybook_full_high.fchgbgtagenname
+      label: 执收预算单位
+      description: 执收方主管预算单位名称（内联）；1,259/1,272 行非空，头部取值：测试001 357 行、云南发展改革委员会 255 行、云南通用测试单位0801
+        110 行、云南医保测试单位 87 行、127208 59 行；测试环境数据污染约 16%（含"测试"字样单位），对账分析建议与 fbustype 切片联用
+      ai_context:
+        synonyms:
+        - 预算单位
+        - 主管单位
+        - 执收预算单位
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","time_dimension":"fill_date"}'
@@ -183,8 +314,12 @@ semantic_model:
     ai_context:
       instructions: 汇总划拨批次明细；金额可直 SUM；fcollectid 非唯一（实测 160 个批次值参与 JOIN）；R1 边 fpaybooksubid=paybook_full_high.fid
         实测 JOIN 1,130 行，R2 边 fcollectid=transfer_new.fcollectid 实测 160 行（to 侧生命周期多版本，测试环境放宽声明，金额指标一律锚定单
-        dataset 不做跨边求和）；划拨完成/未划拨用 fistransfer='1'/'!=1' 收窄；主时间轴 cleardate=toDate(fcleardate)，day
-        粒度
+        dataset 不做跨边求和）；划拨完成/未划拨用 fistransfer='1'/'!=1' 收窄；空键口径（2026-10-20 实测）：178/728 行
+        fcollectid=''（尚未汇总入批次的清分明细行），承载 fimamt 15,986,749,253.84（占全表 99.82%），单表金额聚合禁止按
+        fcollectid != '' 过滤，否则清分金额坍缩到约 2,933 万；ftransamt 空键行全 NULL（全表划拨金额 72,507.62 全在非空键行）；
+        fpaybooksubid 无空键；已声明边实测无空键假关联（R1 to 侧 0 空键，R2 to 侧 fne_transfer_new 0 空键，160=160），跨已声明边
+        JOIN 无需空键前置；若未来连 fne_funddivide_new（fcollectid 两侧均有空键）等未建模表，JOIN 两侧必须前置 fcollectid != ''
+        （实测不过滤 32,508 行假关联）；主时间轴 cleardate=toDate(fcleardate)，day 粒度
     fields:
     - name: fcollectid
       expression:
@@ -333,7 +468,27 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftransrecagenname
       label: 划入单位名称
-      description: 资金划入单位名称（内联）
+      description: 资金划入单位名称（内联）；2026-10-20 实测 728 行全为空串（ftransrecagenidcode/ftransrecagencode 同为全空），按本列分组返回空组——划入单位分析在当前测试数据下不可用
+    - name: funds_nature
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: funddivide_transfer.frecfundsnaturecode
+      label: 资金性质（划拨侧）
+      description: 划拨侧资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空（728/728）；实测码值：12=政府性基金预算收入
+        589 行、2=财政专户管理资金 70 行、11=一般公共预算收入 63 行、5=其他 6 行；与 paybook_full_high.funds_nature（ffundsnaturecode）同码表
+      ai_context:
+        synonyms:
+        - 资金性质
+        - 预算级次
+    - name: funds_nature_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: funddivide_transfer.frecfundsnaturename
+      label: 资金性质名称（划拨侧）
+      description: 划拨侧资金性质中文名称（内联展示列），与 funds_nature（frecfundsnaturecode）一一对应；分组展示优先用本列，过滤按码列
+        funds_nature
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","time_dimension":"cleardate"}'
@@ -470,6 +625,22 @@ semantic_model:
           expression: fstatus
       label: 缴库状态
       description: 缴库报文状态
+    - name: income_status
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toString(fincomestatus)
+      label: 入库确认状态
+      description: 国库入库确认状态（物理 fincomestatus 为 String，toString 统一形态），String 型取值
+        ''0''/''1''，过滤值必须带引号；与 fstatus（缴库状态）交叉：''1''=已确认入库、''0''=未确认入库。实测全表 505 行：''0''=481 行未确认、''1''=24
+        行已确认；与 fstatus 交叉矩阵：(0,0)=353 未缴库未确认、(9,0)=128 已缴库待国库确认、(9,1)=24 已缴库已确认；去重后 76 fid：(0,0)=50、(9,0)=3、(9,1)=23；fincomestatus
+        与 fid 实测完全绑定（76 个 fid 无一跨版本变化），多版本行只是重复报文，去重后状态稳定，可安全按 fid 口径过滤；(9,0) 的 128 行/415.5
+        万是"已缴库待国库确认"中间态（2026 年 125 行集中，415.1 万）；2022 年 23 行确认入库仅 0.4 万、2023/2024 无确认记录
+      ai_context:
+        synonyms:
+        - 入库状态
+        - 入库确认
+        - 缴库确认
     custom_extensions:
     - vendor_name: DATUS
       data: '{"source_type": "query", "time_dimension": "msg_date", "v": "1.11"}'
@@ -540,7 +711,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftransrecagenname
       label: 划入单位名称
-      description: 资金划入单位名称（内联）
+      description: 资金划入单位名称（内联）；2026-10-20 实测 129 行全为空串（ftransrecagenidcode 同为全空），按本列分组返回空组——划入单位分析在当前测试数据下不可用
     - name: ftransstats
       expression:
         dialects:
@@ -663,18 +834,57 @@ semantic_model:
           expression: ftotreasurystatus
       label: 入库状态
       description: 资金入库状态
+    - name: pay_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(agen_treasury_high.fpaydate)
+      dimension:
+        is_time: true
+      label: 缴款日期
+      description: 汇缴缴款日期（fpaydate 字符串转 Date），本表主时间轴；20 行全部非空，实测范围 2022-01-25~2025-12-08（含 1
+        行 2025-12-08 后补测试数据）；F7 汇缴缴库分析按本轴分组
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    - name: belong_rgn
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: agen_treasury_high.fbelongrgncode
+      label: 归属区划编码
+      description: 资金归属区划编码（物理 fbelongrgncode）；F7 省级分成场景的归属区划维度，20 行全非空（实测 2 个 distinct 值）；与分成比例
+        share_rate 联用分析省对下分成
+      ai_context:
+        synonyms:
+        - 归属区划
+        - 分成归属
+    - name: share_rate
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: agen_treasury_high.fsharerate
+      label: 分成比例
+      description: 分成比例定点编码，String 型（35 位定点比例码，过滤/分组必须按整码字符串带引号匹配，不可当数值）；实测 20 行共 3 种比例码：'00000001000000000000000000000000000'
+        13 行、'05000000500000000000000000000000000' 4 行、'05000000200000020000001000000000000' 3 行
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","time_dimension":"pay_date"}'
   - name: dim_agen
-    source: SELECT fagenidcode, fagencode, fagenname, flevel, ftypecode FROM (SELECT
-      fagenidcode, fagencode, fagenname, flevel, ftypecode, ROW_NUMBER() OVER (PARTITION
-      BY fagenidcode ORDER BY fupdatetime DESC) AS _rn FROM yunnan0508.fab_agen) WHERE
-      _rn = 1
+    source: SELECT fagenidcode, fagencode, fagenname, flevel, ftypecode, fpidcode,
+      toString(fisleaf) AS fisleaf FROM (SELECT fagenidcode, fagencode, fagenname,
+      flevel, ftypecode, fpidcode, toString(fisleaf) AS fisleaf, ROW_NUMBER() OVER
+      (PARTITION BY fagenidcode ORDER BY fupdatetime DESC) AS _rn FROM yunnan0508.fab_agen)
+      WHERE _rn = 1
     description: 执收单位查询型维度：fab_agen 按 fagenidcode 去重取最新版本（fupdatetime DESC），295 行去重后
-      218 行
+      218 行；含 parent_agen/is_leaf 单位树层级钻取字段
     ai_context:
       instructions: fab_agen 原始 295 行含多版本，直连会扇出约 4.4 倍，必须使用本去重数据集；与事实表的边（D5/D6/D7：fchgagenidcode=fagenidcode）实测验证连接，to
         侧去重后唯一；去重实现说明：规格原文为 ORDER BY fupdatetime DESC LIMIT 1 BY fagenidcode，因引擎查询源解析器不支持
         LIMIT 1 BY，已等价改写为 ROW_NUMBER() OVER (PARTITION BY fagenidcode ORDER BY fupdatetime
-        DESC)=1（多列去重单排序列技巧），对账指纹一致（218 行）
+        DESC)=1（多列去重单排序列技巧），对账指纹一致（218 行）；parent_agen 指向表内 fagenidcode，可按 parent_agen=单位ID
+        自联结汇总子单位缴款（注意 2 个单位存在跨版本父编码漂移，见 parent_agen 字段说明）
     fields:
     - name: fagenidcode
       expression:
@@ -715,19 +925,52 @@ semantic_model:
           expression: ftypecode
       label: 单位类型代码
       description: 单位类型编码
+    - name: parent_agen
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fpidcode
+      label: 上级单位编码
+      description: 上级单位编码（物理 fpidcode），String 型，沿 parent_agen=fagenidcode 自联结构成单位树。实测：fab_agen 原始
+        295 行中 244 行有父编码、涉及 26 个不同父单位，全部指向表内有效 fagenidcode（无悬挂）；去重后 218 单位中 192 有父编码；2 个单位（18ff49716f334abf94e5405ef8911192、2a02256f21ae47a1bef24a7f99dbc352）跨版本父编码漂移（各
+        2 个不同 fpidcode，同秒内两次变更），去重取 fupdatetime 最新版后树可能受影响；典型用法：JOIN 子查询沿 parent_agen 汇总（示例：测试云南省教育厅1
+        直属 44 子单位、其中 43 叶子、10 个有直缴、直缴合计 160.47 亿）
+      ai_context:
+        synonyms:
+        - 上级单位
+        - 父单位
+        - 主管单位
+        - 单位树
+    - name: is_leaf
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toString(fisleaf)
+      label: 是否叶子单位
+      description: 是否叶子单位（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。实测（去重后 218
+        行）：''0''=26 非叶、''1''=192 叶；层级×叶标志分布 1级（20非叶+23叶）/2级（6非叶+159叶）/3级（10叶）。用途：层级聚合时只对 is_leaf=''1''
+        的叶子单位汇总防父子双重计数；注意 1 级也有 23 个叶子单位——顶层直属单位可直接挂缴款
+      ai_context:
+        synonyms:
+        - 叶子
+        - 末级单位
+        - 单位叶子
     custom_extensions:
     - vendor_name: DATUS
       data: '{"source_type": "query", "v": "1.11"}'
   - name: dim_subject
-    source: SELECT fsubcode, fsubname, fyear, toString(flevel) AS fsublevel FROM (SELECT
-      fsubcode, fsubname, fyear, flevel, ROW_NUMBER() OVER (PARTITION BY fsubcode
+    source: SELECT fsubcode, fsubname, fyear, toString(flevel) AS fsublevel, fpcode,
+      toString(fisleaf) AS fisleaf FROM (SELECT fsubcode, fsubname, fyear, flevel,
+      fpcode, toString(fisleaf) AS fisleaf, ROW_NUMBER() OVER (PARTITION BY fsubcode
       ORDER BY fyear DESC) AS _rn FROM yunnan0508.fab_subject) WHERE _rn = 1
-    description: 预算科目查询型维度：fab_subject 按年度取最新版（fyear DESC 去重），539 个科目
+    description: 预算科目查询型维度：fab_subject 按年度取最新版（fyear DESC 去重），539 个科目；含 parent_subject/subject_leaf
+      科目树字段
     ai_context:
       instructions: 事实表 fsubid/frecsubcode 与 fab_subject.fid 不同（27 清单已验证），科目属性连接只能走科目代码（fsubcode/frecsubcode），D8/D9
         边实测验证连接；同 fsubcode 多年度版本时本数据集取最新年度版；物理表无 fsublevelname 列，fsublevel 取自 toString(flevel)；去重实现说明：规格原文为
         ORDER BY fyear DESC LIMIT 1 BY fsubcode，因引擎查询源解析器不支持 LIMIT 1 BY，已等价改写为 ROW_NUMBER()
-        OVER (PARTITION BY fsubcode ORDER BY fyear DESC)=1，对账指纹一致（539 行）
+        OVER (PARTITION BY fsubcode ORDER BY fyear DESC)=1，对账指纹一致（539 行）；科目树字段 parent_subject（fpcode）/subject_leaf（fisleaf）随去重
+        SELECT 一并提供；科目码前缀即层级路径（10301 系=政府性基金收入 103 之下）
     fields:
     - name: fsubcode
       expression:
@@ -761,10 +1004,40 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fsublevel
       label: 科目层级
-      description: 科目层级（物理 flevel 数值转字符串）
+      description: 科目层级（物理 flevel 数值转字符串，String 型）；实测去重后 539 科目分布：1级 1/2级 10/3级 155/4级 373；科目码前缀即层级路径（10301
+        系=政府性基金收入 103 之下）。按 07 标准 §3.2 同义冗余不重复建模：subject_level 与本字段映射同一物理列 flevel，不重复声明
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
+    - name: parent_subject
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fpcode
+      label: 上级科目编码
+      description: 上级科目编码（物理 fpcode），String 型，沿 parent_subject=fsubcode 自联结构成科目树。实测：fab_subject 3,143 行全部有父编码（一级科目 fpcode=''
+        除外，去重后仅 1 个一级科目'非税收入'103）；fpcode 全部指向表内有效 fsubcode（无悬挂，实测 JOIN 0 孤儿）；去重后 539 科目（1级1/2级10/3级155/4级373，叶
+        450/非叶 89）；103 非税收入下直属 10 个二级类（10301 政府性基金收入等）；同 fsubcode 多年度版本的 fpcode/flevel/fisleaf
+        三字段实测完全稳定（跨版本漂移 0，fab_subject 按 (fsubcode,fyear) 唯一，去重取最新年不影响树结构）；实测场景：10301 政府性基金收入下 7
+        个叶子科目有缴款（民航发展基金 3,085.08 万最高）
+      ai_context:
+        synonyms:
+        - 上级科目
+        - 父科目
+        - 科目树
+    - name: subject_leaf
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toString(fisleaf)
+      label: 是否叶子科目
+      description: 是否叶子科目（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。实测（去重后 539
+        行）：450 叶/89 非叶；有缴款的 23 个科目全部是叶子（实测非叶科目无直接缴款行 0）——缴款全部落在叶子科目，层级聚合无双重计数风险，但 fisleaf
+        仍建议保留作查询守卫
+      ai_context:
+        synonyms:
+        - 叶子科目
+        - 末级科目
     custom_extensions:
     - vendor_name: DATUS
       data: '{"source_type": "query", "v": "1.11"}'
@@ -924,7 +1197,8 @@ semantic_model:
       - dialect: CLICKHOUSE
         expression: SUM(funddivide_transfer.ftransamt)
     ai_context:
-      instructions: 批次明细行 ftransamt 直 SUM；划拨完成/未划拨金额用本指标按 fistransfer 收窄（见 derive
+      instructions: 批次明细行 ftransamt 直 SUM；空键行（fcollectid=''，178 行）ftransamt 全 NULL，全量 72,507.62
+        全在非空键行，单表聚合无需也不得按 fcollectid 过滤；划拨完成/未划拨金额用本指标按 fistransfer 收窄（见 derive
         filter 指标）；时间轴 cleardate
     custom_extensions:
     - vendor_name: DATUS
@@ -948,8 +1222,7 @@ semantic_model:
       - dialect: CLICKHOUSE
         expression: COUNT(DISTINCT funddivide_transfer.fcollectid)
     ai_context:
-      instructions: fcollectid 生命周期多版本非唯一，批次口径去重计数（COUNT(DISTINCT)，引擎编译为 uniqExact）；空串批次是否计入见
-        dataset 说明；时间轴 cleardate
+      instructions: fcollectid 生命周期多版本非唯一，批次口径去重计数（COUNT(DISTINCT)，引擎编译为 uniqExact）；空串批次不计入——空串是尚未汇总入批次的明细行而非批次，查询须排除 fcollectid=''（正确口径 428，含空串会多出 1 个假批次得 429）；时间轴 cleardate
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"个","uid":"hv4nn7pvs85tt3fue9ru05gx"}'
@@ -1045,7 +1318,7 @@ semantic_model:
         expression: SUM(CASE WHEN funddivide_transfer.fistransfer = '1' THEN funddivide_transfer.ftransamt
           END)
     ai_context:
-      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer='1' 表示该明细行已完成划拨
+      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer='1' 表示该明细行已完成划拨；空键行（fcollectid=''）ftransamt 全 NULL，不参与本指标，无需空键前置
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
@@ -1058,7 +1331,7 @@ semantic_model:
         expression: SUM(CASE WHEN funddivide_transfer.fistransfer != '1' THEN funddivide_transfer.ftransamt
           END)
     ai_context:
-      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer!='1' 表示该明细行尚未划拨
+      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer!='1' 表示该明细行尚未划拨；空键行（fcollectid=''）ftransamt 全 NULL，天然不计入本指标（未划拨口径=已入批次未划拨），无需空键前置
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_not_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
