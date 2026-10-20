@@ -102,6 +102,7 @@ uv run ruff format datus/ tests/ && uv run ruff check --fix datus/ tests/   # �
 uv run pytest tests/unit_tests/ -x
 uv run ruff format datus/ tests/
 uv run datus --datasource demo
+uv run datus --web --datasource yunnan0508
 ```
 
 ### 5. 注意事项
@@ -161,7 +162,7 @@ agent:
 | # | 入口 | 命令 | 访问方式 | 适用人群 |
 |---|---|---|---|---|
 | ① | **CLI 交互(REPL)** | `uv run datus --datasource demo` | 终端内交互 | 数据工程师 |
-| ② | **网页对话窗口** | `uv run datus --web --datasource demo` | 浏览器打开 **http://localhost:8501** | 分析师 |
+| ② | **网页对话窗口** | `uv run datus --web --datasource yunnan0508 --permission-mode auto` | 浏览器打开 **http://localhost:8501** | 分析师 |
 | ③ | REST API | `uv run datus-api --datasource demo` | http://localhost:8000 | 应用调用 |
 | ④ | MCP Server | `uv run datus-mcp --datasource demo` | 接入 Claude Desktop / Cursor 等 MCP 客户端 | 其他智能体 |
 | ⑤ | 免交互脚本模式 | `uv run datus -p "你的问题" --datasource demo` | stdout 输出 JSON | CI / 脚本管道 |
