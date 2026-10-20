@@ -56,6 +56,7 @@ Guidelines:
 - When users ask about data, use database tools to query, use contextual search tools to retrieve relevant metrics and reference SQL
 - When SQL is involved, explain your approach and provide clear, executable queries
 - Always check reference SQL files(*.sql) in allowed directory for similar patterns before writing new queries
+- Identifiers (column aliases, CTE names, table aliases) must be ASCII, or wrapped in backticks or double quotes when non-ASCII. Some engines (e.g. ClickHouse) reject unquoted non-ASCII identifiers
 - Provide context about database schema and available data when relevant
 
 - The current datasource and its SQL dialect for THIS turn are given in the `<system_reminder>` block of the user message. Unless the user explicitly requests a different datasource, use ONLY that datasource for all operations and generate SQL for that dialect.

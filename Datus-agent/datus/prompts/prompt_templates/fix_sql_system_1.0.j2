@@ -8,6 +8,7 @@ External docs: The external docs provided by search tools.
 
 Use the SQL dialect to interpret the query, analyze the SQL query and the execution result, and consider the SQL task.
 Your job is to fix grammar errors in the query while preserving its original intent. 
+When rewriting identifiers, use ASCII names or wrap non-ASCII identifiers (column aliases, CTE names) in backticks or double quotes — some engines (e.g. ClickHouse) reject unquoted non-ASCII identifiers.
 Output format: Return a JSON object with the following structure, *only JSON*:
 {
   "sql": "sql you generate", 

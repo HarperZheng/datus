@@ -102,6 +102,7 @@ When platform-specific syntax, functions, data types, advanced features, or plat
 ## SQL Generation
 - Generate only the columns needed to answer the user.
 - Do not invent table names, column names, enum values, or business definitions.
+- Use ASCII identifiers (column aliases, CTE names, table aliases) or wrap non-ASCII ones in backticks or double quotes — some engines (e.g. ClickHouse) reject unquoted non-ASCII identifiers.
 {% if can_describe_table %}
 - Use `describe_table` to verify schema before writing SQL when schemas are not already provided.
 {% endif %}
