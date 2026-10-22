@@ -1,4 +1,4 @@
-# Dosi 语义建模速查卡（非税收入收缴域 · yunnan0508）
+# Dosi 语义建模速查卡
 
 > **定位**：Dosi（Datus 内置语义引擎，OSI YAML）建模的权威速查参考。回答三个问题：**core 字段有哪些、DATUS 扩展 key 有哪些、它们如何被运行时消费**。
 >
@@ -106,7 +106,7 @@
 
 | OSI core 字段 | 必填 | 说明 | 本项目实例 |
 |---|---|---|---|
-| `name` | R | datasource 内唯一（本项目中文命名） | ✅ `非税缴款金额_直缴` |
+| `name` | R | datasource 内唯一（本项目中文命名） | ✅ `非税缴款金额`（2026-10-20 改名，原 `_直缴` 后缀废弃） |
 | `expression` | R | **纯聚合**，字段带 dataset 限定 | ✅ `SUM(paybook_full_high.famt)` |
 | `description` | – | 业务描述 | ✅ |
 | `datatype` | – | 逻辑类型 | |
@@ -179,7 +179,7 @@
 ```sql
 SELECT
     toStartOfMonth(toDate(ffilldate)) AS metric_time__month,
-    SUM(famt) AS `非税缴款金额_直缴`        -- ⚠️ 中文别名必须反引号
+    SUM(famt) AS `非税缴款金额`        -- ⚠️ 中文别名必须反引号；直缴另加 AND fbustype='1'
 FROM yunnan0508.fne_paybook_full_high
 WHERE toDate(ffilldate) >= toDate('2025-08-01')
   AND toDate(ffilldate) <  toDate('2025-09-01')
@@ -198,7 +198,7 @@ GROUP BY metric_time__month
 core expression 仍是纯聚合（fallback），比较逻辑写入 DATUS `window` object：
 
 ```yaml
-- name: 非税缴款金额_直缴_同比
+- name: 非税缴款金额_同比
   expression:
     dialects:
     - dialect: CLICKHOUSE
@@ -208,7 +208,7 @@ core expression 仍是纯聚合（fallback），比较逻辑写入 DATUS `window
     data: '{"v":"1.11","dataset":"paybook_full_high",
             "time_dimension":"paybook_full_high.fill_date",
             "subject_path":["非税收入","资金链","缴款"],"unit":"元",
-            "window":{"base":"非税缴款金额_直缴",
+            "window":{"base":"非税缴款金额",
                       "offset":{"count":1,"granularity":"year","direction":"back"},
                       "calculation":"value"},
             "uid":"vmke8ep5ak3p56rke8246tie"}'
@@ -225,8 +225,8 @@ core expression 仍是纯聚合（fallback），比较逻辑写入 DATUS `window
 ## 五、完整 metric 双世界标注（L869-875 真实原文）
 
 ```yaml
-- name: 非税缴款金额_直缴                     # ┐
-  description: 直缴非税缴款金额（…famt 直 SUM） │ OSI CORE
+- name: 非税缴款金额                           # ┐（2026-10-20 改名，原 非税缴款金额_直缴）
+  description: 非税缴款金额（…famt 直 SUM，全业务类型） │ OSI CORE
   expression:                                # │（校验严格，字段封闭）
     dialects:                                # │
     - dialect: CLICKHOUSE                    # │
@@ -275,8 +275,9 @@ core expression 仍是纯聚合（fallback），比较逻辑写入 DATUS `window
 | 6 | 汇缴（une_）与直缴（fne_）混算；未过滤空键 | 分口径；`fcollectid != ''` |
 | 7 | 为 0 行表建 dataset | 先查行数 |
 | 8 | 跨 dataset 金额 compose / 跨边求和 | 金额指标锚定单 dataset；跨环节对比用双指标并查或 query-backed 对比宽表 |
+| 9 | 表内混入未建模的分类字段被当作同质行（**2026-10-20 实例：paybook_full_high 的 fbustype 混有 1=直缴/2=汇缴，首批指标命名 `_直缴` 却 SUM 全表**） | 分类字段的每个码值必须先 distinct 实测再建模；业务口径词（如"直缴"）要么做成维度+synonyms 要么写进 expression 过滤，**禁止只寄托在"选对表"假设上**；指标名不携带未实施的口径后缀 |
 
-**口径规则（写死在 expression / ai_context）**：笔数一律 `uniqExact(fid)`；时间兜底 `coalesce(toDate(fmsgdate), toDate(ftransdate))`；缴库直接 SUM 虚增 44 倍（505 行原始含 462 冗余，去重 76 行）。
+**口径规则（写死在 expression / ai_context）**：笔数一律 `uniqExact(fid)`；时间兜底 `coalesce(toDate(fmsgdate), toDate(ftransdate))`；缴库直接 SUM 虚增 44 倍（505 行原始含 462 冗余，去重 76 行）；直缴/汇缴按 `fbustype='1'/'2'` 切片（2026-10-20 维度化改造后：指标名 `非税缴款金额`/`非税缴款笔数` 为全业务类型口径，window.base 与 compose.expr 已同步换引用）。
 
 **对账硬数字（对不上即拒绝上线）**：清分金额 16,016,079,467.68；直缴 fid 去重 1,101；缴款金额 18,332,207,203.13；缴库金额（去重）29,535,106.14；汇缴 9,012 / 票据 53,386。
 

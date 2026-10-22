@@ -9,7 +9,8 @@
 - [二、建模：model.yaml](#二建模modelyaml)
 - [三、建模硬规则（语义契约）](#三建模硬规则语义契约)
 - [四、动手闭环（5 条命令）](#四动手闭环5-条命令)
-- [五、两条捷径](#五两条捷径)
+- [五、在 Datus-agent 中建模：semantic_modeling 工作流](#五在-datus-agent-中建模semantic_modeling-工作流)
+- [六、两条捷径](#六两条捷径)
 
 ---
 
@@ -224,9 +225,50 @@ dosi query --metrics revenue --group-by orders.status \
 
 ---
 
-## 五、两条捷径
+## 五、在 Datus-agent 中建模：semantic_modeling 工作流
 
-1. **不用手写 YAML**：装好 Datus-agent 后，它的 Agent 读数据库 schema + 历史 SQL **自动生成 OSI 格式语义模型**，`dosi validate` 兜底校验。手写只用于精调。
+> 本节转向 **Datus-agent 内的建模实施**：前三节讲的是 Dosi CLI / 手写 YAML 的通用契约，实际项目（如本项目 fne_fund_main.yml 的建立与两批字段补全）应通过 `semantic_modeling` 子代理完成——它在 Dosi 契约之上补齐了"读库取证 → 编译验证 → 自动同步 KB"的完整闭环。
+
+### 5.1 一次运行的工作流（5 步）
+
+1. **检查已有模型，选定唯一目标文件**（每轮只编辑一个 semantic model）；
+2. **读真实 schema 和关系证据**（`describe_table` / 实测查询）——不臆造字段名与码值；
+3. **按依赖顺序创建/更新** dataset → field → relationship → metric；
+4. **对整个目标文件做 validate_semantic 编译验证**（可加 dry-run 指标查询）；
+5. **验证通过后把 YAML 自动同步进 KB**（`sync_osi_to_db`）——所以建模后**不需要手动跑 `bootstrap-kb`**。
+
+**产出三态**：`generated`（建好并已同步）/ `skipped`（无需改动）/ `blocked`（证据不足，会解释缺什么）。
+
+### 5.2 关键设计约束（本项目踩过的点均对应）
+
+| 约束 | 本项目实证 |
+|---|---|
+| **YAML 是唯一事实源**（source of truth）；KB 投影只是可检索派生物，不能直接改投影——手改 YAML 必须跑 `bootstrap-kb --components semantic_model --kb_update_strategy sync-yaml` 重放 | 2026-10-20 实测：两批建模 finalizer 自动同步后，`search_semantic_objects` / `search_metrics` 立即可见新字段与改名指标 |
+| **键声明只认 DDL**：主键/唯一键只从物理约束来，不扫数据猜——无键就省略并解释，宁缺勿错 | `fne_paybook_full_high.fid` 非唯一键（147 个重复 fid）——靠 `ai_context.instructions` 声明"笔数必须 uniqExact(fid)"兜住 |
+| **每轮只动一个模型文件** | 本项目按 04 号标准分 fne_fund_main / fne_bill_link / … 逐文件推进，正符合该契约 |
+| **方言逐条声明**：每个字段 expression 带 `dialect: CLICKHOUSE` | 中文列别名必须反引号、String 日期必须 `toDate()` 包裹，全部写在 expression 内（非本地约定，是方言契约） |
+| **指标带稳定 uid**（24 位 CUID2，引擎管理）：改名时**保留 uid**、新建不同指标才省略 | `_直缴`→全口径改名（非税缴款金额/非税缴款笔数）时保留 uid，身份与历史引用不乱 |
+
+### 5.3 在整个体系里的位置
+
+```text
+人工/需求 ──> semantic_modeling（建模）──> B4 YAML（事实源，subject/semantic_models/）
+                                              │ 自动同步（sync_osi_to_db）
+                                              ▼
+                                    A1/A2/A3 KB 投影（LanceDB datus_db/）──> ask_metrics / gen_sql 检索使用
+                                              │
+                                    Dosi runtime（query_metrics 真正算数，读 YAML）
+```
+
+- **与 ask_metrics / gen_sql 的分工**：`semantic_modeling` 定义指标与结构（弹药工厂）；`ask_metrics` 用已有指标答数；`gen_sql` 写一条 SQL（语义层给底座，允许超越已有指标）。
+- **与手写 YAML 的分工**（对照第三节契约）：契约本身（硬规则、错误码）不变，semantic_modeling 是契约之上的**自动化实施路径**——普通建模走子代理，CLI 手工校验（第四节）仅用于精调与 CI 关卡。
+- **配套项目纪律**：字段入模判定走 [07-建模判断标准](../non_tax/07-建模判断标准.md)，字段台账回填走 [06-当前建模字段清单](../non_tax/06-当前建模字段清单.md)，知识资产全景见 [05-知识资产与检索](../non_tax/05-知识资产与检索.md)。
+
+---
+
+## 六、两条捷径
+
+1. **不用手写 YAML**：装好 Datus-agent 后，`semantic_modeling` 子代理读数据库 schema + 业务描述**自动生成 OSI 格式语义模型**（工作流见第五节），`validate_semantic` 兜底校验。手写只用于精调。
 2. **照抄示例**：`~/.local/share/dosi/examples/` 下有四套现成模型：
    - `orders` — 最小，教程用
    - `lod-commerce` — LOD 电商全套路（模型、数据、查询）
@@ -235,7 +277,7 @@ dosi query --metrics revenue --group-by orders.status \
 
 ### 建议路径
 
-先拿 `orders` 跑通第 1、4 步（对着自己的数仓改 `source:` 和连接配置）→ 再把真实业务表加进 `datasets` → 复杂指标（LOD、窗口）让 Datus-agent 帮你生成。
+先拿 `orders` 跑通第四节第 1、4 步（对着自己的数仓改 `source:` 和连接配置）→ 真实项目转 `semantic_modeling` 工作流（第五节）建模 → 复杂指标（LOD、窗口）同样交给子代理生成 → 字段判定与台账维护走 07/06 号项目标准。
 
 ---
 
