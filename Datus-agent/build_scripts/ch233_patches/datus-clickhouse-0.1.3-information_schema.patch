@@ -1,0 +1,35 @@
+diff --git a/datus_clickhouse/connector.py b/datus_clickhouse/connector.py
+index 75d1866..0381729 100644
+--- a/datus_clickhouse/connector.py
++++ b/datus_clickhouse/connector.py
+@@ -142,9 +142,9 @@ class ClickHouseConnector(SQLAlchemyConnector, MigrationTargetMixin):
+         # Build WHERE clause
+         if database_name:
+             safe_db = database_name.replace("'", "''")
+-            where = f"TABLE_SCHEMA = '{safe_db}'"
++            where = f"table_schema = '{safe_db}'"
+         else:
+-            where = f"{list_to_in_str('TABLE_SCHEMA not in', list(self._sys_databases()))}"
++            where = f"{list_to_in_str('table_schema not in', list(self._sys_databases()))}"
+ 
+         # Get metadata configuration
+         metadata_config = _get_metadata_config(table_type)
+@@ -152,10 +152,15 @@ class ClickHouseConnector(SQLAlchemyConnector, MigrationTargetMixin):
+         # Build and execute query
+         type_filter = ""
+         if metadata_config.table_types:
+-            type_filter = list_to_in_str("and table_type in ", metadata_config.table_types)
++            # ClickHouse <=23.x returns table_type as UInt8 codes (1=BASE TABLE, 2=VIEW,
++            # 3=FOREIGN TABLE, 4=LOCAL TEMPORARY, 5=SYSTEM VIEW); newer versions return
++            # strings. Map names to codes for old servers; unknown values pass through.
++            type_codes = {"BASE TABLE": 1, "VIEW": 2, "FOREIGN TABLE": 3, "LOCAL TEMPORARY": 4, "SYSTEM VIEW": 5}
++            values = [type_codes.get(v, v) for v in metadata_config.table_types]
++            type_filter = "and table_type in (" + ",".join(str(v) for v in values) + ")"
+         query = (
+-            f"SELECT TABLE_SCHEMA, TABLE_NAME "
+-            f"FROM information_schema.{metadata_config.info_table} "
++            f"SELECT table_schema, table_name "
++            f"FROM INFORMATION_SCHEMA.{metadata_config.info_table} "
+             f"WHERE {where} {type_filter}"
+         )
+ 
