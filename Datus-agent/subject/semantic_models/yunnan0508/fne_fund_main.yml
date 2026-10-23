@@ -17,7 +17,9 @@ semantic_model:
       instructions: 分析缴款/清分/归属/科目/项目层级用；金额可直 SUM，笔数必须 uniqExact(fid)：147 个 fid 存在生命周期多版本重复，fid
         非唯一键；主时间轴 fill_date=toDate(ffilldate)，day 粒度；与汇缴（une_）口径不混算；R1 边（被 funddivide_transfer.fpaybooksubid
         引用）实测 JOIN 1,130 行；fbustype：1=直缴、2=汇缴，表内混合存在（全表实测 1=1,063 行/2=209 行）；凡用户提及"直缴"必须按
-        fbustype='1' 收窄，禁止将全表 SUM(famt) 表述为直缴金额
+        fbustype='1' 收窄，禁止将全表 SUM(famt) 表述为直缴金额；日期维度体系：除主时间轴 fill_date 外已建模日期维度（有效期 eff_date、缴款
+        pay_date、资金到账 received_date、划转 trans_date、划拨到账 enter_date），仅作分析维度，dataset 与指标 time_dimension
+        不变；用户问某日缴款默认按开票口径 fill_date，严格缴款口径改用 pay_date（差异见字段说明）
     fields:
     - name: fid
       expression:
@@ -282,16 +284,109 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(paybook_full_high.fcleardate)
+          expression: toDate(nullIf(paybook_full_high.fcleardate, ''))
       dimension:
         is_time: true
       label: 清分日期
-      description: 清分日期（fcleardate 字符串转 Date），本表二级时间轴（主时间轴仍是 fill_date，dataset 与指标 time_dimension 均不变）；实测
-        760/1,272 行非空；清分时效分析用（clear_date - fill_date 间隔），未清分行此值为空
+      description: 清分日期（fcleardate 字符串转 Date，nullIf 空串守卫——空串直接 toDate 在 CH 23.3 抛 CANNOT_PARSE_DATE），本表二级时间轴（主时间轴仍是
+        fill_date，dataset 与指标 time_dimension 均不变）；实测 760/1,281 行非空（521 行空串转 NULL）；清分时效分析用（clear_date - fill_date 间隔），未清分行
+        此值为 NULL
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","time_granularity":"day"}'
+    - name: eff_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(paybook_full_high.feffdate, ''))
+      dimension:
+        is_time: true
+      label: 缴款书有效期
+      description: 缴款书有效期（feffdate 字符串转 Date，nullIf 空串守卫），NOT NULL，实测 1,281 行 100% 非空，范围 2022-03-21~2028-09-02（含未来
+        日期，有效期天然可晚于当前）；判断已过期按本字段与当前日期比较，不能当业务发生时间轴用
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 有效期
+    - name: pay_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(paybook_full_high.fdate, ''))
+      dimension:
+        is_time: true
+      label: 缴款日期
+      description: 缴款书缴款日期（fdate 字符串转 Date，nullIf 空串守卫），NOT NULL，实测 1,281 行 100% 非空，范围 2021-12-21~2026-10-07；与主时间轴
+        fill_date（开票日）实测 1,220 行同日、61 行晚于开票日、0 行早于开票日——用户问某日缴款/收款金额时按口径取舍：开票口径用 fill_date，缴款口径用本字段
+        （两个缴款指标默认锚定 fill_date，缴款口径需显式改用本字段分组/过滤）；源侧 fdate 另承载生成日期义（文档 150 号字段映射），本表主语义取缴款日期；
+        文档 170 号缴款日期 fpaydate 列在本物理表不存在，无法建模
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 缴款日
+    - name: received_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(paybook_full_high.freceiveddate, ''))
+      dimension:
+        is_time: true
+      label: 资金到账日期
+      description: 缴款资金到账日期（freceiveddate 字符串转 Date，nullIf 空串守卫），实测 869/1,281 行非空（412 行空串转 NULL，以未到账行为主），范围
+        2022-01-07~2026-08-05；与 is_received（fisreceived）标志配套，实测轻微错位（日期有值但标志为 0 的 2 行、标志为 1 但日期为空的 7 行）——到账/欠缴口径
+        过滤以 is_received 为准，本字段用于到账时效（received_date 与 fill_date/pay_date 的间隔）；与 enter_date（划拨侧到账）是两条不同资金链，勿混用
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 资金到账
+        - 收款到账
+    - name: trans_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(paybook_full_high.ftransdate, ''))
+      dimension:
+        is_time: true
+      label: 划转日期
+      description: 划转/扣款日期（ftransdate 字符串转 Date，nullIf 空串守卫），源侧一列两义（划拨表 FTRANSDATE=划转日期、扣款表 FTRANSDATE=扣款日期
+        映射同列），本表主语义取划转日期；实测近全空：仅 2/1,281 行有值（2024-08-29、2024-11-07），当前测试数据下划拨日期基本未回填，时效分析不可用
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 划拨日期
+        - 扣款日期
+    - name: enter_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(paybook_full_high.fenterdate, ''))
+      dimension:
+        is_time: true
+      label: 划拨到账日期
+      description: 划拨到账/入库日期（fenterdate 字符串转 Date，nullIf 空串守卫），源侧一列两义（划拨到账、入库两条源记录映射同列）；实测近全空：仅
+        1/1,281 行有值（2024-08-29），物理表 fisenter 到账标志（未建模）分布为空 1,243 行/0=37 行/1=1 行，与本列一致，当前测试数据下到账/入库时效分析
+        不可用；与 received_date（缴款资金到账，收缴侧）是两条不同资金链
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 到账日期
+        - 入库日期
     - name: budget_agen
       expression:
         dialects:
@@ -649,7 +744,7 @@ semantic_model:
     description: 划拨指令生命周期表，129 行
     ai_context:
       instructions: 划拨指令生命周期记录，fcollectid 存在多版本（129 行，JOIN 实测 160 行命中），R2 边 to 侧非唯一，测试环境放宽声明；金额直
-        SUM；主时间轴 transdate=toDate(ftransdate)，day 粒度
+        SUM；主时间轴 transdate=toDate(nullIf(ftransdate, ''))，day 粒度；实测 127/129 行 ftransdate 为空串转 NULL
     fields:
     - name: fcollectid
       expression:
@@ -679,11 +774,12 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(ftransdate)
+          expression: toDate(nullIf(ftransdate, ''))
       dimension:
         is_time: true
       label: 划拨日期
-      description: 划拨指令日期（ftransdate 字符串转 Date），本表主时间轴
+      description: 划拨指令日期（ftransdate 字符串转 Date，nullIf 空串守卫——空串直接 toDate 在 CH 23.3 抛 CANNOT_PARSE_DATE），本表主时间轴；实测
+        129 行中仅 2 行有值、127 行空串转 NULL，按本轴分组大部分落入 NULL 桶，时段趋势分析价值有限
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
