@@ -56,6 +56,9 @@ from datus.tools.semantic_tools.models import (
     ValidationIssue,
     ValidationResult,
 )
+from datus.utils.loggings import get_logger
+
+logger = get_logger(__name__)
 
 
 class DosiRuntime:
@@ -433,6 +436,14 @@ class DosiRuntime:
                 query,
                 connection=connection,
                 timeout_secs=float(self.config.timeout_seconds),
+            )
+            # 旁路留痕（2026-10-23，sql-sparring v4）：记录实际执行的 SQL 原文，
+            # 供外部按时间窗取证。不改变返回值与 LLM 所见；sql 放末位便于解析。
+            logger.info(
+                "dosi_sql_executed",
+                row_count=result.get("row_count"),
+                dialect=result.get("dialect"),
+                sql=result.get("sql"),
             )
             return QueryResult(
                 columns=list(result["columns"]),
