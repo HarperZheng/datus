@@ -22,7 +22,7 @@
 /tests/sessions
 /tests/semantic_models
 sql_processing_errors.log
-/conf/agent.yml
+# /conf/agent.yml
 # DuckDB runtime artifacts
 *.duckdb.wal
 *.duckdb.tmp
@@ -38,7 +38,7 @@ before_reflection_*.yaml
 /benchmark/semantic_layer/semantic_models
 /dist
 *.egg-info
-.claude
+# .claude
 /.omc
 
 # MkDocs build output

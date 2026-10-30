@@ -1,5 +1,5 @@
 # Claude Code session state
-.claude/
+# .claude/
 
 # Python build artifacts
 __pycache__/

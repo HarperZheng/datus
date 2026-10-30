@@ -1,0 +1,28 @@
+agent:
+  home: .datus
+  name: datus
+  language: zh
+
+  target: glm
+
+  models:
+    glm:
+      type: openai
+      # 经 Windows 宿主机 TCP 转发访问 LLM(绕过宿主机代理 TUN 对 WSL 流量的劫持)
+      # ${WSL_GW} 动态取 WSL NAT 网关,冒号后是兜底值(2026-10-17 时为 172.31.112.1)
+      base_url: http://${WSL_GW:-172.31.112.1}:18304/v1
+      api_key: dummy
+      model: GLM-5.3-Flash
+
+  services:
+    datasources:
+      yunnan0508:
+        type: clickhouse
+        host: 172.18.166.126
+        port: 8123
+        username: yunnan0508
+        password: "Bstdb@2021#"
+        database: yunnan0508
+        # CH <23.5 兼容反代开关:true=走反代(剥 session_timezone+改写 dateTrunc);
+        # off/不写=直连原生路径。CH 升级 >=23.5 后改 off 或删键。
+        ch233_compat: true
