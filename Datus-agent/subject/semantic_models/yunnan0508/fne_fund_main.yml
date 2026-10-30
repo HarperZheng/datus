@@ -1,33 +1,40 @@
 version: 0.2.0.dev0
 semantic_model:
 - name: fne_fund_main
-  description: 非税收入资金链（缴款→清分→划拨→缴库）：核心骨架（paybook_full_high / funddivide_transfer /
-    treasury_transfer_dedup）+ 同主题补充（transfer_new / agen_treasury_high）+ round-03 查询型数据集（paybook_treasury_pair
-    缴款-缴库配对 / unpaid_paybook 未缴池 / transit_transfer_pool 划拨在途池 / income_daybook 收入流水）+
-    查询型维度（dim_agen / dim_subject），共 11 个 dataset、9 条实测验证关系（R1-R4 主链 + D5-D9 维度；新数据集自包含不建关系）
+  description: 非税收入资金链（缴款→清分→划拨→缴库）：核心骨架（paybook_full_high_item / funddivide_transfer /
+    treasury_transfer_dedup）+ 同主题补充（transfer_new / agen_treasury_high）+ 查询型数据集（paybook_treasury_pair
+    缴款-缴库配对 / unpaid_paybook 未缴池 / transit_transfer_pool 划拨在途池 / income_daybook 收入流水 /
+    no_income_paybook 已缴未形成收入池 / entered_uncleared_paybook 已缴库未清分池 / paybook_head 缴款书粒度票面总额）+
+    查询型维度（dim_agen / dim_subject）；查询型数据集自包含不建关系
   ai_context:
-    instructions: 金额指标一律锚定单 dataset（跨边求和会因 M:N 扇出膨胀）；测试环境放宽规则允许 to 侧非唯一的关系用于行级钻取，预期基数已写入各关系
-      ai_context；生产化时按 28 号标准 §七 复验升级；fbustype（业务类型：1=直缴、2=汇缴）仅存在于 paybook_full_high
+    instructions: 金额指标一律锚定单 dataset（跨边求和会因 M:N 扇出膨胀）；to 侧非唯一的关系仅授权行级钻取用途；fbustype（业务类型：1=直缴、2=汇缴）仅存在于 paybook_full_high_item
       数据集，仅缴款/清分/清分率类指标可按业务类型切片，禁止对其他 dataset（funddivide_transfer / treasury_transfer_dedup
-      / transfer_new / agen_treasury_high）的指标按业务类型分组或过滤；滞留类两池分家（2026-10-27 round-03 q23/q24）："执收单位已收未汇缴"
-      用 income_daybook 的 已收未汇缴金额（fisgenerec=0），"划拨指令已发未到账/在途滞留"用 transit_transfer_pool 的 在途滞留金额/在途滞留笔数，两池禁止混用
+      / transfer_new / agen_treasury_high）的指标按业务类型分组或过滤；滞留类两池分家："执收单位已收未汇缴"
+      用 income_daybook 的 已收未汇缴金额（fisgenerec=0），"划拨指令已发未到账/在途滞留"用 transit_transfer_pool 的 在途滞留金额/在途滞留笔数，两池禁止混用；
+      收入侧问题（收入单位/预算科目/收入区划/预算单位/主管部门口径）一律走
+      income_daybook（收入金额 + income_agen_name/subject_name/income_rgn_name/bgt_agen_name/dept_name 维度、enter_date 收入锚），与缴款侧
+      paybook_full_high_item 口径分家，禁止用缴款侧字段冒充收入侧口径；"对账"一词三义——资金对账=fisfundsrec/ffundsrecdate、
+      缴库报文对账=treasury_transfer_dedup.reconcile_status、清分=is_cleared，禁止互相顶替；退付域未建模缺口：
+      UNE_REFUND/FNE_BACKPAY/FNE_REFUND_DATA/FNE_REFUND/FNE_REFUND_RECEIPT 五表全未抽取，"退付金额/退付给缴款人"类问题
+      显式拒答并说明待扩抽取，不得以 0 作答
   datasets:
-  - name: paybook_full_high
+  - name: paybook_full_high_item
     source: yunnan0508.fne_paybook_full_high
-    description: 缴款书全生命周期宽表（缴款+清分事实，PAYBOOK+ITEM+状态），1,281 行，明细行粒度；round-03 补代理银行
-      （pay_bank_code/pay_bank_name）、头表金额（total_amt）与金额档位（amount_bucket）
+    description: 缴款书全生命周期明细行宽表（缴款+清分事实，PAYBOOK+ITEM+状态），一张缴款书拆多明细行；行级金额本粒度直 SUM：famt=缴款明细金额、fimamt=清分金额
     ai_context:
-      instructions: 分析缴款/清分/归属/科目/项目层级用；金额可直 SUM，笔数键统一 COUNT(DISTINCT fpaycode)（2026-10-26 round-02
-        全局拍板5：笔数键统一 fpaycode；全表 1,281 行 fid distinct 1,110 / fpaycode distinct 975，fid 有生命周期多版本重复、fpaycode
-        因明细拆多行亦非唯一，两者计数都必须去重）；主时间轴 pay_date=toDate(nullIf(fdate,''))（缴款日，day 粒度；2026-10-26 round-02 全局拍板1：缴款时间统一 FDATE，
-        toDate 精度不带时分秒；原主时间轴 fill_date 开票日降级为分析维度）；与汇缴（une_）口径不混算；R1 边（被 funddivide_transfer.fpaybooksubid
-        引用）实测 JOIN 1,130 行；fbustype：1=直缴、2=汇缴，表内混合存在（全表实测 1=1,063 行/2=209 行）；凡用户提及"直缴"必须按
+      instructions: 分析缴款/清分/归属/科目/项目层级用；金额可直 SUM，笔数键统一 COUNT(DISTINCT fpaycode)（fid 有生命周期多版本重复、
+        fpaycode 因明细拆多行亦非唯一，两者计数都必须去重）；主时间轴 pay_date=toDate(nullIf(fdate,''))（缴款日，day 粒度；缴款时间统一 FDATE，
+        toDate 精度不带时分秒；fill_date 为开票口径分析维度）；与汇缴（une_）口径不混算；本表 fid 被 funddivide_transfer.fpaybooksubid
+        引用；fbustype：1=直缴、2=汇缴，表内混合存在；凡用户提及"直缴"必须按
         fbustype='1' 收窄，禁止将全表 SUM(famt) 表述为直缴金额；日期维度体系：除主时间轴 pay_date 外已建模日期维度（开票日 fill_date、
         有效期 eff_date、资金到账 received_date、划转 trans_date、划拨到账 enter_date），仅作分析维度；"缴款/今年缴款"类问题一律按主时间轴
-        pay_date 过滤，开票口径需显式改用 fill_date（差异见字段说明）；未缴/欠缴口径已迁至 unpaid_paybook 数据集（2026-10-27 round-03
-        q22 拍板：UNE 开具侧左连本表无缴款记录+行级 fstate≠'2'），本表 fstate 不得当未缴池（'1' 实测仅 1 行）；"已缴"判定=行在本表存在即 FNE
-        侧有缴款记录（round-03 q19 左连判定已缴侧），金额分档统计用 amount_bucket × 有效缴款笔数；代理银行维度=pay_bank_code/pay_bank_name
-        （round-03 q15 拍板），frecbankname 是收款银行不作代理银行
+        pay_date 过滤，开票口径需显式改用 fill_date（差异见字段说明）；"已缴"判定=行在本表存在即 FNE
+        侧有缴款记录（UNE 侧左连判定），金额分档统计用 amount_bucket × 有效缴款笔数；"各代理银行代收/排名"类问题=指标 代收非税收入金额（锚定缴款书粒度数据集 paybook_head）；本数据集 pay_bank_code/pay_bank_name
+        服务明细行口径金额按代理银行分组；清分"分入"核心模式=两区划/两单位字段参与判定：分入本区划=frecrgncode=本区划 AND
+        fchgrgncode≠frecrgncode、分入本单位=rec_agen_id_code=本单位（分入金额一律=fimamt，禁用 ftransamt 划拨金额；
+        "分入本区划"过滤=frecrgncode=本区划）；资金去向=bgt_style_code（1=国库/2=财政专户/3=单位代收/4=其他，
+        分组维度，禁用资金性质 funds_nature——那是更细预算级次）；到账时效起 pay_date 终 received_date，对账完成=
+        funds_rec_flag/funds_rec_date（资金对账），与缴库报文对账（treasury_transfer_dedup.reconcile_status）、清分（is_cleared）三义勿混
     fields:
     - name: fid
       expression:
@@ -35,8 +42,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fid
       label: 缴款明细ID
-      description: 缴款明细生命周期ID；存在生命周期多版本重复，非唯一键；2026-10-26 round-02 全局拍板5 后笔数口径统一走 fpaycode（见
-        pay_code 字段），本字段仅作行标识与 R1/R4 连接键
+      description: 缴款明细生命周期ID；存在生命周期多版本重复，非唯一键；笔数口径统一走 fpaycode（见
+        pay_code 字段），本字段仅作行标识
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -74,8 +81,8 @@ semantic_model:
       dimension:
         is_time: true
       label: 缴款通知书填开日
-      description: 缴款通知书填开日期（ffilldate 字符串转 Date），开票口径分析维度；2026-10-26 round-02 全局拍板1 后主时间轴已切至
-        pay_date（缴款日），本字段降级仅作开票口径分析维度（"按开票日"类问题显式使用）
+      description: 缴款通知书填开日期（ffilldate 字符串转 Date），开票口径分析维度；主时间轴为
+        pay_date（缴款日），"按开票日"类问题显式使用本字段
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -110,8 +117,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fchgrgnname
       label: 执收区划名称
-      description: 执收单位所在区划名称（内联），String 型；实测 1,272 行 100% 非空，5 个 distinct 全分布：云南省本级 1,242 行/昆明市本级
-        17/五华区 7/官渡区 4/云龙县 2；与 fchgrgncode 一一对应，分组展示优先用本列；与归属区划 frecrgnname 实测 584 行不一致（区划间资金流入口径的近似基础；注意
+      description: 执收单位所在区划名称（内联），String 型；与 fchgrgncode 一一对应，分组展示优先用本列；与归属区划 frecrgnname 大量不一致（区划间资金流入口径的近似基础；注意
         frecrgnname 含空串与"中央"等特殊值，跨区归因口径需业务确认）
       ai_context:
         synonyms:
@@ -134,17 +140,15 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: frecrgncode
       label: 归属区划代码
-      description: 资金归属区划代码
+      description: 资金归属区划代码，String 型；值域：530000=云南省本级、''（空）=清分汇总前中间态、000000=中央、530100=昆明市本级、532929=云龙县、530102=五华区；「本区划」过滤取值=登录人所属区划，本库主体区划为云南省本级
+        530000；分组展示配 frecrgnname
     - name: frecbankname
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: frecbankname
       label: 收款银行名称
-      description: 缴款资金收款银行名称（内联），String 型；实测 1,281 行 100% 非空，9 个 distinct（trim 后仍 9 个，取值统一带尾部空格，过滤匹配时注意）：
-        中国建设银行 923 行/中国工商银行 125/中国银行 117/人民银行 80/中国邮政储蓄银行 14/中国农业银行 9/云南省农村信用社联合社 2/支付宝 1/中国光大银行 1；
-        2026-10-27 round-03 q15 拍板：本列是收款户开户网点（收款银行），不是代理银行——"各代理银行"分析一律用 pay_bank_code（fpaybankcode）+
-        pay_bank_name（fpaybankname），旧"按本列分组答代理银行"用法作废；编码 frecbankcode 维度暂不建（出现按编码对齐需求时再建）
+      description: 缴款资金收款银行名称（收款户开户侧，内联），String 型；取值统一带尾部空格，过滤匹配需 trim；值域含：中国建设银行/中国工商银行/中国银行/人民银行/中国邮政储蓄银行/中国农业银行/云南省农村信用社联合社/支付宝/中国光大银行；分组仅限收款银行视角
       ai_context:
         synonyms:
         - 收款银行
@@ -189,7 +193,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fistransfer
       label: 划拨标志
-      description: 是否已划拨：1=已划拨
+      description: 是否已划拨（String 型，过滤值必须带引号）：1=已划拨；值域含 ''（空）、'0'（''与'0'均未划拨）、'1'；未划拨池=''或'0'
     - name: fstate
       expression:
         dialects:
@@ -197,9 +201,11 @@ semantic_model:
           expression: fstate
       label: 缴款书状态
       description: 缴款书生命周期状态，String 型，过滤值必须带引号；码值枚举（源码 UPayBook.xml：1=未缴款、2=作废、3=已缴款、4=已到账）；
-        实测分布（1,281 行）：'3'=1266 行（主导状态）、''（空）=13 行、'2'=1 行、'1'=1 行；注意 3 是主导但非唯一状态，过滤/分组时保留空串与其他码值的可能性；
-        2026-10-27 round-03 q22 拍板：未缴/欠缴判定已迁至 unpaid_paybook 数据集（UNE 左连判定），本字段='1' 实测仅 1 行不得当未缴池；
-        本字段在宽表的可用过滤=有效缴款 fstate≠'2'（round-03 q19：本表 FSTATE 不在 insert 列清单、值来自 UNE 侧状态，仅作废排除可靠）
+        值域含 '3' 与 ''（空），过滤时保留空串与其他码值的可能性；
+        本字段在宽表的可用过滤=有效缴款 fstate≠'2'（本表 FSTATE 不在 insert 列清单、值来自 UNE 侧状态，仅作废排除可靠）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
       ai_context:
         synonyms:
         - 缴款状态
@@ -223,11 +229,9 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.ffundsnaturecode
+          expression: paybook_full_high_item.ffundsnaturecode
       label: 资金性质
-      description: 资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空；实测码值（全表 1,272 行口径）：12=政府性基金预算收入
-        1,083 行/183.16 亿元（金额占比约 99.9%）、11=一般公共预算收入 97 行、2=财政专户管理资金 86 行、5=其他 6 行；直缴切片（fbustype='1'，1,063
-        行）分布为 12=895 行/160.47 亿元、11=84 行、2=78 行、5=6 行；与 funddivide_transfer.funds_nature（frecfundsnaturecode）同码表
+      description: 资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空；码值：12=政府性基金预算收入、11=一般公共预算收入、2=财政专户管理资金、5=其他；与 funddivide_transfer.funds_nature（frecfundsnaturecode）同码表
       ai_context:
         synonyms:
         - 资金性质
@@ -238,18 +242,33 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.ffundsnaturename
+          expression: paybook_full_high_item.ffundsnaturename
       label: 资金性质名称
       description: 资金性质中文名称（内联展示列），与 funds_nature（ffundsnaturecode）一一对应，取值：政府性基金预算收入/一般公共预算收入/财政专户管理资金/其他；分组展示优先用本列，过滤按码列
         funds_nature
+    - name: rec_funds_nature
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecfundsnaturecode
+      label: 接收侧资金性质
+      description: 接收侧（清分落账侧）资金性质码（物理 frecfundsnaturecode，String 型，过滤值必须带引号；语义对应源侧资金分类 FFUNDSORT）；
+        值域：12=政府性基金预算收入、2=财政专户管理资金、11=一般公共预算收入、5=其他、''（空）=未清分中间态；与缴款侧 funds_nature（ffundsnaturecode）同码表；
+        资金性质错配判定列（应缴国库性质 11-14 实落专户，见 资金性质错配笔数 指标）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+      ai_context:
+        synonyms:
+        - 接收侧资金性质
+        - 落账资金性质
     - name: income_sort
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fincomesortname
+          expression: paybook_full_high_item.fincomesortname
       label: 收入分类
-      description: 收入分类名称（单列即名称，无配套码列）；实测分布：政府性基金收入 1,006 行/182.85 亿元、专项收入 142 行、行政事业性收费收入
-        109 行、罚没收入 9 行、空 6 行
+      description: 收入分类名称（单列即名称，无配套码列）；值域含 政府性基金收入/专项收入/行政事业性收费收入/罚没收入 及空值
       ai_context:
         synonyms:
         - 收入分类
@@ -260,10 +279,10 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fpaycode
+          expression: paybook_full_high_item.fpaycode
       label: 票据关联码
-      description: 财政票据关联码（缴款码），String 型；100% 非空，1,281 行共 975 个 distinct（2026-10-26 复测）；票据链（une_cbill_high.fpaycode）与资金链之间唯一验证连通的键（fpid
-        跨链实测 0 行命中）；2026-10-26 round-02 全局拍板5：全部缴款类笔数指标（缴款/完成/未缴/分档）统一以本字段去重计数；为
+      description: 财政票据关联码（缴款码），String 型；100% 非空；票据链（une_cbill_high.fpaycode）与资金链之间唯一验证连通的键（单据键 fpid
+        跨链无命中，不用于跨链）；全部缴款类笔数指标（缴款/完成/未缴/分档）统一以本字段去重计数；为
         fne_bill_link.yml 票据-资金桥接模型预铺桥键，本文件内不声明关系
       ai_context:
         synonyms:
@@ -273,11 +292,10 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fpayername
+          expression: paybook_full_high_item.fpayername
       label: 缴款人（付款方）
-      description: 缴款人/付款方名称（内联），String 型；实测 1,268/1,281 行非空、449 个 distinct（Top：测试单位 209 行、云南发展改革委员会
-        57 行、李思维 47 行、hm 35 行、博思软件 32 行）；缴款人排名类问题（如 Top10 缴款人）按本列分组（round-02 q14 拍板）；账号类字段
-        fpayerno/fpayerid 按拍板不建模
+      description: 缴款人/付款方名称（内联），String 型；存在含"测试"字样的测试数据单位（数据污染），排名类结果需业务甄别；缴款人排名类问题（如 Top10 缴款人）按本列分组；账号类字段
+        fpayerno/fpayerid 不建模
       ai_context:
         synonyms:
         - 缴款人
@@ -288,11 +306,9 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fisclear
+          expression: paybook_full_high_item.fisclear
       label: 是否清分
-      description: 是否已清分标志（物理 fisclear 为 Nullable(UInt32)，实测值域仅 0/1 无 NULL）：1=已清分 757 行、0=未清分 515 行；"未清分"
-        过滤字段；清分环节与对账无关（round-02 q27 拍板：对账判定在缴库报文表 reconcile_status，禁止把本字段当"对账"落点）；未缴/欠缴口径见
-        unpaid_paybook 数据集（2026-10-27 round-03 q22 拍板）
+      description: 是否已清分标志（物理 fisclear 为 Nullable(UInt32)，值域仅 0/1 无 NULL）：1=已清分、0=未清分；清分环节判定字段
       datatype: Integer
       ai_context:
         synonyms:
@@ -303,11 +319,10 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fisreceived
+          expression: paybook_full_high_item.fisreceived
       label: 资金是否到账
-      description: 资金是否到账标志（物理 fisreceived 为 Nullable(UInt32)，实测值域仅 0/1 无 NULL）：1=已到账 874 行（638 个 fpaycode）、0=未到账 407
-        行；到账环节标志（比缴款晚一环，源码 UPayBook.xml），0 含"已缴款未到账"中间态——不等于欠缴，2026-10-27 round-03 q22 拍板后未缴/欠缴判定在
-        unpaid_paybook 数据集，禁用 is_received='0' 表述欠缴；"未到账"过滤与代收金额口径（round-03 q15：fisreceived='1'）仍可用本字段
+      description: 资金是否到账标志（物理 fisreceived 为 Nullable(UInt32)，值域仅 0/1 无 NULL）：1=已到账、0=未到账（0 含"已缴款未到账"中间态）；
+        到账环节标志（比缴款晚一环，源码 UPayBook.xml）；"已到账/未到账"过滤（明细行口径）用本字段
       datatype: Integer
       ai_context:
         synonyms:
@@ -318,13 +333,13 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.fcleardate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.fcleardate, ''))
       dimension:
         is_time: true
       label: 清分日期
       description: 清分日期（fcleardate 字符串转 Date，nullIf 空串守卫——空串直接 toDate 在 CH 23.3 抛 CANNOT_PARSE_DATE），本表二级时间轴
-        （主时间轴为 pay_date，round-02 q16 拍板清分日期双侧时间轴对齐）；实测 760/1,281 行非空（521 行空串转 NULL）；清分时效分析用（clear_date -
-        fill_date 间隔），未清分行此值为 NULL
+        （主时间轴为 pay_date，清分日期双侧时间轴对齐）；未清分行此值为 NULL；清分时效分析用（clear_date -
+        fill_date 间隔）
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -333,16 +348,15 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.feffdate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.feffdate, ''))
       dimension:
         is_time: true
       label: 缴款书有效期
-      description: 缴款书有效期（feffdate 字符串转 Date，nullIf 空串守卫），NOT NULL，实测 1,281 行 100% 非空，范围 2022-03-21~2028-09-02（含未来
-        日期，有效期天然可晚于当前）；判断已过期按本字段与当前日期比较，不能当业务发生时间轴用
+      description: 缴款书有效期（feffdate 字符串转 Date，nullIf 空串守卫），NOT NULL；可含未来日期（有效期天然可晚于当前）；判断已过期按本字段与当前日期比较，不能当业务发生时间轴用
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
-        data: '{"v":"1.11","time_granularity":"day"}'
+        data: '{"v":"1.11","time_granularity":"day","is_dimension":false}'
       ai_context:
         synonyms:
         - 有效期
@@ -350,14 +364,13 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.fdate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.fdate, ''))
       dimension:
         is_time: true
       label: 缴款日期
-      description: 缴款书缴款日期（fdate 字符串转 Date，nullIf 空串守卫），本表主时间轴（2026-10-26 round-02 全局拍板1：缴款时间统一 FDATE，
-        toDate 精度不带时分秒），NOT NULL，实测 1,281 行 100% 非空，范围 2021-12-21~2026-10-07；与开票日 fill_date 实测 1,220 行同日、
-        61 行晚于开票日、0 行早于开票日——"缴款/今年缴款"类问题一律按本字段过滤/分组，开票口径需显式改用 fill_date；源侧 fdate 另承载生成日期义
-        （文档 150 号字段映射），本表主语义取缴款日期；文档 170 号缴款日期 fpaydate 列在本物理表不存在，无法建模
+      description: 缴款书缴款日期（fdate 字符串转 Date，nullIf 空串守卫），本表主时间轴（缴款时间统一 FDATE，
+        toDate 精度不带时分秒），NOT NULL；与开票日 fill_date 基本同日、少量晚于开票日——"缴款/今年缴款"类问题一律按本字段过滤/分组，开票口径需显式改用 fill_date；源侧 fdate 另承载生成日期义，
+        本表主语义取缴款日期；源侧设计的缴款日期列 fpaydate 在本物理表不存在，无法建模
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -369,13 +382,12 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.freceiveddate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.freceiveddate, ''))
       dimension:
         is_time: true
       label: 资金到账日期
-      description: 缴款资金到账日期（freceiveddate 字符串转 Date，nullIf 空串守卫），实测 869/1,281 行非空（412 行空串转 NULL，以未到账行为主），范围
-        2022-01-07~2026-08-05；与 is_received（fisreceived）标志配套，实测轻微错位（日期有值但标志为 0 的 2 行、标志为 1 但日期为空的 7 行）——到账口径
-        过滤以 is_received 为准（未缴/欠缴口径见 unpaid_paybook 数据集，2026-10-27 round-03 q22 拍板），本字段用于到账时效（received_date 与 fill_date/pay_date 的间隔）；
+      description: 缴款资金到账日期（freceiveddate 字符串转 Date，nullIf 空串守卫），与 is_received（fisreceived）标志配套，
+        两者存在轻微错位——到账口径过滤以 is_received 为准，本字段用于到账时效（received_date 与 fill_date/pay_date 的间隔）；
         与 enter_date（划拨侧到账）是两条不同资金链，勿混用
       datatype: Date
       custom_extensions:
@@ -389,12 +401,12 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.ftransdate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.ftransdate, ''))
       dimension:
         is_time: true
       label: 划转日期
       description: 划转/扣款日期（ftransdate 字符串转 Date，nullIf 空串守卫），源侧一列两义（划拨表 FTRANSDATE=划转日期、扣款表 FTRANSDATE=扣款日期
-        映射同列），本表主语义取划转日期；实测近全空：仅 2/1,281 行有值（2024-08-29、2024-11-07），当前测试数据下划拨日期基本未回填，时效分析不可用
+        映射同列），本表主语义取划转日期；近全空（划拨日期基本未回填），时效分析不可用
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -407,13 +419,12 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: toDate(nullIf(paybook_full_high.fenterdate, ''))
+          expression: toDate(nullIf(paybook_full_high_item.fenterdate, ''))
       dimension:
         is_time: true
       label: 划拨到账日期
-      description: 划拨到账/入库日期（fenterdate 字符串转 Date，nullIf 空串守卫），源侧一列两义（划拨到账、入库两条源记录映射同列）；实测近全空：仅
-        1/1,281 行有值（2024-08-29），物理表 fisenter 到账标志（未建模）分布为空 1,243 行/0=37 行/1=1 行，与本列一致，当前测试数据下到账/入库时效分析
-        不可用；与 received_date（缴款资金到账，收缴侧）是两条不同资金链
+      description: 划拨到账/入库日期（fenterdate 字符串转 Date，nullIf 空串守卫），源侧一列两义（划拨到账、入库两条源记录映射同列）；
+        近全空（到账/入库日期基本未回填），到账/入库时效分析不可用；与 received_date（缴款资金到账，收缴侧）是两条不同资金链
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -426,34 +437,24 @@ semantic_model:
       expression:
         dialects:
         - dialect: CLICKHOUSE
-          expression: paybook_full_high.fchgbgtagenname
+          expression: paybook_full_high_item.fchgbgtagenname
       label: 执收预算单位
-      description: 执收方主管预算单位名称（内联）；1,259/1,272 行非空，头部取值：测试001 357 行、云南发展改革委员会 255 行、云南通用测试单位0801
-        110 行、云南医保测试单位 87 行、127208 59 行；测试环境数据污染约 16%（含"测试"字样单位），对账分析建议与 fbustype 切片联用
+      description: 执收方主管预算单位名称（内联）；存在含"测试"字样的测试数据单位（数据污染），对账分析建议与 fbustype 切片联用
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
       ai_context:
         synonyms:
-        - 预算单位
-        - 主管单位
         - 执收预算单位
-    - name: total_amt
-      expression:
-        dialects:
-        - dialect: CLICKHOUSE
-          expression: ftotalamt
-      label: 缴款总金额（头表）
-      description: 缴款通知书头表总金额（物理 ftotalamt，Nullable(Decimal(18,6))），头表缴款书口径（明细行 famt 之外的聚合口径，2026-10-27
-        round-03 q10 拍板"缴款金额=SUM(ftotalamt)（头表缴款书总额口径，非明细行 famt）"）；同 fpaycode 各明细行本值相同（头表值回填），
-        分档/分组时按 fpaycode 去重后使用；是否含滞纳金 codeqa 未定论（QryPayBook.java:337/355 存疑），按拍板直接作金额与分档依据
-      datatype: Decimal
     - name: pay_bank_code
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fpaybankcode
       label: 代理银行编码
-      description: 代理银行编码（物理 fpaybankcode，String；源码 PayBook.java:67 注释"代理银行编码"，字典 152，与收款银行 FRECBANKCODE
-        并排区分），2026-10-27 round-03 q15 拍板："各代理银行代收金额"类问题的分组维度；名称展示配 pay_bank_name；旧 frecbankname
-        （收款户开户网点）不再作代理银行维度
+      description: 代理银行编码（物理 fpaybankcode，String，字典 152；代理银行=缴款确认时代理银行回单）；码名对：0105 中国建设银行/0102 中国工商银行/0104 中国银行/0000_0005
+        微信/0100 中国邮政储蓄银行/0103 中国农业银行/0318 平安银行/1409 云南省农村信用社联合社/9999 人民银行；明细行口径金额
+        （非税缴款金额/清分金额）按代理银行分组的维度，名称展示配 pay_bank_name、过滤按本列
       ai_context:
         synonyms:
         - 代理银行
@@ -464,9 +465,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fpaybankname
       label: 代理银行名称
-      description: 代理银行名称（物理 fpaybankname，String，抽取侧已完成字典翻译 fne_paybook_new.sql:57/:61），与 pay_bank_code
-        配套的展示列，分组展示优先用本列、过滤按码列；2026-10-28 实测 2026 年缴款（fdate 落 2026+fisreceived='1'）出现 2 家：
-        0105 中国建设银行/0102 中国工商银行
+      description: 代理银行名称（物理 fpaybankname，String，抽取侧已完成字典翻译），与 pay_bank_code
+        配套的展示列，分组展示优先用本列、过滤按码列（码名对见 pay_bank_code）
       ai_context:
         synonyms:
         - 代理银行
@@ -477,29 +477,105 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: multiIf(ftotalamt IS NULL, '未知', ftotalamt < 1000, '<1千', ftotalamt < 10000, '1千-1万', ftotalamt < 100000, '1万-10万', ftotalamt < 1000000, '10万-100万', '≥100万')
       label: 金额档位
-      description: 单笔缴款金额分档维度（2026-10-27 round-03 q19 + 全局拍板4 10 倍档：金额类起点 1 千元）：<1千/1千-1万/1万-10万/10万-100万/≥100万，
-        ftotalamt 为空落"未知"桶；单笔金额=total_amt（ftotalamt 头表口径）；分档内笔数口径 COUNT(DISTINCT fpaycode)（全局拍板5），
-        配 有效缴款笔数 指标+今年缴款（pay_date）过滤使用；2026-10-28 实测（fdate 落 2026+fstate≠'2'）：<1千 44 笔/1千-1万 8 笔/1万-10万 3 笔/10万-100万 0 笔/≥100万 1 笔
+      description: 单笔缴款金额分档维度（10 倍档：金额类起点 1 千元）：<1千/1千-1万/1万-10万/10万-100万/≥100万，
+        ftotalamt 为空落"未知"桶；单笔金额=ftotalamt（票面总额口径）；分档内笔数口径 COUNT(DISTINCT fpaycode)，
+        配 有效缴款笔数 指标+今年缴款（pay_date）过滤使用
       ai_context:
         synonyms:
         - 金额分档
         - 单笔金额分档
         - 缴款金额档位
+    - name: bgt_style_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fbgtstyle
+      label: 资金去向编码
+      description: 资金去向/预算管理方式编码（物理 fbgtstyle，String 型，过滤值必须带引号；BgtStyle.java:10-17，FNE_FundDivide.FBGTSTYLE
+        经 funddivide 链入宽表）；枚举：1=缴入国库、2=落入财政专户、3=单位代收、4=其他；值域含 '1'/'2'/'4'/''（空）（空串为未清分中间态，
+        fimamt 全 NULL；无 '3'）；"缴入国库/落入专户"分组维度用本字段（资金性质 funds_nature 是更细预算级次，不作资金去向分组）；
+        展示名配 bgt_style_name
+      ai_context:
+        synonyms:
+        - 资金去向
+        - 缴入国库
+        - 财政专户
+        - 入库方式
+    - name: bgt_style_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: multiIf(fbgtstyle = '1', '国库', fbgtstyle = '2', '财政专户', fbgtstyle = '3', '单位代收', fbgtstyle = '4', '其他', '未知')
+      label: 资金去向名称
+      description: 资金去向枚举标签（bgt_style_code 码值翻译）；空串行落"未知"（未清分中间态，fimamt 全 NULL）；分组展示优先用本列，过滤按码列 bgt_style_code
+    - name: chg_agen_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fchgagencode
+      label: 执收单位编码
+      description: 执收单位编码（物理 fchgagencode，String；对应 dim_agen.fagencode，识别码列 fchgagenidcode 已另建）；
+        值源注记：宽表本列与清分侧 fchgagencode 值源不同，两侧非同源，跨侧过滤前需业务核对；"本单位执收"过滤器主字段候选（或按
+        fchgagenname 名称过滤）
+    - name: rec_agen_id_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: frecagenidcode
+      label: 收入记账单位识别码
+      description: 收入记账到本单位的单位识别码（物理 frecagenidcode，String）；断供注记：生产过滤器字段 frecagencode 未抽取落地，
+        过滤器落地列改本字段（is_dimension:false，识别码仅作过滤不作分组维度）；
+        备选 fimagencode（收入台账侧）；"收入记账到本单位"过滤=本字段=本单位取值
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+      ai_context:
+        synonyms:
+        - 收入记账单位
+        - 分入单位
+    - name: funds_rec_flag
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fisfundsrec
+      label: 资金对账标志
+      description: 缴款资金日终对账完成标志（物理 fisfundsrec 为 Nullable(UInt32)：1=已对账、0=未对账，无 NULL）；"对账完成"
+        判定字段——三义辨析：本字段=缴款资金对账，treasury_transfer_dedup.reconcile_status=缴库报文对账，is_cleared=清分，三者互不等价
+        勿混用；未对账判定建议与 funds_rec_date 组合
+        （标志='0' 或对账日期为空）
+      datatype: Integer
+      ai_context:
+        synonyms:
+        - 资金对账
+        - 对账完成
+        - 未对账
+    - name: funds_rec_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(ffundsrecdate, ''))
+      dimension:
+        is_time: true
+      label: 资金对账日期
+      description: 缴款资金对账完成日期（物理 ffundsrecdate 字符串转 Date，nullIf 空串守卫）；未对账时长：起算锚=received_date（到账日）、完成点=本字段；"对账超期"判定=（funds_rec_flag='0' 或本字段为空）且
+        received_date 距今>15 天（见 超期未对账笔数 指标）
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","time_dimension":"pay_date"}'
   - name: funddivide_transfer
     source: yunnan0508.fne_funddivide_transfer
-    description: 汇总划拨批次宽表（清分→划拨环节），728 行
+    description: 汇总划拨批次宽表（清分→划拨环节）
     ai_context:
-      instructions: 汇总划拨批次明细；金额可直 SUM；fcollectid 非唯一（实测 160 个批次值参与 JOIN）；R1 边 fpaybooksubid=paybook_full_high.fid
-        实测 JOIN 1,130 行，R2 边 fcollectid=transfer_new.fcollectid 实测 160 行（to 侧生命周期多版本，测试环境放宽声明，金额指标一律锚定单
-        dataset 不做跨边求和）；划拨完成/未划拨用 fistransfer='1'/'!=1' 收窄；空键口径（2026-10-20 实测）：178/728 行
-        fcollectid=''（尚未汇总入批次的清分明细行），承载 fimamt 15,986,749,253.84（占全表 99.82%），单表金额聚合禁止按
-        fcollectid != '' 过滤，否则清分金额坍缩到约 2,933 万；ftransamt 空键行全 NULL（全表划拨金额 72,507.62 全在非空键行）；
-        fpaybooksubid 无空键；已声明边实测无空键假关联（R1 to 侧 0 空键，R2 to 侧 fne_transfer_new 0 空键，160=160），跨已声明边
-        JOIN 无需空键前置；若未来连 fne_funddivide_new（fcollectid 两侧均有空键）等未建模表，JOIN 两侧必须前置 fcollectid != ''
-        （实测不过滤 32,508 行假关联）；主时间轴 cleardate=toDate(fcleardate)，day 粒度
+      instructions: 汇总划拨批次明细；金额可直 SUM；fcollectid 生命周期多版本非唯一（to 侧非唯一的关系授权行级钻取，金额指标一律锚定单
+        dataset 不做跨边求和）；fpaybooksubid 引用 paybook_full_high_item.fid，fcollectid 被 transfer_new.fcollectid 引用；划拨完成/未划拨用 fistransfer='1'/'!=1' 收窄；
+        空键口径：空串 fcollectid=尚未汇总入批次的清分明细行，承载几乎全部清分金额 fimamt，单表金额聚合禁止按
+        fcollectid != '' 过滤（否则清分金额大幅坍缩）；ftransamt 空键行全 NULL（划拨金额全部在非空键行）；
+        fpaybooksubid 无空键；已声明边 to 侧无空键，跨已声明边
+        JOIN 无需空键前置；若未来连 fcollectid 两侧均有空键的未建模表（如 fne_funddivide_new），JOIN 两侧必须前置 fcollectid != ''；主时间轴 cleardate=toDate(fcleardate)，day 粒度
     fields:
     - name: fcollectid
       expression:
@@ -524,7 +600,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fpaybooksubid
       label: 缴款明细ID
-      description: 外键：指向 paybook_full_high.fid（R1 边，实测 JOIN 1,130 行）
+      description: 外键：指向 paybook_full_high_item.fid
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -563,7 +639,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fistransfer
       label: 划拨完成标志
-      description: 是否已划拨：1=已划拨，其他=未划拨
+      description: 是否已划拨：1=已划拨；值域含 ''（空）、'0'（''与'0'均未划拨）；未划拨池=''或'0'
     - name: ftransno
       expression:
         dialects:
@@ -597,6 +673,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fchgrgncode
       label: 执收单位区划代码
+      description: 执收单位区划代码（源 fchgrgncode）
     - name: frecrgnname
       expression:
         dialects:
@@ -615,13 +692,14 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: frecrgncode
       label: 归属区划代码
+      description: 资金归属区划代码（源 frecrgncode）；分组展示配 frecrgnname，过滤按本列
     - name: frecsubcode
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: frecsubcode
       label: 收款科目代码
-      description: 收款方预算科目代码，连接 dim_subject.fsubcode（D9 边）
+      description: 收款方预算科目代码，连接 dim_subject.fsubcode
     - name: frecsubname
       expression:
         dialects:
@@ -635,6 +713,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fitemidcode
       label: 项目ID
+      description: 非税收入项目ID（源 fitemidcode）；展示名配 fitemname
     - name: fitemname
       expression:
         dialects:
@@ -648,15 +727,14 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftransrecagenname
       label: 划入单位名称
-      description: 资金划入单位名称（内联）；2026-10-20 实测 728 行全为空串（ftransrecagenidcode/ftransrecagencode 同为全空），按本列分组返回空组——划入单位分析在当前测试数据下不可用
+      description: 资金划入单位名称（内联）；断供注记：本列及配套识别码/编码列当前全空，按本列分组返回空组，划入单位分析不可用；表达式自包含可直接执行，一律实查
     - name: funds_nature
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: funddivide_transfer.frecfundsnaturecode
       label: 资金性质（划拨侧）
-      description: 划拨侧资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空（728/728）；实测码值：12=政府性基金预算收入
-        589 行、2=财政专户管理资金 70 行、11=一般公共预算收入 63 行、5=其他 6 行；与 paybook_full_high.funds_nature（ffundsnaturecode）同码表
+      description: 划拨侧资金性质（预算级次）码，String 型，过滤值必须带引号；100% 非空；码值：12=政府性基金预算收入、2=财政专户管理资金、11=一般公共预算收入、5=其他；与 paybook_full_high_item.funds_nature（ffundsnaturecode）同码表
       ai_context:
         synonyms:
         - 资金性质
@@ -675,14 +753,14 @@ semantic_model:
   - name: treasury_transfer_dedup
     source: SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY fid) AS _rn FROM
       yunnan0508.fne_treasury_transfer_new) WHERE _rn = 1
-    description: 缴库报文去重数据集：fne_treasury_transfer_new（505 行）按 fid 去重后 76 行
+    description: 缴库报文去重数据集：fne_treasury_transfer_new 按 fid 去重（去除生命周期冗余报文）
     ai_context:
-      instructions: 物理表 505 行含 462 行生命周期冗余（33 个重复 fid 组），本数据集按 fid 去重后 76 行；缴库金额必须以本去重口径直
-        SUM（对账基准 29,535,106.14 / 76 行），直接 SUM 原始表会虚增约 44 倍；R3 边 ftranscollectid=funddivide_transfer.fcollectid
-        实测 460 行、R4 边 fpid=funddivide_transfer.fid 实测 476 行（to 侧非唯一，测试环境放宽声明）；主时间轴
+      instructions: 物理表含大量生命周期冗余报文（同一 fid 多行），本数据集按 fid 去重；缴库金额必须以本去重口径直
+        SUM，直接 SUM 原始表会大幅虚增；ftranscollectid 引用 funddivide_transfer.fcollectid、fpid 引用 funddivide_transfer.fid
+        （to 侧非唯一，授权行级钻取）；主时间轴
         msg_date=toDate(fmsgdate)，day 粒度；去重实现说明：规格原文为 LIMIT 1 BY fid（ClickHouse 方言扩展），因引擎查询源解析器不支持该语法，已等价改写为
-        ROW_NUMBER() OVER (PARTITION BY fid)=1，对账指纹一致（76 行 / 29,535,106.14）；"已缴入国库"口径=enter_status='1'（时间锚 enter_date，
-        2026-10-26 round-02 全局拍板2：fincomestatus 属国库收入记账层不参与该口径，已缴入国库金额指标已内置过滤）；异常存在性校验（round-02 q27）
+        ROW_NUMBER() OVER (PARTITION BY fid)=1；"已缴入国库"口径=enter_status='1'（时间锚 enter_date，
+        fincomestatus 属国库收入记账层不参与该口径，已缴入国库金额指标已内置过滤）；异常存在性校验
         两层：对账层 reconcile_status='1' 且 enter_status!='1'、记账层 income_status='1' 且 enter_status!='1'，指标 ftransno 去重笔数+单号明细，
         异常类型（对账/记账）为查询层组合维度
     fields:
@@ -692,7 +770,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fid
       label: 缴库明细ID
-      description: 缴库报文明细ID，本数据集已按其去重（76 行唯一）
+      description: 缴库报文明细ID，本数据集已按其去重（去重后唯一）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -702,7 +780,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fpid
       label: 缴库主单ID
-      description: 外键：指向 funddivide_transfer.fid（R4 边，实测 476 行，to 侧非唯一）
+      description: 外键：指向 funddivide_transfer.fid（to 侧非唯一，行级钻取用途）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -712,7 +790,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftranscollectid
       label: 划拨汇总批次ID
-      description: 外键：指向 funddivide_transfer.fcollectid（R3 边，实测 460 行）
+      description: 外键：指向 funddivide_transfer.fcollectid
     - name: ftransno
       expression:
         dialects:
@@ -775,18 +853,21 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fchgrgncode
       label: 执收单位区划代码
+      description: 执收单位区划代码（源 fchgrgncode）
     - name: frecrgncode
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: frecrgncode
       label: 归属区划代码
+      description: 资金归属区划代码（源 frecrgncode）
     - name: fsubcode
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fsubcode
       label: 科目代码
+      description: 预算科目代码（源 fsubcode）
     - name: fsubname
       expression:
         dialects:
@@ -801,13 +882,17 @@ semantic_model:
           expression: fsublevelname
       label: 科目层级名称
       description: 科目层级名称（内联）
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
     - name: fstatus
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fstatus
       label: 缴库状态
-      description: 缴库报文状态
+      description: 缴库报文状态（缴库指令回执）：0=未缴库、9=已缴库（人工缴库路径写入）；本库值域仅 0/9（EVL 回执
+        2/33/39 态未出现）；入库判定用 enter_status，入库确认用 income_status
     - name: income_status
       expression:
         dialects:
@@ -815,10 +900,9 @@ semantic_model:
           expression: toString(fincomestatus)
       label: 入库确认状态
       description: 国库入库确认状态（物理 fincomestatus 为 String，toString 统一形态），String 型取值
-        ''0''/''1''，过滤值必须带引号；与 fstatus（缴库状态）交叉：''1''=已确认入库、''0''=未确认入库。实测全表 505 行：''0''=481 行未确认、''1''=24
-        行已确认；与 fstatus 交叉矩阵：(0,0)=353 未缴库未确认、(9,0)=128 已缴库待国库确认、(9,1)=24 已缴库已确认；去重后 76 fid：(0,0)=50、(9,0)=3、(9,1)=23；fincomestatus
-        与 fid 实测完全绑定（76 个 fid 无一跨版本变化），多版本行只是重复报文，去重后状态稳定，可安全按 fid 口径过滤；(9,0) 的 128 行/415.5
-        万是"已缴库待国库确认"中间态（2026 年 125 行集中，415.1 万）；2022 年 23 行确认入库仅 0.4 万、2023/2024 无确认记录
+        ''0''/''1''，过滤值必须带引号；与 fstatus（缴库状态）交叉：''1''=已确认入库、''0''=未确认入库；fincomestatus
+        与 fid 完全绑定（多版本行只是重复报文），去重后状态稳定，可安全按 fid 口径过滤；"已缴库待国库确认"=(9,0)
+        中间态——已缴库但尚未经国库确认入库
       ai_context:
         synonyms:
         - 入库状态
@@ -832,8 +916,8 @@ semantic_model:
       label: 资金入库状态
       description: 资金实际入库态（入库流水驱动），String 型，过滤值必须带引号；'1'=已缴入国库、'0'=未入库；与 fstatus（缴库指令回执，
         2→33→9/39）、income_status（国库收入记账回写）三层不等价：EVL 回单路径 fenterstatus='1' 对应 fstatus='39'，人工缴库两步写存在
-        fstatus='9' 而 fenterstatus≠'1' 的中间态；实测 raw 505 行 '0'=353、'1'=152，与 fenterdate 非空数（152）完全对齐；round-02 q11
-        全局拍板2："已缴入国库"判定统一本字段='1'，fincomestatus 不参与该口径
+        fstatus='9' 而 fenterstatus≠'1' 的中间态；本字段非空情况与 fenterdate 非空情况完全对齐；
+        "已缴入国库"判定统一本字段='1'，fincomestatus 不参与该口径
       ai_context:
         synonyms:
         - 已缴入国库
@@ -847,8 +931,8 @@ semantic_model:
       dimension:
         is_time: true
       label: 入库日期
-      description: 资金实际入库日期（fenterdate 字符串转 Date，nullIf 空串守卫），"已缴入国库"类问题的时间锚（round-02 q11 全局拍板2）；
-        实测非空 152/505，与 enter_status='1' 行完全对齐；区别于主时间轴 msg_date（缴库报文日期）
+      description: 资金实际入库日期（fenterdate 字符串转 Date，nullIf 空串守卫），"已缴入国库"类问题的时间锚；
+        与 enter_status='1' 行完全对齐；主时间轴 msg_date=缴库报文日期，本字段=资金实际入库日
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -863,8 +947,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: freconcilestatus
       label: 对账状态
-      description: 缴库报文对账状态，String 型，过滤值必须带引号；0=未对账、1=成功、2=失败（源码 TreasuryTransferTipsMsg）；实测 raw 505 行
-        '0'=353、'1'=152；round-02 q27 拍板："已完成对账"判定=本字段='1'（对账在缴库报文表，与清分 is_cleared 无关）
+      description: 缴库报文对账状态，String 型，过滤值必须带引号；0=未对账、1=成功、2=失败（源码 TreasuryTransferTipsMsg）；本库值域仅 0/1；"已完成对账"判定=本字段='1'
       ai_context:
         synonyms:
         - 对账状态
@@ -875,12 +958,13 @@ semantic_model:
       data: '{"source_type": "query", "time_dimension": "msg_date", "v": "1.11"}'
   - name: transfer_new
     source: yunnan0508.fne_transfer_new
-    description: 划拨指令生命周期表，129 行
+    description: 划拨指令生命周期表
     ai_context:
-      instructions: 划拨指令生命周期记录，fcollectid 存在多版本（129 行，JOIN 实测 160 行命中），R2 边 to 侧非唯一，测试环境放宽声明；金额直
-        SUM；主时间轴 transdate=toDate(nullIf(ftransdate, ''))，day 粒度；实测 127/129 行 ftransdate 为空串转 NULL；2026-10-27
-        round-03 q24 拍板后在途滞留池重建至 transit_transfer_pool 数据集（本表 ftransstats 全空、ftransdate 近全空不可作池依据），本数据集仅保留
-        指令生命周期明细与 R2 边用途；与 funddivide_transfer 的 未划拨金额（fistransfer≠'1'，q16 池）是互补池不得混用
+      instructions: 划拨指令生命周期记录，fcollectid 生命周期多版本（to 侧非唯一，授权行级钻取）；金额直
+        SUM；主时间轴 transdate=toDate(nullIf(ftransdate, ''))，day 粒度；ftransdate 近全空（下达日期基本未回填）不可作池过滤依据；
+        ftransstats 本库无 '9' 码值（源侧枚举见字段说明）；
+        在途滞留池在 transit_transfer_pool 数据集，未划拨池在 funddivide_transfer（fistransfer≠'1'），本数据集仅承载
+        指令生命周期明细（供 funddivide_transfer 关联）
     fields:
     - name: fcollectid
       expression:
@@ -888,13 +972,14 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fcollectid
       label: 汇总批次ID
-      description: 清分汇总批次ID；生命周期多版本非唯一，被 funddivide_transfer.fcollectid 引用（R2 边）
+      description: 清分汇总批次ID；生命周期多版本非唯一，被 funddivide_transfer.fcollectid 引用
     - name: fcollectpid
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fcollectpid
       label: 汇总父单ID
+      description: 汇总父单ID（物理 fcollectpid，上游过程记录字段，仅行标识留档）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -915,8 +1000,8 @@ semantic_model:
         is_time: true
       label: 划拨日期
       description: 划拨指令下达日期（ftransdate 字符串转 Date，nullIf 空串守卫——空串直接 toDate 在 CH 23.3 抛 CANNOT_PARSE_DATE），本表主时间轴，
-        round-02 q24 拍板时间锚（下达日）；实测 129 行中仅 2 行有值（均 2024 年）、127 行空串转 NULL，按本轴过滤"今年下达"会将空下达日的在途单
-        全部滤掉（在途池实测坍缩为空），时段趋势分析价值有限
+        时间锚=下达日；下达日期近全空（基本未回填），按本轴过滤"今年下达"会将空下达日的在途单
+        全部滤掉，时段趋势分析价值有限
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -927,7 +1012,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fistransfer
       label: 划拨完成标志
-      description: 是否已划拨：1=已划拨
+      description: 是否已划拨：1=已划拨；值域 '0'/'1'
     - name: ftransno
       expression:
         dialects:
@@ -944,16 +1029,16 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftransrecagenname
       label: 划入单位名称
-      description: 资金划入单位名称（内联）；2026-10-20 实测 129 行全为空串（ftransrecagenidcode 同为全空），按本列分组返回空组——划入单位分析在当前测试数据下不可用
+      description: 资金划入单位名称（内联）；断供注记：本列及配套识别码列当前全空，按本列分组返回空组，划入单位分析不可用；一律实查
     - name: ftransstats
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: ftransstats
       label: 划拨状态
-      description: 划拨指令下发状态，源侧枚举（MsgStatus.java）：0=未发、1=已发、7=失败、9=成功回执、14=校验不通过；CH 落地表实测全 129 行
-        空串（值未同步），不作过滤依据（同 round-02 q16 trans_stats 先例）；源侧拍板"配 fstats∈{1,9}"（round-02 q24）在落地不可执行，
-        且 ftransstats='9' 仅回执≠到账（到账由独立动作写 fisenter='1'+fenterdate）
+      description: 划拨指令下发状态，源侧枚举（MsgStatus.java）：0=未发、1=已发、7=失败、9=成功回执、14=校验不通过；本库落地值域仅 ''（空）/'0'/'1'（无 '7'/'9'/'14'）；
+        ftransstats='9' 仅回执≠到账（到账由独立动作写 fisenter='1'+fenterdate）；
+        在途口径不经本列过滤，用 transit_transfer_pool 池（在途滞留金额/在途滞留笔数）实查
     - name: enter_flag
       expression:
         dialects:
@@ -961,8 +1046,8 @@ semantic_model:
           expression: fisenter
       label: 划转到账标志
       description: 划拨资金到账标志（物理列名 fisenter，源侧记 fiseenter），String 型，过滤值必须带引号；'1'=已到账、'0'=未到账，由独立到账
-        动作回写（源码 ConvertUnit vs EnterTransfer：fstats='9' 仅回执，≠到账）；实测 129 行：'0'=33、'1'=1、空=95；round-02 q24 拍板
-        "尚未到账"判定=本字段='0'（兜底 fenterdate IS NULL）；与 paybook_full_high 的 is_received（缴款侧到账）是不同环节，勿混用
+        动作回写（源码 ConvertUnit vs EnterTransfer：fstats='9' 仅回执，≠到账）；值域含 ''（空）/'0'/'1'；
+        "尚未到账"判定=本字段='0'（兜底 fenterdate IS NULL）；与 paybook_full_high_item 的 is_received（缴款侧到账）是不同环节，勿混用
       ai_context:
         synonyms:
         - 划转到账
@@ -976,8 +1061,8 @@ semantic_model:
       dimension:
         is_time: true
       label: 划拨到账日期
-      description: 划拨资金到账日期（fenterdate 字符串转 Date，nullIf 空串守卫），实测仅 1/129 非空，当前测试数据下到账时效分析不可用；
-        round-02 q24 兜底判据 fenterdate IS NULL；与 paybook_full_high.enter_date（缴款侧入库）是不同资金链
+      description: 划拨资金到账日期（fenterdate 字符串转 Date，nullIf 空串守卫），近全空（到账日期基本未回填），到账时效分析不可用；
+        兜底判据 fenterdate IS NULL；与 paybook_full_high_item.enter_date（缴款侧入库）是不同资金链
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -987,10 +1072,9 @@ semantic_model:
       data: '{"v":"1.11","time_dimension":"transdate"}'
   - name: agen_treasury_high
     source: yunnan0508.fne_agen_treasury_high
-    description: 单位汇缴缴库宽表（F7 汇缴口径），20 行；无实测验证边，不声明 relationship
+    description: 单位汇缴缴库宽表（F7 汇缴口径）；无实测验证边，不声明 relationship
     ai_context:
-      instructions: 汇缴口径（une_ 体系）的单位汇缴缴库事实，与直缴（fne_）口径不混算；无实测验证边，不与其他 dataset 建关系；小表（20
-        行）金额可直 SUM
+      instructions: 汇缴口径（une_ 体系）的单位汇缴缴库事实，与直缴（fne_）口径不混算；无实测验证边，不与其他 dataset 建关系；金额可直 SUM
     fields:
     - name: fid
       expression:
@@ -998,6 +1082,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fid
       label: 汇缴缴库明细ID
+      description: 汇缴缴库记录行标识（物理 fid）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -1007,6 +1092,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: ftransno
       label: 缴库批次号
+      description: 缴库批次号（物理 ftransno）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -1016,6 +1102,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fbatchno
       label: 汇总批次号
+      description: 汇总批次号（物理 fbatchno）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -1041,6 +1128,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fchgagenidcode
       label: 执收单位ID
+      description: 执收单位识别码（物理 fchgagenidcode，连接 dim_agen.fagenidcode）
     - name: fchgagenname
       expression:
         dialects:
@@ -1061,6 +1149,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fsubcode
       label: 科目代码
+      description: 预算科目代码（物理 fsubcode）
     - name: fsubname
       expression:
         dialects:
@@ -1074,6 +1163,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fsublevel
       label: 科目层级
+      description: 科目层级（物理 fsublevel，数值）
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -1083,20 +1173,21 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fsublevelname
       label: 科目层级名称
+      description: 科目层级名称（内联）
     - name: fstatus
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fstatus
       label: 状态
-      description: 汇缴缴库状态
+      description: 汇缴缴库状态（缴库指令回执）：0=未缴库、9=已缴库；值域含 ''（空）
     - name: ftotreasurystatus
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: ftotreasurystatus
       label: 入库状态
-      description: 资金入库状态
+      description: 资金入库状态：1=已入库、0=未入库；值域含 ''（空）
     - name: pay_date
       expression:
         dialects:
@@ -1105,8 +1196,7 @@ semantic_model:
       dimension:
         is_time: true
       label: 缴款日期
-      description: 汇缴缴款日期（fpaydate 字符串转 Date），本表主时间轴；20 行全部非空，实测范围 2022-01-25~2025-12-08（含 1
-        行 2025-12-08 后补测试数据）；F7 汇缴缴库分析按本轴分组
+      description: 汇缴缴款日期（fpaydate 字符串转 Date），本表主时间轴，全非空；F7 汇缴缴库分析按本轴分组
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -1117,7 +1207,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: agen_treasury_high.fbelongrgncode
       label: 归属区划编码
-      description: 资金归属区划编码（物理 fbelongrgncode）；F7 省级分成场景的归属区划维度，20 行全非空（实测 2 个 distinct 值）；与分成比例
+      description: 资金归属区划编码（物理 fbelongrgncode）；F7 省级分成场景的归属区划维度，全非空；与分成比例
         share_rate 联用分析省对下分成
       ai_context:
         synonyms:
@@ -1129,8 +1219,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: agen_treasury_high.fsharerate
       label: 分成比例
-      description: 分成比例定点编码，String 型（35 位定点比例码，过滤/分组必须按整码字符串带引号匹配，不可当数值）；实测 20 行共 3 种比例码：'00000001000000000000000000000000000'
-        13 行、'05000000500000000000000000000000000' 4 行、'05000000200000020000001000000000000' 3 行
+      description: 分成比例定点编码，String 型（35 位定点比例码，过滤/分组必须按整码字符串带引号匹配，不可当数值）；值域为少数几种定点比例码组合
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","time_dimension":"pay_date"}'
@@ -1145,15 +1234,15 @@ semantic_model:
       JOIN yunnan0508.fne_funddivide_transfer fd ON fd.fpaybooksubid = p.fid INNER
       JOIN yunnan0508.fne_treasury_transfer_new t ON t.ftranscollectid = fd.fcollectid)
       GROUP BY pay_code
-    description: 缴款→缴库配对数据集（2026-10-27 round-03 q21）：缴款书宽表经 fpaybooksubid（R1）+ftranscollectid（R3/R4）
-      两跳关联缴库报文，聚合到 fpaycode 粒度，内置"有缴库记录"池；2026-10-28 实测 222 笔，其中 2026 年缴款 84 笔、有入库日 8 笔
+    description: 缴款→缴库配对数据集：缴款书宽表经 fpaybooksubid+ftranscollectid
+      两跳关联缴库报文，聚合到 fpaycode 粒度，内置"有缴库记录"池
     ai_context:
       instructions: 数据集自包含（join+聚合在 source SQL 内），不与其他 dataset 建关系，无扇出；落点缘起：fne_treasury_transfer_new.fpaycode
-        实测 505 行全空串，无法直连宽表，必须经 funddivide_transfer 两跳链（t.fpid=fd.fid 与 t.ftranscollectid=fd.fcollectid 两条路径
-        UNION ALL）；每 fpaycode 取 MAX(fenterdate)（round-03 q21 拍板"每笔缴款取最晚缴库日"，生命周期冗余被 MAX 吸收）；起点
-        pay_date=缴款日（全局拍板1），终点 treasury_enter_date=fne_treasury_transfer_new.fenterdate（国库回执入库日）——与宽表
-        enter_date（划转 MSG 到账日）同列名不同表，勿混用（round-03 q21 注记）；"今年缴款"按 pay_date 过滤；耗时用 enter_days，
-        分档用 enter_duration_bucket（<1天/1-10天/10-100天/≥100天，全局拍板4）；2026 实测（今年缴款+有入库日 8 笔）分档：<1天 1/1-10天 1/10-100天 6
+        全空串（断供），无法直连宽表，必须经 funddivide_transfer 两跳链（t.fpid=fd.fid 与 t.ftranscollectid=fd.fcollectid 两条路径
+        UNION ALL）；每 fpaycode 取 MAX(fenterdate)（每笔缴款取最晚缴库日，生命周期冗余被 MAX 吸收）；起点
+        pay_date=缴款日，终点 treasury_enter_date=fne_treasury_transfer_new.fenterdate（国库回执入库日）——与宽表
+        enter_date（划转 MSG 到账日）同列名不同表，勿混用；"今年缴款"按 pay_date 过滤；耗时用 enter_days，
+        分档用 enter_duration_bucket（<1天/1-10天/10-100天/≥100天）
     fields:
     - name: pay_code
       expression:
@@ -1161,7 +1250,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: pay_code
       label: 票据关联码
-      description: 缴款码（聚合键，每 fpaycode 一行），笔数口径 COUNT(DISTINCT pay_code)（2026-10-26 全局拍板5）
+      description: 缴款码（聚合键，每 fpaycode 一行），笔数口径 COUNT(DISTINCT pay_code)
       ai_context:
         synonyms:
         - 缴款码
@@ -1173,7 +1262,7 @@ semantic_model:
       dimension:
         is_time: true
       label: 缴款日期
-      description: 全程耗时起点=缴款日（宽表 fdate，源 FNE_PAYBOOK.FPAYDATE，2026-10-26 全局拍板1），本数据集主时间轴；"今年缴款"按本字段过滤
+      description: 全程耗时起点=缴款日（宽表 fdate，源 FNE_PAYBOOK.FPAYDATE），本数据集主时间轴；"今年缴款"按本字段过滤
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -1186,7 +1275,7 @@ semantic_model:
       dimension:
         is_time: true
       label: 缴库入库日期
-      description: 全程耗时终点=每 fpaycode 最晚入库日（MAX(fenterdate)，fne_treasury_transfer_new 国库回执入库日，round-03 q21 拍板）；
+      description: 全程耗时终点=每 fpaycode 最晚入库日（MAX(fenterdate)，fne_treasury_transfer_new 国库回执入库日）；
         与宽表 enter_date（划转 MSG 到账日）同列名不同表，勿混用；无入库日为 NULL
       datatype: Date
       custom_extensions:
@@ -1202,7 +1291,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: dateDiff('day', pay_date, treasury_enter_date)
       label: 全程耗时天数
-      description: 缴款→缴库全程耗时天数（dateDiff(pay_date, treasury_enter_date)，round-03 q21 拍板口径）；无入库日为 NULL
+      description: 缴款→缴库全程耗时天数（dateDiff(pay_date, treasury_enter_date) 口径）；无入库日为 NULL
         （落 enter_duration_bucket"未知"桶）
       datatype: Integer
     - name: enter_duration_bucket
@@ -1211,7 +1300,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: multiIf(treasury_enter_date IS NULL, '未知', dateDiff('day', pay_date, treasury_enter_date) < 1, '<1天', dateDiff('day', pay_date, treasury_enter_date) < 10, '1-10天', dateDiff('day', pay_date, treasury_enter_date) < 100, '10-100天', '≥100天')
       label: 全程耗时区间分档
-      description: 全程耗时区间分档维度（round-03 q21 + 2026-10-26 全局拍板4 时长序列）：<1天/1-10天/10-100天/≥100天，无入库日落"未知"桶；
+      description: 全程耗时区间分档维度（时长序列 1/10/100 天）：<1天/1-10天/10-100天/≥100天，无入库日落"未知"桶；
         分档内笔数口径 COUNT(DISTINCT pay_code)
       ai_context:
         synonyms:
@@ -1222,20 +1311,23 @@ semantic_model:
       data: '{"source_type": "query", "time_dimension": "pay_date", "v": "1.11"}'
   - name: unpaid_paybook
     source: SELECT u.fpaycode AS pay_code, MAX(toDate(nullIf(u.fdate, ''))) AS issue_date,
-      MAX(u.ftotalamt) AS total_amt FROM yunnan0508.une_paybook_high u LEFT JOIN
-      (SELECT DISTINCT fpaycode FROM yunnan0508.fne_paybook_full_high) f ON u.fpaycode
-      = f.fpaycode WHERE coalesce(f.fpaycode, '') = '' AND u.fstate != '2' GROUP
-      BY u.fpaycode
-    description: 未缴缴款书池（2026-10-27 round-03 q22）：UNE 开具侧（une_paybook_high，9,124 行/8,138 缴款书）按 fpaycode
-      左连缴款书宽表无缴款记录+行级 fstate≠'2'，聚合到缴款书级；2026-10-28 实测 6,214 笔
+      MAX(toDate(nullIf(u.feffdate, ''))) AS eff_date, MAX(u.ftotalamt) AS total_amt
+      FROM yunnan0508.une_paybook_high u LEFT JOIN (SELECT DISTINCT fpaycode FROM
+      yunnan0508.fne_paybook_full_high) f ON u.fpaycode = f.fpaycode WHERE coalesce(f.fpaycode,
+      '') = '' AND u.fstate = '1' GROUP BY u.fpaycode
+    description: 未缴缴款书池：UNE 开具侧（une_paybook_high）按 fpaycode 左连缴款书宽表无缴款记录+fstate='1'（官方统计主条件；frecmode_treasury 排除项断供，退化
+      单条件并记断供），聚合到缴款书级
     ai_context:
       instructions: 数据集自包含（左连判定在 source SQL 内），不与其他 dataset 建关系；反连实现注意：CH 23.3 默认 join_use_nulls=0
         下 LEFT JOIN 未命中回填空串而非 NULL，故用 coalesce(f.fpaycode,'')='' 判未命中（两种 join_use_nulls 取值下均正确）——勿改写成
-        IS NULL（实测会误得 0 行）；round-03 q22 拍板：未缴判定=生产权威 SQL（UPayBook.xml:1428-1431 UNE left join FNE 无记录）
-        的 CK 等价实现，替代 round-02 的 fstate='1' 直筛（宽表主表 FNE 侧，未缴书不进宽表）；时间锚 issue_date=une_paybook_high.fdate
-        （开具日）——与宽表 fdate（缴款日，源 FNE_PAYBOOK.FPAYDATE）同名不同义（etl-unepaybook-a2d909f2 核对，round-02 行
-        ffilldate 锚作废——ffilldate 是 FNE 侧列名，未缴缴款书在 FNE 侧无记录）；分档用 unpaid_duration_bucket；金额
-        total_amt=ftotalamt 头表口径（含滞纳金存疑同 q19）；2026-10-28 实测分档：<1天 0/1-10天 5/10-100天 99/≥100天 6110
+        IS NULL（改写成 IS NULL 会误得 0 行）；未缴判定=左连+行级 fstate='1'（UNE 侧状态 1=正常未缴/2=作废/3=已缴款确认/4=转电脑开票，InvoiceConsts.java:130-134；官方统计完整口径
+        PayBook.xml:2464-2512 还含 fbillnature='2'+frecmode_treasury 排除项，后者断供退化单条件并记断供；票据性质排除项缺
+        关联键（une 侧现无 fbillcode），补齐前维持单条件判定）；时间锚 issue_date=une_paybook_high.fdate（开具日，une 侧无
+        ffilldate 列，锚 ffilldate 由本字段承载）——与宽表 fdate（缴款日，源 FNE_PAYBOOK.FPAYDATE）同名不同义
+        （ffilldate 是 FNE 侧列名，未缴缴款书在 FNE 侧无记录）；
+        有效期拆分：未缴且有效=eff_date>=当前日、已过期未缴=eff_date<当前日，
+        两池互补勾稽等于未缴总数（eff_date 无空值）；分档用 unpaid_duration_bucket；金额 total_amt=ftotalamt 票面总额口径
+        （含滞纳金存疑）
     fields:
     - name: pay_code
       expression:
@@ -1243,7 +1335,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: pay_code
       label: 票据关联码
-      description: 缴款码（缴款书级聚合键，每 fpaycode 一行），未缴笔数口径 COUNT(DISTINCT pay_code)（2026-10-26 全局拍板5）
+      description: 缴款码（缴款书级聚合键，每 fpaycode 一行），未缴笔数口径 COUNT(DISTINCT pay_code)
       ai_context:
         synonyms:
         - 缴款码
@@ -1255,19 +1347,39 @@ semantic_model:
       dimension:
         is_time: true
       label: 开具日期
-      description: 未缴时长起算锚=缴款书开具日（une_paybook_high.fdate，round-03 q22 拍板）；与宽表 pay_date（fdate=缴款日，
-        源 FNE_PAYBOOK.FPAYDATE）同名不同义；本数据集主时间轴；实测池开具日跨 2021-06-10~2026-10-19
+      description: 未缴时长起算锚=缴款书开具日（une_paybook_high.fdate）；与宽表 pay_date（fdate=缴款日，
+        源 FNE_PAYBOOK.FPAYDATE）同名不同义；本数据集主时间轴；une 侧无 ffilldate 列，锚 ffilldate 由本字段
+        承载；"今年开具"按本字段过滤
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","time_granularity":"day"}'
+    - name: eff_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: eff_date
+      dimension:
+        is_time: true
+      label: 缴款书有效期
+      description: 未缴缴款书有效期（une_paybook_high.feffdate，varchar yyyy-MM-dd 转 Date，池内取 MAX；赋值=开票日+单位
+        fpayBookEffDays 天、否则 2099-12-31，InvoiceHelper.java:274-287；无过期定时任务，过期判定纯靠本字段与当前日期比较
+        OpenQueryAPIServiceImpl.java:615）；有效期拆分锚：未缴且有效=本字段>=当前日，已过期未缴=本字段
+        <当前日，两池互补勾稽等于未缴总数；无空值
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 有效期
     - name: total_amt
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: total_amt
       label: 未缴书总金额
-      description: 未缴缴款书头表总金额（une_paybook_high.ftotalamt，头表口径，池内取 MAX）；未缴金额分析备用；含滞纳金存疑同 q19
+      description: 未缴缴款书票面总额（une_paybook_high.ftotalamt，票面总额口径，池内取 MAX）；未缴金额分析备用；含滞纳金存疑
       datatype: Decimal
     - name: unpaid_days
       expression:
@@ -1283,8 +1395,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: multiIf(issue_date IS NULL, '未知', dateDiff('day', issue_date, today()) < 1, '<1天', dateDiff('day', issue_date, today()) < 10, '1-10天', dateDiff('day', issue_date, today()) < 100, '10-100天', '≥100天')
       label: 未缴时长分档
-      description: 未缴时长分档维度（round-03 q22 + 2026-10-26 全局拍板4 时长序列）：<1天/1-10天/10-100天/≥100天，issue_date 为空落"未知"桶；
-        分档内笔数口径 COUNT(DISTINCT pay_code)；2026-10-28 实测：<1天 0/1-10天 5/10-100天 99/≥100天 6110
+      description: 未缴时长分档维度（时长序列 1/10/100 天）：<1天/1-10天/10-100天/≥100天，issue_date 为空落"未知"桶；
+        分档内笔数口径 COUNT(DISTINCT pay_code)
       ai_context:
         synonyms:
         - 未缴时长
@@ -1296,16 +1408,17 @@ semantic_model:
     source: SELECT DISTINCT ftransno AS trans_no, fpaycode AS pay_code, ftransamt AS
       trans_amt, toDate(nullIf(ftransdate, '')) AS trans_date FROM yunnan0508.fne_paybook_full_high
       WHERE fistransfer = '1' AND (fisenter = '0' OR toDate(nullIf(fenterdate, '')) IS NULL)
-    description: 划拨在途滞留池（2026-10-27 round-03 q24）：宽表"指令已发未到账"行去重到（划拨单号×缴款书）粒度；2026-10-28 实测
-      35 行/27 个 ftransno/24,511 元（raw 37 行直接 SUM 虚增 204，ftransamt 批次级回填须去重）
+    description: 划拨在途滞留池：宽表"指令已发未到账"行去重到（划拨单号×缴款书）粒度（ftransamt 批次级回填，raw 明细行直接 SUM 会虚增，须去重）
     ai_context:
-      instructions: 数据集自包含（池过滤在 source SQL 内），不与其他 dataset 建关系；池条件（round-03 q24 拍板）=fistransfer='1'
-        AND (fisenter='0' OR fenterdate IS NULL)，已内置；拍板的 fstats IN('1','9') 因宽表实库无 fstats 列（2026-10-28
-        system.columns 129 列核对，ETL 脚本与实库不一致）未落地——fistransfer 源侧由 DECODE(NVL(MSG.FSTATS,'0'),'0','0','1')
-        派生，无法排除 fstats='7' 划转失败，记数据现实偏差待②升级；粒度缘起：ftransamt 为批次级回填，同 ftransno 多明细行重复同额
-        （如 103 元×2 行），raw SUM=24,715 虚高，去重到（ftransno,fpaycode）后 24,511；笔数口径 COUNT(DISTINCT trans_no)
-        （q24 拍板划拨单据号）；时间锚 trans_date=ftransdate（银行回执成功日写入，RestTransferService.java:279-291；round-03
-        注记"下达"无独立日期字段，以此为最接近可用锚待人定）——实测 27 单全落 2024-11-07，"今年下达"过滤后池为空属数据现实；滞留天数用
+      instructions: 数据集自包含（池过滤在 source SQL 内），不与其他 dataset 建关系；池条件=fistransfer='1'
+        AND (fisenter='0' OR fenterdate IS NULL)，已内置；源侧完整判据 fstats='9' AND fisenter='0'（CapitalTransfer.xml:9）
+        因宽表实库无 fstats 列（ETL 抽取未带出）退化为 fistransfer+'0'/'1' 判定，fistransfer 源侧由
+        DECODE(NVL(MSG.FSTATS,'0'),'0','0','1') 派生，无法排除 fstats='7' 划转失败，记数据现实偏差；
+        单头表 FNE_TRANSFER_BANK_MSG 未抽取，金额取宽表 ftransamt（源 FNE_COLLECT_TO_TRANSFER.FAMT）；
+        粒度缘起：ftransamt 为批次级回填，同 ftransno 多明细行重复同额，
+        raw SUM 虚高，须去重到（ftransno,fpaycode）；笔数口径 COUNT(DISTINCT trans_no)
+        （划拨单据号）；时间锚 trans_date=ftransdate（银行回执成功日写入，RestTransferService.java:279-291；
+        "下达"无独立日期字段，以此为最接近可用锚）；滞留天数用
         transit_days，分档用 transit_duration_bucket
     fields:
     - name: trans_no
@@ -1314,8 +1427,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: trans_no
       label: 划拨单据号
-      description: 划拨阶段单据号（物理 ftransno，源 FNE_COLLECT_TO_TRANSFER.FTRANSFERNO，round-03 q24 拍板笔数键）；
-        与缴库侧单据号（fenterno 等）同名陷阱勿混（round-03 q21 注记）
+      description: 划拨阶段单据号（物理 ftransno，源 FNE_COLLECT_TO_TRANSFER.FTRANSFERNO，笔数键）；
+        与缴库侧单据号（fenterno 等）同名陷阱勿混
       ai_context:
         synonyms:
         - 划拨单号
@@ -1336,7 +1449,7 @@ semantic_model:
           expression: trans_amt
       label: 划拨金额
       description: 该（划拨单×缴款书）的划拨金额（物理 ftransamt，源 FNE_COLLECT_TO_TRANSFER.FAMT，Nullable(Decimal(18,6))）；
-        去重后 SUM 即在途滞留金额（raw 明细行粒度 SUM 会因批次级回填重复而虚增 204）
+        去重后 SUM 即在途滞留金额（raw 明细行粒度 SUM 会因批次级回填重复而虚增）
       datatype: Decimal
     - name: trans_date
       expression:
@@ -1346,8 +1459,8 @@ semantic_model:
       dimension:
         is_time: true
       label: 划转日期
-      description: 滞留起算锚=ftransdate（银行回执成功日写入，RestTransferService.java:279-291；round-03 q24 注记：语义≈划转执行/回执日，
-        "下达"无独立日期字段，以此为最接近可用锚待人定）；实测 27 单全落 2024-11-07；本数据集主时间轴
+      description: 滞留起算锚=ftransdate（银行回执成功日写入，RestTransferService.java:279-291；语义≈划转执行/回执日，
+        "下达"无独立日期字段，以此为最接近可用锚）；本数据集主时间轴
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -1358,7 +1471,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: dateDiff('day', trans_date, today())
       label: 在途滞留天数
-      description: 划拨指令滞留天数（当前日−trans_date，round-02 q24 派生口径）；trans_date 为空（未回执）为 NULL
+      description: 划拨指令滞留天数（当前日−trans_date）；trans_date 为空（未回执）为 NULL
       datatype: Integer
     - name: transit_duration_bucket
       expression:
@@ -1366,7 +1479,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: multiIf(trans_date IS NULL, '未知', dateDiff('day', trans_date, today()) < 1, '<1天', dateDiff('day', trans_date, today()) < 10, '1-10天', dateDiff('day', trans_date, today()) < 100, '10-100天', '≥100天')
       label: 在途滞留时长分档
-      description: 在途滞留时长分档维度（round-02 q24 + 2026-10-26 全局拍板4 时长序列）：<1天/1-10天/10-100天/≥100天，trans_date
+      description: 在途滞留时长分档维度（时长序列 1/10/100 天）：<1天/1-10天/10-100天/≥100天，trans_date
         为空落"未知"桶；分档内笔数口径 COUNT(DISTINCT trans_no)
       ai_context:
         synonyms:
@@ -1377,15 +1490,21 @@ semantic_model:
       data: '{"source_type": "query", "time_dimension": "trans_date", "v": "1.11"}'
   - name: income_daybook
     source: yunnan0508.fne_income_daybook
-    description: 收入流水表（2026-10-27 round-03 q23）：执收单位已收资金流水（按 freceiveddate 日刷分区），fisgenerec=0
-      为"已收未汇缴"存量池；2026-10-28 实测 740 条流水/1,472,288.25 元，到账日跨 2022-07-18~2026-06-30
+    description: 收入流水表：执收单位已收资金流水（按 freceiveddate 日刷分区），fisgenerec=0
+      为"已收未汇缴"存量池；收入侧口径含 enter_date 记账日期锚、income_agen_name/bgt_agen_name/dept_name/subject_name/income_rgn_name
+      收入侧维度
     ai_context:
-      instructions: 与宽表无现成 JOIN（etl-daybook-1ca2b7a0：宽表加工不消费本表），不建关系，需要跨表时使用方自行按 fpaycode 关联
-        （本表 fpaycode 一对多，report.sql:57 先例），注意防扇出；round-03 q23 拍板："执收单位已收未汇缴滞留"用本表 fisgenerec=0
-        过滤（权威口径 IncomeDayBookServiceImpl.queryIncomeUnGeneRec），替代 round-02 误用的在途滞留口径与 fnr_unpaid
-        （欠缴口径，CK 未覆盖，双重不可用）；金额取数列 fimamt（fownimamt 本级收入为备选列，report.sql:56 按 fiodirection
-        方向加权，口径辨析待人定，已建模备用）；queryIncomeUnGeneRec 的资金性质预算内条件因 CK 侧列未核验（etl-daybook 仅核
-        6 列）未落地，记数据现实偏差；时间锚 received_date=到账日；滞留天数用 detention_days，分档用 detention_duration_bucket
+      instructions: 与宽表无现成 JOIN（宽表加工不消费本表），不建关系，需要跨表时使用方自行按 fpaycode 关联
+        （本表 fpaycode 一对多，report.sql:57 先例），注意防扇出；"执收单位已收未汇缴滞留"用本表 fisgenerec=0
+        过滤（权威口径 IncomeDayBookServiceImpl.queryIncomeUnGeneRec；fnr_unpaid 欠缴口径 CK 未覆盖不可用）；
+        金额取数列 fimamt（fownimamt 本级收入为备选列，report.sql:56 按 fiodirection
+        方向加权）；queryIncomeUnGeneRec 的资金性质预算内条件所需列未抽取，未落地，记数据现实偏差；时间锚 received_date=到账日；滞留天数用 detention_days，分档用 detention_duration_bucket；
+        收入侧口径："收入金额/收入单位/预算科目/收入区划/预算单位/主管部门"类问题一律用本数据集，
+        收入侧"今年"按 enter_date（收入日期锚）过滤，received_date（到账锚）保留给已收未汇缴滞留口径；财政记账完成判定走缴库报文侧
+        （财政记账收入金额，treasury_transfer_dedup.income_status='1'），本表 fisgeneacct 为生成态中间标记（当前全 0）不作记账完成判定；收入单位=income_agen_name（fimagenname，权威收入归属单位，禁用执收单位 fchgagenname 冒充）、收入区划=income_rgn_name（fimrgnname，过滤用 income_rgn_code，本区划=云南省本级 530000）、预算单位=
+        bgt_agen_name（fbgtagenname，预算单位双侧统一收入侧口径，宽表 budget_agen 在收入类问题中弃用）、主管部门=dept_name
+        （fdeptname，主管部门主选，禁用预算单位冒充）、收入科目=subject_name（fsubname 台账落库名称列，禁用缴款侧科目文本/项目名）；
+        空科目编码（fsubcode=''）落 subject_name"未归属"单列不摊入排序（当前数据 fsubcode 全非空，逻辑保留）
     fields:
     - name: fisgenerec
       expression:
@@ -1393,17 +1512,19 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fisgenerec
       label: 是否生成缴库记录
-      description: 是否已生成缴库记录（物理 fisgenerec，UInt8：0=未生成/1=已生成；入账置 0 IncomeDayBookServiceImpl.java:769、
-        生成缴库置 1 TreasuryServiceImpl.java:222-233，权威未汇缴判定=0）；2026-10-28 实测：0=740 条/147.23 万元；过滤用数值
+      description: 是否已生成缴库记录（物理 fisgenerec，UInt8：0=未生成/1=已生成，权威未汇缴判定=0）；过滤用数值
         比较（fisgenerec = 0），不加引号
       datatype: Integer
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
     - name: income_amt
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: fimamt
       label: 收入金额
-      description: 该流水收入金额（物理 fimamt，Decimal(18,6)）；已收未汇缴金额指标的取数列（round-03 q23 拍板）
+      description: 该流水收入金额（物理 fimamt，Decimal(18,6)）；已收未汇缴金额指标的取数列
       datatype: Decimal
     - name: own_income_amt
       expression:
@@ -1411,8 +1532,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fownimamt
       label: 本级收入金额
-      description: 本级收入金额（物理 fownimamt，Decimal(18,6)）；report.sql:56 按 fiodirection 方向加权的口径，与 income_amt
-        的口径辨析待人定（round-03 q23 注记），已建模备用
+      description: 本级收入金额（物理 fownimamt，Decimal(18,6)）；report.sql:56 按 fiodirection 方向加权的口径，已建模备用
       datatype: Decimal
     - name: received_date
       expression:
@@ -1423,7 +1543,7 @@ semantic_model:
         is_time: true
       label: 资金到账日期
       description: 资金到账日期（物理 freceiveddate 字符串转 Date，nullIf 空串守卫），也是 ETL 抽取过滤键（按日刷分区）；
-        round-03 q23 拍板滞留起算锚；实测池跨 2022-07-18~2026-06-30；本数据集主时间轴
+        已收未汇缴滞留起算锚；本数据集主时间轴
       datatype: Date
       custom_extensions:
       - vendor_name: DATUS
@@ -1445,14 +1565,17 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fbatchno
       label: 缴库批次号
-      description: 汇缴缴库批次号（生成缴库记录时回填，TreasuryServiceImpl.java:222-233）；fisgenerec=0 池内应为空，可作核对用
+      description: 汇缴缴库批次号（生成缴库记录时回填）；fisgenerec=0 池内应为空，可作核对用
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
     - name: detention_days
       expression:
         dialects:
         - dialect: CLICKHOUSE
           expression: dateDiff('day', toDate(nullIf(freceiveddate, '')), today())
       label: 滞留天数
-      description: 已收未汇缴滞留天数（当前日−freceiveddate，round-03 q23 拍板分档锚）；到账日为空为 NULL
+      description: 已收未汇缴滞留天数（当前日−freceiveddate，分档锚）；到账日为空为 NULL
       datatype: Integer
     - name: detention_duration_bucket
       expression:
@@ -1460,27 +1583,337 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: multiIf(toDate(nullIf(freceiveddate, '')) IS NULL, '未知', dateDiff('day', toDate(nullIf(freceiveddate, '')), today()) < 1, '<1天', dateDiff('day', toDate(nullIf(freceiveddate, '')), today()) < 10, '1-10天', dateDiff('day', toDate(nullIf(freceiveddate, '')), today()) < 100, '10-100天', '≥100天')
       label: 滞留时长分档
-      description: 滞留时长分档维度（round-03 q23 + 2026-10-26 全局拍板4 时长序列）：<1天/1-10天/10-100天/≥100天，到账日为空落"未知"桶
+      description: 滞留时长分档维度（时长序列 1/10/100 天）：<1天/1-10天/10-100天/≥100天，到账日为空落"未知"桶
       ai_context:
         synonyms:
         - 滞留时长
+    - name: fisgeneacct
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fisgeneacct
+      label: 记账数据生成标志
+      description: 是否已生成记账数据（物理 fisgeneacct，UInt8 生成态中间标记，先生成后写入，非记账完成判定）；当前数据全为生成态 0；财政记账完成判定在缴库报文侧（财政记账收入金额
+        指标，treasury_transfer_dedup.income_status='1'）；过滤用数值比较 fisgeneacct = 1，不加引号
+      datatype: Integer
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","is_dimension":false}'
+    - name: enter_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: toDate(nullIf(fpaydate, ''))
+      dimension:
+        is_time: true
+      label: 收入日期（记账锚）
+      description: 收入侧业务日期锚（物理 fpaydate 字符串转 Date，nullIf 空串守卫）；
+        源侧设计时间锚=fenterdate（记账日期，记账完成无独立日期列、收入台账收入日期取自缴库单入库日期
+        FENTERDATE，TipsProcessor.java:150,167），但实库 fne_income_daybook 无 fenterdate 列（断供注记，一律实查），
+        以 fpaydate 代锚；收入侧"今年"一律按本字段过滤（received_date
+        到账锚保留给已收未汇缴滞留），勿与宽表 enter_date（划拨到账）混用——同名不同义
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 收入日期
+        - 记账日期
+    - name: income_agen_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fimagenname
+      label: 收入单位名称
+      description: 收入单位名称（物理 fimagenname，权威收入归属单位；官方查询 queryAgenItemIncome 按 fimAgen* 分组 IncomeDayBook.xml:183-217）；
+        "收入金额排名前十的收入单位"分组维度（执收单位 fchgagen*
+        是另一口径）；名称列冗余落库可直接分组（XML:19-28），识别码 fimagenidcode 暂不建模
+      ai_context:
+        synonyms:
+        - 收入单位
+        - 收入归属单位
+    - name: income_rgn_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fimrgnname
+      label: 收入区划名称
+      description: 收入区划名称（物理 fimrgnname，fimRgn* 前缀=收入归属区划，frecrgncode 不在台账上而在清分表）；值域含 云南省本级（530000）/中央（000000）等；
+        "收入金额排名前十的收入区划"分组维度，过滤按
+        income_rgn_code
+      ai_context:
+        synonyms:
+        - 收入区划
+        - 收入归属区划
+    - name: income_rgn_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fimrgncode
+      label: 收入区划代码
+      description: 收入区划代码（物理 fimrgncode，String），与 income_rgn_name 一一对应；过滤按本列，「本区划」=登录人所属区划，本库主体区划为云南省本级
+        530000
+    - name: bgt_agen_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fbgtagenname
+      label: 预算单位名称（收入侧）
+      description: 收入侧预算单位名称（物理 fbgtagenname）；
+        预算单位双侧统一收入侧口径（缴款侧名称与收入侧编码实为同一字段两列，统一到收入侧并保证名称非空），宽表
+        budget_agen（fchgbgtagenname）在收入类问题中弃用；"各预算单位对应的收入金额"按本列分组
+      ai_context:
+        synonyms:
+        - 预算单位
+        - 主管预算单位
+    - name: dept_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: fdeptname
+      label: 主管部门名称
+      description: 主管部门名称（物理 fdeptname）；
+        "主管部门归口"维度主选（备选 归口业务处室 ffindeptname；主管部门勿用预算单位
+        fbgtAgen* 冒充）；分组在台账明细表做（汇总层 report_income_daybook_data_new 无此列）
+      ai_context:
+        synonyms:
+        - 主管部门
+        - 归口部门
+    - name: subject_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: multiIf(fsubcode = '', '未归属', fsubname)
+      label: 收入科目名称
+      description: 收入侧预算科目名称（fsubname 台账落库名称列直接分组，写入时编码+名称成对取自 fab_subject 按收入年度翻译
+        IncomeDayBookServiceImpl.java:1567-1571）；预算科目维度用本列（收入侧不抄
+        缴款书 fsubname 文本）；fsubcode 空="项目/单位项目未配置预算科目"的收入（非脏数据，ITEM_ATTR_SCOPE 016 参数控制
+        ParamConsts.java:68-71），本列落"未归属"单列不摊入排序（判据=物理 fsubcode 空串；当前数据 fsubcode 无空值，"未归属"分支
+        逻辑保留）；CK 无 fab_subject 字典镜像，编码核对用物理 fsubcode
+      ai_context:
+        synonyms:
+        - 收入科目
+        - 预算科目
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","time_dimension":"received_date"}'
+  - name: no_income_paybook
+    source: SELECT p.fpaycode AS pay_code, MAX(toDate(nullIf(p.fdate, ''))) AS pay_date
+      FROM yunnan0508.fne_paybook_full_high p LEFT JOIN (SELECT DISTINCT fpaycode
+      FROM yunnan0508.fne_income_daybook) d ON p.fpaycode = d.fpaycode WHERE p.fisreceived
+      = '1' AND coalesce(d.fpaycode, '') = '' GROUP BY p.fpaycode
+    description: 已缴款未形成收入记录池：宽表 fisreceived='1' 按 fpaycode 左连收入台账
+      distinct fpaycode 无匹配记录（记录口径 CK 落地退化——权威判定 FNE_PAYINFO_RECONCILED.FUNGENEINCOMEAMT>0 整表未抽取
+      ，按契约"断供只记账不改口径"以台账关联无记录退化）
+    ai_context:
+      instructions: 数据集自包含（反连判定在 source SQL 内），不与其他 dataset 建关系；反连实现：CH 23.3 默认 join_use_nulls=0
+        下 LEFT JOIN 未命中回填空串，用 coalesce(d.fpaycode,'')='' 判无收入记录（勿改写 IS NULL）；台账侧取 DISTINCT fpaycode
+        防一对多扇出（report.sql:57 先例）；口径两义辨析：记录口径=本池笔数，金额差额口径（FUNGENEINCOMEAMT 权威，
+        未抽取断供）两口径不可互推，金额差额备选=fownimamt；"今年已缴款"按 pay_date 过滤；
+        已缴款判定=fisreceived='1'，勿用宽表 fstate
+    fields:
+    - name: pay_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_code
+      label: 票据关联码
+      description: 缴款码（缴款书级聚合键，每 fpaycode 一行），未形成收入笔数口径 COUNT(DISTINCT pay_code)
+      ai_context:
+        synonyms:
+        - 缴款码
+    - name: pay_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_date
+      dimension:
+        is_time: true
+      label: 缴款日期
+      description: 缴款日期（池内取 MAX，源宽表 fdate=缴款日）；"今年已缴款"过滤锚；本数据集主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "time_dimension": "pay_date", "v": "1.11"}'
+  - name: entered_uncleared_paybook
+    source: SELECT pay_code, SUM(fimamt) AS uncleared_amt, MAX(pay_date) AS pay_date
+      FROM (SELECT DISTINCT p.fid AS fid, p.fpaycode AS pay_code, p.fimamt AS fimamt,
+      toDate(nullIf(p.fdate, '')) AS pay_date FROM yunnan0508.fne_paybook_full_high
+      p JOIN yunnan0508.fne_funddivide_transfer fd ON fd.fpaybooksubid = p.fid JOIN
+      yunnan0508.fne_treasury_transfer_new t ON t.fpid = fd.fid WHERE t.fenterstatus
+      = '1' AND p.fcollectid = '') GROUP BY pay_code
+    description: 已缴入国库未完成清分池（异常存在性校验）：宽表 fcollectid=''（未汇总入清分批次，
+      ClearDetail.xml:156/221）经两跳（funddivide_transfer.fpaybooksubid=宽表 fid → treasury_transfer_new.fpid=funddivide
+      fid，t.fenterstatus='1'）判定已缴库
+    ai_context:
+      instructions: 数据集自包含（两跳判定在 source SQL 内），不与其他 dataset 建关系；关联路径：两跳（fd.fpaybooksubid=p.fid
+        JOIN t.fpid=fd.fid），禁用 ftransno 直连清分表（须经 fcollectid→ftranscollectid→ftransno 三跳）；
+        判定组合：已缴入国库=t.fenterstatus='1' AND 未清分=宽表 fcollectid=''（CH 23.3 join_use_nulls=0 空串语义，
+        null=未汇总/'0'=汇总中/非空=已汇总；fispayenter 是缴库侧标志非清分完成标志，勿用）；inner DISTINCT（fid 粒度）防两跳
+        扇出，外层按 fpaycode 聚合明细行 fimamt；子查询列必须显式 AS 别名（CK 23.3 DISTINCT+JOIN 下裸 p.fimamt 输出名被改写致外层
+        Missing columns 'fimamt'，且 fd 表也有同名列 fimamt）
+    fields:
+    - name: pay_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_code
+      label: 票据关联码
+      description: 缴款码（池聚合键，每 fpaycode 一行），未清分笔数口径 COUNT(DISTINCT pay_code)
+      ai_context:
+        synonyms:
+        - 缴款码
+    - name: uncleared_amt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: uncleared_amt
+      label: 未清分金额
+      description: 该缴款书未清分明细金额合计（宽表 fimamt 明细行求和，清分金额口径）；未清分金额辅指标取数列
+      datatype: Decimal
+    - name: pay_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_date
+      dimension:
+        is_time: true
+      label: 缴款日期
+      description: 缴款日期（池内取 MAX，源宽表 fdate=缴款日）；异常校验类问题无时间锚，本字段仅作池内参考维度；本数据集主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "time_dimension": "pay_date", "v": "1.11"}'
+  - name: paybook_head
+    source: SELECT fpaycode AS pay_code, any(ftotalamt) AS total_amt, SUM(famt) AS
+      item_amt, any(fisreceived) AS is_received, any(toDate(nullIf(fdate, ''))) AS
+      pay_date, any(fbustype) AS bustype, any(fpaybankcode) AS pay_bank_code, any(fpaybankname)
+      AS pay_bank_name, any(frecbankname) AS rec_bank_name FROM yunnan0508.fne_paybook_full_high
+      GROUP BY fpaycode
+    description: 缴款书粒度数据集（票面总额口径），自明细行宽表 fne_paybook_full_high 按 fpaycode 升粒度，每张缴款书恰一行；书级数值本粒度直 SUM：total_amt=票面总额、item_amt=该书明细金额合计
+    ai_context:
+      instructions: 数据集自包含（升粒度在 source SQL 内），不与其他 dataset 建关系；票面总额指标（缴款金额_票面总额/代收非税收入金额）取数于本数据集，
+        可分组维度=pay_bank_code/pay_bank_name（代理银行）、rec_bank_name（收款银行）、bustype（业务类型）、pay_date（缴款日）、
+        is_received（到账）；执收单位/科目/项目/归属区划分组用 paybook_full_high_item 明细行口径（非税缴款金额/清分金额）；同 fpaycode 各明细行的票面总额与书级属性组内全等，
+        any() 取值无歧义
+    fields:
+    - name: pay_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_code
+      label: 缴款码
+      description: 财政票据关联码（缴款书业务键，升粒度分组键，每 fpaycode 一行）；跨链连通键，笔数口径 COUNT(DISTINCT pay_code)
+      ai_context:
+        synonyms:
+        - 缴款码
+        - 票据关联码
+    - name: total_amt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: total_amt
+      label: 缴款总金额（票面总额）
+      description: 缴款通知书票面总额（组内 any 取一份，源 ftotalamt Nullable(Decimal(18,6))）；本粒度直 SUM 即缴款金额票面总额口径；
+        是否含滞纳金口径未定论（QryPayBook.java:337/355 存疑）
+      datatype: Decimal
+    - name: item_amt
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: item_amt
+      label: 缴款明细金额合计
+      description: 该缴款书各科目明细行金额合计（源明细行 famt 升粒度 SUM）；票面总额与明细合计之差反映书内拆分差
+      datatype: Decimal
+    - name: is_received
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: is_received
+      label: 资金是否到账
+      description: 资金是否到账标志（源 fisreceived，值域 0/1 无 NULL）：1=已到账；"代收"判定按 is_received='1'
+      datatype: Integer
+      ai_context:
+        synonyms:
+        - 到账状态
+    - name: pay_date
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_date
+      dimension:
+        is_time: true
+      label: 缴款日期
+      description: 缴款书缴款日期（源 fdate 转 Date，nullIf 空串守卫；组内 any，组内全等）；本数据集主时间轴
+      datatype: Date
+      custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v":"1.11","time_granularity":"day"}'
+      ai_context:
+        synonyms:
+        - 缴款日
+    - name: bustype
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: bustype
+      label: 业务类型
+      description: 业务类型（源 fbustype）：1=直缴、2=汇缴；直缴口径按 bustype='1' 切片
+    - name: pay_bank_code
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_bank_code
+      label: 代理银行编码
+      description: 代理银行编码（源 fpaybankcode，字典 152）；"各代理银行代收金额/排名"类问题的分组/过滤维度，展示配 pay_bank_name、过滤按本列
+      ai_context:
+        synonyms:
+        - 代理银行
+        - 代收银行
+    - name: pay_bank_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: pay_bank_name
+      label: 代理银行名称
+      description: 代理银行名称（源 fpaybankname，字典翻译）；与 pay_bank_code 配套的展示列，分组展示优先用本列、过滤按码列
+      ai_context:
+        synonyms:
+        - 代理银行
+        - 代收银行
+    - name: rec_bank_name
+      expression:
+        dialects:
+        - dialect: CLICKHOUSE
+          expression: rec_bank_name
+      label: 收款银行名称
+      description: 缴款资金收款银行名称（源 frecbankname，取值统一带尾部空格，过滤匹配需 trim）；收款银行视角分组用本列
+      ai_context:
+        synonyms:
+        - 收款银行
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"source_type": "query", "time_dimension": "pay_date", "v": "1.11"}'
   - name: dim_agen
     source: SELECT fagenidcode, fagencode, fagenname, flevel, ftypecode, fpidcode,
       toString(fisleaf) AS fisleaf FROM (SELECT fagenidcode, fagencode, fagenname,
       flevel, ftypecode, fpidcode, toString(fisleaf) AS fisleaf, ROW_NUMBER() OVER
       (PARTITION BY fagenidcode ORDER BY fupdatetime DESC) AS _rn FROM yunnan0508.fab_agen)
       WHERE _rn = 1
-    description: 执收单位查询型维度：fab_agen 按 fagenidcode 去重取最新版本（fupdatetime DESC），295 行去重后
-      218 行；含 parent_agen/is_leaf 单位树层级钻取字段
+    description: 执收单位查询型维度：fab_agen 按 fagenidcode 去重取最新版本（fupdatetime DESC）；含 parent_agen/is_leaf 单位树层级钻取字段
     ai_context:
-      instructions: fab_agen 原始 295 行含多版本，直连会扇出约 4.4 倍，必须使用本去重数据集；与事实表的边（D5/D6/D7：fchgagenidcode=fagenidcode）实测验证连接，to
+      instructions: fab_agen 原始行含多版本，直连会扇出，必须使用本去重数据集；与事实表的边（fchgagenidcode=fagenidcode）实测验证连接，to
         侧去重后唯一；去重实现说明：规格原文为 ORDER BY fupdatetime DESC LIMIT 1 BY fagenidcode，因引擎查询源解析器不支持
         LIMIT 1 BY，已等价改写为 ROW_NUMBER() OVER (PARTITION BY fagenidcode ORDER BY fupdatetime
-        DESC)=1（多列去重单排序列技巧），对账指纹一致（218 行）；parent_agen 指向表内 fagenidcode，可按 parent_agen=单位ID
-        自联结汇总子单位缴款（注意 2 个单位存在跨版本父编码漂移，见 parent_agen 字段说明）
+        DESC)=1（多列去重单排序列技巧）；parent_agen 指向表内 fagenidcode，可按 parent_agen=单位ID
+        自联结汇总子单位缴款（注意少数单位存在跨版本父编码漂移，见 parent_agen 字段说明）
     fields:
     - name: fagenidcode
       expression:
@@ -1495,6 +1928,7 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fagencode
       label: 单位代码
+      description: 执收单位代码（物理 fagencode）；与事实表 fchgagencode 对应，识别码连接键为 fagenidcode
     - name: fagenname
       expression:
         dialects:
@@ -1527,10 +1961,9 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fpidcode
       label: 上级单位编码
-      description: 上级单位编码（物理 fpidcode），String 型，沿 parent_agen=fagenidcode 自联结构成单位树。实测：fab_agen 原始
-        295 行中 244 行有父编码、涉及 26 个不同父单位，全部指向表内有效 fagenidcode（无悬挂）；去重后 218 单位中 192 有父编码；2 个单位（18ff49716f334abf94e5405ef8911192、2a02256f21ae47a1bef24a7f99dbc352）跨版本父编码漂移（各
-        2 个不同 fpidcode，同秒内两次变更），去重取 fupdatetime 最新版后树可能受影响；典型用法：JOIN 子查询沿 parent_agen 汇总（示例：测试云南省教育厅1
-        直属 44 子单位、其中 43 叶子、10 个有直缴、直缴合计 160.47 亿）
+      description: 上级单位编码（物理 fpidcode），String 型，沿 parent_agen=fagenidcode 自联结构成单位树。
+        父编码全部指向表内有效 fagenidcode（无悬挂）；少数单位存在跨版本父编码漂移（同键多版本 fpidcode 不同），
+        去重取 fupdatetime 最新版后树可能受影响；典型用法：JOIN 子查询沿 parent_agen 汇总子单位
       ai_context:
         synonyms:
         - 上级单位
@@ -1543,9 +1976,9 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: toString(fisleaf)
       label: 是否叶子单位
-      description: 是否叶子单位（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。实测（去重后 218
-        行）：''0''=26 非叶、''1''=192 叶；层级×叶标志分布 1级（20非叶+23叶）/2级（6非叶+159叶）/3级（10叶）。用途：层级聚合时只对 is_leaf=''1''
-        的叶子单位汇总防父子双重计数；注意 1 级也有 23 个叶子单位——顶层直属单位可直接挂缴款
+      description: 是否叶子单位（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。''1''=叶子、''0''=非叶；
+        层级聚合时只对 is_leaf=''1''
+        的叶子单位汇总防父子双重计数；注意顶层也有叶子单位——顶层直属单位可直接挂缴款
       ai_context:
         synonyms:
         - 叶子
@@ -1559,13 +1992,13 @@ semantic_model:
       toString(fisleaf) AS fisleaf FROM (SELECT fsubcode, fsubname, fyear, flevel,
       fpcode, toString(fisleaf) AS fisleaf, ROW_NUMBER() OVER (PARTITION BY fsubcode
       ORDER BY fyear DESC) AS _rn FROM yunnan0508.fab_subject) WHERE _rn = 1
-    description: 预算科目查询型维度：fab_subject 按年度取最新版（fyear DESC 去重），539 个科目；含 parent_subject/subject_leaf
+    description: 预算科目查询型维度：fab_subject 按年度取最新版（fyear DESC 去重）；含 parent_subject/subject_leaf
       科目树字段
     ai_context:
-      instructions: 事实表 fsubid/frecsubcode 与 fab_subject.fid 不同（27 清单已验证），科目属性连接只能走科目代码（fsubcode/frecsubcode），D8/D9
-        边实测验证连接；同 fsubcode 多年度版本时本数据集取最新年度版；物理表无 fsublevelname 列，fsublevel 取自 toString(flevel)；去重实现说明：规格原文为
+      instructions: 事实表 fsubid/frecsubcode 与 fab_subject.fid 不同，科目属性连接只能走科目代码（fsubcode/frecsubcode），
+        实测验证连接；同 fsubcode 多年度版本时本数据集取最新年度版；物理表无 fsublevelname 列，fsublevel 取自 toString(flevel)；去重实现说明：规格原文为
         ORDER BY fyear DESC LIMIT 1 BY fsubcode，因引擎查询源解析器不支持 LIMIT 1 BY，已等价改写为 ROW_NUMBER()
-        OVER (PARTITION BY fsubcode ORDER BY fyear DESC)=1，对账指纹一致（539 行）；科目树字段 parent_subject（fpcode）/subject_leaf（fisleaf）随去重
+        OVER (PARTITION BY fsubcode ORDER BY fyear DESC)=1；科目树字段 parent_subject（fpcode）/subject_leaf（fisleaf）随去重
         SELECT 一并提供；科目码前缀即层级路径（10301 系=政府性基金收入 103 之下）
     fields:
     - name: fsubcode
@@ -1600,8 +2033,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fsublevel
       label: 科目层级
-      description: 科目层级（物理 flevel 数值转字符串，String 型）；实测去重后 539 科目分布：1级 1/2级 10/3级 155/4级 373；科目码前缀即层级路径（10301
-        系=政府性基金收入 103 之下）。按 07 标准 §3.2 同义冗余不重复建模：subject_level 与本字段映射同一物理列 flevel，不重复声明
+      description: 科目层级（物理 flevel 数值转字符串，String 型）；科目码前缀即层级路径（10301
+        系=政府性基金收入 103 之下）；subject_level 与本字段映射同一物理列 flevel，同义冗余不重复声明
       custom_extensions:
       - vendor_name: DATUS
         data: '{"v":"1.11","is_dimension":false}'
@@ -1611,11 +2044,9 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: fpcode
       label: 上级科目编码
-      description: 上级科目编码（物理 fpcode），String 型，沿 parent_subject=fsubcode 自联结构成科目树。实测：fab_subject 3,143 行全部有父编码（一级科目 fpcode=''
-        除外，去重后仅 1 个一级科目'非税收入'103）；fpcode 全部指向表内有效 fsubcode（无悬挂，实测 JOIN 0 孤儿）；去重后 539 科目（1级1/2级10/3级155/4级373，叶
-        450/非叶 89）；103 非税收入下直属 10 个二级类（10301 政府性基金收入等）；同 fsubcode 多年度版本的 fpcode/flevel/fisleaf
-        三字段实测完全稳定（跨版本漂移 0，fab_subject 按 (fsubcode,fyear) 唯一，去重取最新年不影响树结构）；实测场景：10301 政府性基金收入下 7
-        个叶子科目有缴款（民航发展基金 3,085.08 万最高）
+      description: 上级科目编码（物理 fpcode），String 型，沿 parent_subject=fsubcode 自联结构成科目树。一级科目 fpcode=''；
+        fpcode 全部指向表内有效 fsubcode（无悬挂）；103 非税收入下直属若干二级类（10301 政府性基金收入等）；同 fsubcode 多年度版本的 fpcode/flevel/fisleaf
+        三字段完全稳定（fab_subject 按 (fsubcode,fyear) 唯一，去重取最新年不影响树结构）
       ai_context:
         synonyms:
         - 上级科目
@@ -1627,9 +2058,8 @@ semantic_model:
         - dialect: CLICKHOUSE
           expression: toString(fisleaf)
       label: 是否叶子科目
-      description: 是否叶子科目（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。实测（去重后 539
-        行）：450 叶/89 非叶；有缴款的 23 个科目全部是叶子（实测非叶科目无直接缴款行 0）——缴款全部落在叶子科目，层级聚合无双重计数风险，但 fisleaf
-        仍建议保留作查询守卫
+      description: 是否叶子科目（物理 fisleaf 为 UInt8，toString 转字符串），String 型取值 ''0''/''1''，过滤值必须带引号。''1''=叶子；
+        缴款全部落在叶子科目，层级聚合无双重计数风险，仍建议保留作查询守卫
       ai_context:
         synonyms:
         - 叶子科目
@@ -1640,13 +2070,13 @@ semantic_model:
   relationships:
   - name: funddivide_to_paybook
     from: funddivide_transfer
-    to: paybook_full_high
+    to: paybook_full_high_item
     from_columns:
     - fpaybooksubid
     to_columns:
     - fid
     ai_context:
-      instructions: R1：清分划拨明细→缴款明细，实测 JOIN 1,130 行；to 侧 fid 存在 147 个生命周期多版本重复，测试环境放宽声明（行级钻取用途，金额指标一律锚定单
+      instructions: 清分划拨明细→缴款明细；to 侧 fid 存在生命周期多版本重复（定性非唯一声明，行级钻取用途，金额指标一律锚定单
         dataset）
     custom_extensions:
     - vendor_name: DATUS
@@ -1659,7 +2089,7 @@ semantic_model:
     to_columns:
     - fcollectid
     ai_context:
-      instructions: R2：清分划拨明细→划拨指令，实测 JOIN 160 行；to 侧 fcollectid 生命周期多版本非唯一，测试环境放宽声明
+      instructions: 清分划拨明细→划拨指令；to 侧 fcollectid 生命周期多版本非唯一（行级钻取用途）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
@@ -1671,7 +2101,7 @@ semantic_model:
     to_columns:
     - fcollectid
     ai_context:
-      instructions: R3：缴库报文→清分划拨批次，实测 JOIN 460 行；to 侧 fcollectid 非唯一，测试环境放宽声明
+      instructions: 缴库报文→清分划拨批次；to 侧 fcollectid 非唯一（行级钻取用途）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
@@ -1683,19 +2113,19 @@ semantic_model:
     to_columns:
     - fid
     ai_context:
-      instructions: R4：缴库报文→清分划拨明细，实测 JOIN 476 行；to 侧 fid 非唯一，测试环境放宽声明
+      instructions: 缴库报文→清分划拨明细；to 侧 fid 非唯一（行级钻取用途）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
   - name: paybook_to_dim_agen
-    from: paybook_full_high
+    from: paybook_full_high_item
     to: dim_agen
     from_columns:
     - fchgagenidcode
     to_columns:
     - fagenidcode
     ai_context:
-      instructions: D5：缴款明细→执收单位维度，实测验证连接；to 侧 dim_agen 已按 fagenidcode 去重唯一
+      instructions: 缴款明细→执收单位维度，实测验证连接；to 侧 dim_agen 已按 fagenidcode 去重唯一
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
@@ -1707,7 +2137,7 @@ semantic_model:
     to_columns:
     - fagenidcode
     ai_context:
-      instructions: D6：清分划拨明细→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
+      instructions: 清分划拨明细→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
@@ -1719,19 +2149,19 @@ semantic_model:
     to_columns:
     - fagenidcode
     ai_context:
-      instructions: D7：缴库报文→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
+      instructions: 缴库报文→执收单位维度，实测验证连接；to 侧 dim_agen 已去重唯一
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
   - name: paybook_to_dim_subject
-    from: paybook_full_high
+    from: paybook_full_high_item
     to: dim_subject
     from_columns:
     - fsubcode
     to_columns:
     - fsubcode
     ai_context:
-      instructions: D8：缴款明细→预算科目维度，实测验证连接；科目属性只能走科目代码（fsubid 与 fab_subject.fid 不同）
+      instructions: 缴款明细→预算科目维度，实测验证连接；科目属性只能走科目代码（fsubid 与 fab_subject.fid 不同）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
@@ -1743,68 +2173,70 @@ semantic_model:
     to_columns:
     - fsubcode
     ai_context:
-      instructions: D9：清分划拨明细→预算科目维度（收款科目），实测验证连接
+      instructions: 清分划拨明细→预算科目维度（收款科目），实测验证连接
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","join_type":"left"}'
   metrics:
   - name: 非税缴款金额
-    description: 非税缴款金额（缴款通知书明细口径，paybook_full_high.famt 直 SUM）；全部业务类型，直缴口径=按 fbustype='1'
+    description: 非税缴款金额（缴款通知书明细口径，paybook_full_high_item.famt 直 SUM）；全部业务类型，直缴口径=按 fbustype='1'
       切片，汇缴口径=按 fbustype='2' 切片
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.famt)
+        expression: SUM(paybook_full_high_item.famt)
     ai_context:
-      instructions: 用 pay_date 作业务时间轴（缴款日，2026-10-26 round-02 全局拍板1：缴款时间统一 FDATE，"今年"窗口按 pay_date 落年）；
+      instructions: 用 pay_date 作业务时间轴（缴款日，缴款时间统一 FDATE，"今年"窗口按 pay_date 落年）；
         按执收单位/科目/项目/归属区划/业务类型(fbustype)/缴款人(payer_name)分组；与汇缴（une_）口径不混算；用户提及"直缴/汇缴"必须按
-        fbustype='1'/'2' 收窄，禁止将全类型 SUM 表述为直缴金额
+        fbustype='1'/'2' 收窄，禁止将全类型 SUM 表述为直缴金额；「各代理银行代收的非税收入金额/排名」类问题用 代收非税收入金额（缴款书粒度票面口径，代理银行维度=pay_bank_code/pay_bank_name）；
+        收入侧口径（收入单位/预算科目/收入区划/预算单位/主管部门）问题一律用 收入金额（income_daybook）
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"pdaqokomvznqk2anu4rfdemm"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"pdaqokomvznqk2anu4rfdemm"}'
   - name: 非税缴款笔数
-    description: 非税缴款笔数（fpaycode 去重口径，2026-10-26 round-02 全局拍板5：笔数键统一 fpaycode；原 fid 口径）；全部业务类型，直缴口径=按
+    description: 非税缴款笔数（fpaycode 去重口径，笔数键统一 fpaycode）；全部业务类型，直缴口径=按
       fbustype='1' 切片
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: COUNT(DISTINCT paybook_full_high.pay_code)
+        expression: COUNT(DISTINCT paybook_full_high_item.pay_code)
     ai_context:
-      instructions: paybook_full_high 有 1,281 行，fid 与 fpaycode 均非唯一（fid distinct 1,110 有生命周期多版本重复，fpaycode
-        distinct 975 因通知书明细拆多行），笔数必须去重，禁止 COUNT(*)；OSI 聚合白名单不含 uniqExact，故用 COUNT(DISTINCT
-        fpaycode)（ClickHouse 引擎编译为 uniqExact，口径一致，去重笔数 975；2026-10-26 全局拍板5 前的 fid 口径为 1,110，彼时表
-        1,272 行为 1,101）；时间轴同 非税缴款金额（pay_date，round-02 全局拍板1）；用户提及"直缴/汇缴"必须按 fbustype='1'/'2' 收窄
+      instructions: paybook_full_high_item 的 fid 与 fpaycode 均非唯一（fid 有生命周期多版本重复，fpaycode
+        因通知书明细拆多行），笔数必须去重，禁止 COUNT(*)；OSI 聚合白名单不含 uniqExact，故用 COUNT(DISTINCT
+        fpaycode)（ClickHouse 引擎编译为 uniqExact，口径一致）；时间轴同 非税缴款金额（pay_date）；用户提及"直缴/汇缴"必须按 fbustype='1'/'2' 收窄
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"x3qdjni9hn8h3icg8cg9m4g9"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"x3qdjni9hn8h3icg8cg9m4g9"}'
   - name: 完成缴款笔数
-    description: 完成缴款笔数（fisreceived='1' 到账完成口径，round-02 q18 拍板；笔数键按 2026-10-26 全局拍板5 统一 fpaycode）；实测
-      fisreceived='1' 按业务类型（fpaycode 去重）：直缴 570 笔/汇缴 68 笔，合计 638 笔（原 fid 口径 629/99 合计 728）
+    description: 完成缴款笔数（fisreceived='1' 到账完成口径，笔数键统一 fpaycode）；按业务类型（fbustype）切片得直缴/汇缴完成笔数
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: COUNT(DISTINCT CASE WHEN paybook_full_high.is_received = '1' THEN paybook_full_high.pay_code END)
+        expression: COUNT(DISTINCT CASE WHEN paybook_full_high_item.is_received = '1' THEN paybook_full_high_item.pay_code END)
     ai_context:
-      instructions: 基于 非税缴款笔数 的 filter 派生（paybook_full_high.fisreceived='1'，源码 PayBookServiceImpl/UPayBook 报表判据）；
-        "完成的缴款"时间锚仍 pay_date（round-02 q18 拍板：不另立 freceiveddate 到账锚）；按 fbustype 分组得直缴('1')/汇缴('2')完成笔数，
-        占比=各方式完成笔数÷完成总笔数，分母用不带维度的单独全量查询；笔数键按 2026-10-26 全局拍板5 统一 fpaycode（原 fid 口径 629/99
-        因 92 个 fpaycode 拆多明细行而偏高，已弃用）
+      instructions: 基于 非税缴款笔数 的 filter 派生（paybook_full_high_item.fisreceived='1'，源码 PayBookServiceImpl/UPayBook 报表判据）；
+        "完成的缴款"时间锚为 pay_date（不另立 freceiveddate 到账锚）；按 fbustype 分组得直缴('1')/汇缴('2')完成笔数，
+        占比=各方式完成笔数÷完成总笔数，分母用不带维度的单独全量查询；笔数键统一 fpaycode
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_received_pcode_uniq"},"derive":{"type":"filter","base":"非税缴款笔数","where":"paybook_full_high.is_received
-        = ''1''"},"dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r02q18finishedcnt0000001"}'
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_item_received_pcode_uniq"},"derive":{"type":"filter","base":"非税缴款笔数","where":"paybook_full_high_item.is_received
+        = ''1''"},"dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r02q18finishedcnt0000001"}'
   - name: 清分金额
-    description: 清分金额（paybook_full_high.fimamt 直 SUM，明细行口径）
+    description: 清分金额（paybook_full_high_item.fimamt 直 SUM，明细行口径）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.fimamt)
+        expression: SUM(paybook_full_high_item.fimamt)
     ai_context:
-      instructions: 明细行 fimamt 直 SUM；全量对账基准 16,016,079,467.68；时间轴与缴款金额一致用 pay_date（round-02 全局拍板1）；可按
-        fbustype 切片，直缴清分金额需同时过滤 fbustype='1'
+      instructions: 明细行 fimamt 直 SUM；时间轴与缴款金额一致用 pay_date；可按
+        fbustype 切片，直缴清分金额需同时过滤 fbustype='1'；「缴入国库/落入财政专户各多少」资金去向分组按 bgt_style_name
+        （bgt_style_code '1'=国库 '2'=财政专户 '3'=单位代收 '4'=其他，空串为未清分中间态 fimamt 全 NULL）；
+        「分入本单位/收入记账到本单位」=rec_agen_id_code=本单位识别码过滤（登录人单位档案 dim_agen 查取）+按执收单位 fchgagenname
+        分组；「本单位执收」=chg_agen_code=本单位编码过滤；「分入本区划」=frecrgncode 过滤（云南省本级='530000'），
+        区划级收窄+按执收区划分组用 清分分入金额_跨区划
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","uid":"pijjwlipxhhj3g6oosgj1h4m"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","uid":"pijjwlipxhhj3g6oosgj1h4m"}'
   - name: 划拨金额
     description: 划拨金额（funddivide_transfer.ftransamt 直 SUM，批次明细行口径）
     expression:
@@ -1812,47 +2244,48 @@ semantic_model:
       - dialect: CLICKHOUSE
         expression: SUM(funddivide_transfer.ftransamt)
     ai_context:
-      instructions: 批次明细行 ftransamt 直 SUM；空键行（fcollectid=''，178 行）ftransamt 全 NULL，全量 72,507.62
-        全在非空键行，单表聚合无需也不得按 fcollectid 过滤；划拨完成/未划拨金额用本指标按 fistransfer 收窄（见 derive
+      instructions: 批次明细行 ftransamt 直 SUM；空键行（fcollectid=''）ftransamt 全 NULL，划拨金额全部在非空键行，
+        单表聚合无需也不得按 fcollectid 过滤；划拨完成/未划拨金额用本指标按 fistransfer 收窄（见 derive
         filter 指标）；时间轴 cleardate
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"gk53phzrrkgo7t13n9tc245l"}'
   - name: 缴库金额
-    description: 缴库金额（treasury_transfer_dedup 按 fid 去重后 76 行 ftotalamt 直 SUM）
+    description: 缴库金额（treasury_transfer_dedup 按 fid 去重口径 ftotalamt 直 SUM）
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: SUM(treasury_transfer_dedup.ftotalamt)
     ai_context:
-      instructions: 必须使用 treasury_transfer_dedup 去重口径：物理表 505 行含 462 行冗余，直接 SUM 虚增约
-        44 倍；全量对账基准 29,535,106.14（76 行）；业务时间轴 msg_date
+      instructions: 必须使用 treasury_transfer_dedup 去重口径：物理表含大量生命周期冗余，直接 SUM 原始表会大幅虚增；业务时间轴 msg_date
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.msg_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","uid":"baxyufkxfxy2kufn8t6f0vy4"}'
   - name: 已缴入国库金额
-    description: 已缴入国库金额（资金实际入库口径 fenterstatus='1'，round-02 q11 全局拍板2）；实测去重后 26 行/46,304.09 元；
-      原报文口径 缴库金额（29,535,106.14）保留作对账基准
+    description: 已缴入国库金额（资金实际入库口径 fenterstatus='1'）；缴库金额（报文口径）与之是两种口径对照
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: SUM(CASE WHEN treasury_transfer_dedup.enter_status = '1' THEN treasury_transfer_dedup.ftotalamt END)
     ai_context:
       instructions: 基于 缴库金额 的 filter 派生（treasury_transfer_dedup.fenterstatus='1'，资金实际入库态）；时间锚
-        enter_date（入库日，round-02 全局拍板2），不再用 fmsgdate/fstatus='9'+income_status 分层口径（已退役）；
-        fincomestatus（国库收入记账回写）不参与本口径；必须用去重口径，直接 SUM 原始表会虚增约 44 倍
+        enter_date（入库日）；
+        「财政记账完成多少/记账回写」记账态问题用 财政记账收入金额（income_status='1' 记账回写完成态，与本指标的
+        资金入库态是两个状态）；必须用去重口径，直接 SUM 原始表会大幅虚增；
+        「缴入国库 vs 财政专户各多少」资金去向分组类问题用 清分金额 按 bgt_style_name 分组（应缴归属口径），
+        本指标答"资金实际到账国库多少"（入库态）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","requires":["measure"],"measure":{"name":"treasury_transfer_dedup_entered_totalamt_sum"},"derive":{"type":"filter","base":"缴库金额","where":"treasury_transfer_dedup.enter_status
         = ''1''"},"dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.enter_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","uid":"r02q11enteredamt00000001"}'
   - name: 汇总批次数
-    description: 清分汇总批次数（funddivide_transfer.fcollectid 去重口径）
+    description: 清分汇总批次数（funddivide_transfer.fcollectid 去重、排除空串口径）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: COUNT(DISTINCT funddivide_transfer.fcollectid)
+        expression: COUNT(DISTINCT CASE WHEN funddivide_transfer.fcollectid != '' THEN funddivide_transfer.fcollectid END)
     ai_context:
-      instructions: fcollectid 生命周期多版本非唯一，批次口径去重计数（COUNT(DISTINCT)，引擎编译为 uniqExact）；空串批次不计入——空串是尚未汇总入批次的明细行而非批次，查询须排除 fcollectid=''（正确口径 428，含空串会多出 1 个假批次得 429）；时间轴 cleardate
+      instructions: fcollectid 生命周期多版本非唯一，批次口径去重计数（COUNT(DISTINCT)，引擎编译为 uniqExact）；空串批次不计入——空串是尚未汇总入批次的明细行而非批次，表达式已内置排除；时间轴 cleardate
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"个","uid":"hv4nn7pvs85tt3fue9ru05gx"}'
@@ -1873,49 +2306,49 @@ semantic_model:
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.famt)
+        expression: SUM(paybook_full_high_item.famt)
     ai_context:
       instructions: window 派生：offset 1 年的 period-over-period；查询粒度（month/quarter/year）运行时决定；缺失比较桶保留
         NULL
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"vmke8ep5ak3p56rke8246tie"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"vmke8ep5ak3p56rke8246tie"}'
   - name: 非税缴款金额_环比
     description: 非税缴款金额 的环比值（上一自然月同口径聚合）；全业务类型口径，直缴需另按 fbustype='1' 过滤
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.famt)
+        expression: SUM(paybook_full_high_item.famt)
     ai_context:
       instructions: window 派生：offset 1 月的 period-over-period；查询粒度（month/quarter/year）运行时决定；缺失比较桶保留
         NULL
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"y5lidl55ibttikipag7fsgbx"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","window":{"base":"非税缴款金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"y5lidl55ibttikipag7fsgbx"}'
   - name: 清分金额_同比
     description: 清分金额 的同比值（上一自然年同口径聚合）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.fimamt)
+        expression: SUM(paybook_full_high_item.fimamt)
     ai_context:
       instructions: window 派生：offset 1 年的 period-over-period；时间轴与 清分金额 一致（pay_date）；缺失比较桶保留
         NULL
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"tt3f4q7l4ei4gydhhm2wd39b"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"year","direction":"back"},"calculation":"value"},"uid":"tt3f4q7l4ei4gydhhm2wd39b"}'
   - name: 清分金额_环比
     description: 清分金额 的环比值（上一自然月同口径聚合）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.fimamt)
+        expression: SUM(paybook_full_high_item.fimamt)
     ai_context:
       instructions: window 派生：offset 1 月的 period-over-period；时间轴与 清分金额 一致（pay_date）；缺失比较桶保留
         NULL
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"rpbb4gu7pfkqsbqj41tcmrfo"}'
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","window":{"base":"清分金额","offset":{"count":1,"granularity":"month","direction":"back"},"calculation":"value"},"uid":"rpbb4gu7pfkqsbqj41tcmrfo"}'
   - name: 缴库金额_同比
     description: 缴库金额 的同比值（上一自然年同口径聚合）
     expression:
@@ -1952,7 +2385,7 @@ semantic_model:
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
-        = ''1''"},"subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"rpj7qvvo5clow1kflbh3gaac"}'
+        = ''1''"},"dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"rpj7qvvo5clow1kflbh3gaac"}'
   - name: 未划拨金额
     description: 未完成划拨金额（划拨金额按 funddivide_transfer.fistransfer!='1' 收窄）
     expression:
@@ -1961,140 +2394,327 @@ semantic_model:
         expression: SUM(CASE WHEN funddivide_transfer.fistransfer != '1' THEN funddivide_transfer.ftransamt
           END)
     ai_context:
-      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer!='1' 表示该明细行尚未划拨；空键行（fcollectid=''）ftransamt 全 NULL，天然不计入本指标（未划拨口径=已入批次未划拨），无需空键前置；本指标与 transit_transfer_pool 的 在途滞留金额（fistransfer='1' 且 fisenter='0'，round-03 q24）是互补池，不得混用
+      instructions: 基于 划拨金额 的 filter 派生；funddivide_transfer.fistransfer!='1' 表示该明细行尚未划拨；空键行（fcollectid=''）ftransamt 全 NULL，天然不计入本指标（未划拨口径=已入批次未划拨），无需空键前置；本指标与 transit_transfer_pool 的 在途滞留金额（fistransfer='1' 且 fisenter='0'）是互补池，不得混用
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","requires":["measure"],"measure":{"name":"funddivide_transfer_not_transferred_amt_sum"},"derive":{"type":"filter","base":"划拨金额","where":"funddivide_transfer.fistransfer
-        != ''1''"},"subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"vmihazae3pwvle6cm01lzmxh"}'
+        != ''1''"},"dataset":"funddivide_transfer","time_dimension":"funddivide_transfer.cleardate","subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"vmihazae3pwvle6cm01lzmxh"}'
   - name: 在途滞留金额
-    description: 在途滞留金额（指令已发未到账：fistransfer='1' 且 fisenter='0'，2026-10-27 round-03 q24 拍板；重建至
-      transit_transfer_pool 去重粒度）；实测 24,511 元/27 个 ftransno（raw 37 行直 SUM 虚增 204）；与 未划拨金额（fistransfer≠'1'，q16 池）是互补池不得混用
+    description: 在途滞留金额（指令已发未到账，锚定 transit_transfer_pool 去重粒度）；源侧完整判据
+      fstats='9' AND fisenter='0'（CapitalTransfer.xml:9），宽表无 fstats 列退化按 fistransfer='1' AND
+      fisenter='0' 判定，单头表 FNE_TRANSFER_BANK_MSG 未抽取
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: SUM(transit_transfer_pool.trans_amt)
     ai_context:
-      instructions: 在途滞留池指标（数据集 transit_transfer_pool，round-03 q24；池条件已内置，含 ftransno×fpaycode 去重防批次级
-        金额双算）；拍板的 fstats IN('1','9') 因宽表实库无 fstats 列未落地（数据现实偏差，无法排除划转失败'7'，待②升级）；"今年下达"按
-        trans_date 过滤（实测 27 单 ftransdate 全落 2024-11-07，今年过滤后池空属数据现实）；滞留天数用 transit_days，分档用
-        transit_duration_bucket；与 income_daybook 的 已收未汇缴金额（q23 执收单位已收未汇缴池）是不同池，禁止混用
+      instructions: 在途滞留池指标（数据集 transit_transfer_pool；池条件已内置，含 ftransno×fpaycode 去重防批次级
+        金额双算）；表达式自包含可直接执行，一律以 query_metrics 实查为准；在途判定=fistransfer='1' AND
+        fisenter='0'（源侧完整判据 fstats='9' AND fisenter='0'，CapitalTransfer.xml:9，宽表无 fstats 列记数据现实偏差）；
+        金额列 ftransamt（源 FNE_COLLECT_TO_TRANSFER.FAMT）；"今年下达"按 trans_date 过滤；滞留天数用
+        transit_days，分档用 transit_duration_bucket
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"transit_transfer_pool","time_dimension":"transit_transfer_pool.trans_date","subject_path":["非税收入","资金链","划拨"],"unit":"元","uid":"r02q24intransitamt000001"}'
   - name: 在途滞留笔数
-    description: 在途滞留笔数（指令已发未到账，按 ftransno 去重，2026-10-27 round-03 q24 拍板辅指标）；实测 27 个 ftransno
+    description: 在途滞留笔数（指令已发未到账，按 ftransno 去重辅指标）
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: COUNT(DISTINCT transit_transfer_pool.trans_no)
     ai_context:
-      instructions: 在途滞留池辅指标（数据集 transit_transfer_pool，round-03 q24）；口径与 在途滞留金额 完全一致（fstats/今年下达落地
-        限制同该指标说明）；ftransno=划拨单据号（round-03 拍板：q24 的 ftransno 属划拨单据号口径，与缴库单据号同名不同义）
+      instructions: 在途滞留池辅指标（数据集 transit_transfer_pool）；口径与 在途滞留金额 完全一致，同该指标说明；
+        ftransno=划拨单据号，与缴库单据号同名不同义；笔数键收敛到 ftransno，fpaycode 笔数口径不适用于划拨单据维度
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"transit_transfer_pool","time_dimension":"transit_transfer_pool.trans_date","subject_path":["非税收入","资金链","划拨"],"unit":"笔","uid":"r02q24intransitcnt000001"}'
   - name: 清分率
-    description: 清分率 = 清分金额 ÷ 非税缴款金额（两者同在 paybook_full_high 行内）；按 fbustype
+    description: 清分率 = 清分金额 ÷ 非税缴款金额（两者同在 paybook_full_high_item 行内）；按 fbustype
       分组时比值逐组成立；整体比值含全类型行，直缴清分率=查询时分子分母同时过滤 fbustype='1'
     datatype: Float
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: COALESCE(SUM(paybook_full_high.fimamt), 0) / COALESCE(SUM(paybook_full_high.famt),
+        expression: COALESCE(SUM(paybook_full_high_item.fimamt), 0) / COALESCE(SUM(paybook_full_high_item.famt),
           0)
     ai_context:
       instructions: compose 派生：清分金额 / 非税缴款金额，两者同 dataset 行内计算安全；除零/空值按 fill=0 返回
         0；直缴口径必须同时过滤 fbustype='1'，禁止只用全类型合计表述直缴清分率
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","derive":{"type":"compose","expr":"清分金额 / 非税缴款金额","fill":0},"dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","清分"],"uid":"vu089fiu5h16kcr6xm19suzo"}'
-  - name: 缴款金额_头表
-    description: 缴款金额（头表缴款书总额口径 SUM(ftotalamt)，2026-10-27 round-03 q10 拍板：非明细行 famt）；全业务类型，
-      直缴口径=按 fbustype='1' 切片
+      data: '{"v":"1.11","derive":{"type":"compose","expr":"清分金额 / 非税缴款金额","fill":0},"dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"%","uid":"vu089fiu5h16kcr6xm19suzo"}'
+  - name: 缴款金额_票面总额
+    description: 缴款金额（缴款通知书票面总额口径）；全业务类型，直缴口径=按 bustype='1' 切片；锚定缴款书粒度数据集
+      paybook_head（每 fpaycode 一行）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(paybook_full_high.total_amt)
+        expression: SUM(paybook_head.total_amt)
     ai_context:
-      instructions: 时间轴 pay_date（缴款日，2026-10-26 全局拍板1）；与 非税缴款金额（famt 明细行口径）并存，"缴款金额/金额走势"类
-        问题按 round-03 q10 拍板优先用本指标，逐月互证时两口径可对照；是否含滞纳金 codeqa 未定论（QryPayBook.java:337/355 存疑）；
-        同 fpaycode 各明细行 ftotalamt 相同（头表回填），按执收单位/科目/项目/归属区划/业务类型/代理银行（pay_bank_code）分组，
-        笔数键另用 非税缴款笔数/有效缴款笔数（全局拍板5），禁止把本指标的行数当笔数
+      instructions: 时间轴 pay_date（缴款日）；与 非税缴款金额（famt 明细行口径）并存，"缴款金额/金额走势"类问题优先用本指标，
+        逐月互证时两口径可对照；是否含滞纳金口径未定论（QryPayBook.java:337/355 存疑）；本指标可按 代理银行（pay_bank_code/pay_bank_name）、
+        收款银行（rec_bank_name）、业务类型（bustype）、缴款日（pay_date）分组；执收单位/科目/项目/归属区划维度用 非税缴款金额（明细行口径）；
+        收入侧口径（收入单位/预算科目/收入区划/预算单位/主管部门）问题一律用 收入金额（income_daybook）；
+        笔数键另用 非税缴款笔数/有效缴款笔数，禁止把本指标的行数当笔数
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"r03q10headtotalamt000000"}'
+      data: '{"v":"1.11","dataset":"paybook_head","time_dimension":"paybook_head.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"r03q10headtotalamt000000"}'
   - name: 代收非税收入金额
-    description: 各代理银行代收的非税收入金额（缴款金额_头表 按 fisreceived='1' 收窄，2026-10-27 round-03 q15 拍板，
-      codeqa 建议限定已缴）
+    description: 各代理银行代收的非税收入金额（缴款金额_票面总额 按 is_received='1' 收窄——"代收"须已缴入银行）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: SUM(CASE WHEN paybook_full_high.is_received = '1' THEN paybook_full_high.total_amt END)
+        expression: SUM(CASE WHEN paybook_head.is_received = '1' THEN paybook_head.total_amt END)
     ai_context:
-      instructions: 基于 缴款金额_头表 的 filter 派生（paybook_full_high.is_received='1'，codeqa 拍板"代收"须已缴入银行）；
-        分组维度=pay_bank_code（代理银行编码），展示名 pay_bank_name，TopN 排名按本指标；旧 frecbankname/acc_agen 维度作废
-        （round-03 q15 裁决：两侧旧维度都不是生产口径"代理银行"）；时间轴 pay_date
+      instructions: 「各代理银行代收的非税收入金额/排名」类问题即本指标，基于 缴款金额_票面总额 的 filter 派生（is_received='1'）；
+        分组维度=pay_bank_code（代理银行编码），展示名 pay_bank_name，TopN 排名按本指标；时间轴 pay_date
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_received_totalamt_sum"},"derive":{"type":"filter","base":"缴款金额_头表","where":"paybook_full_high.is_received
-        = ''1''"},"dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"r03q15paybankrecvamt0000"}'
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_head_received_totalamt_sum"},"derive":{"type":"filter","base":"缴款金额_票面总额","where":"paybook_head.is_received
+        = ''1''"},"dataset":"paybook_head","time_dimension":"paybook_head.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"元","uid":"r03q15paybankrecvamt0000"}'
   - name: 有效缴款笔数
-    description: 有效缴款笔数（非税缴款笔数 按 fstate≠'2' 排除作废，2026-10-27 round-03 q19 拍板过滤器"有效"；笔数键
-      COUNT(DISTINCT fpaycode) 全局拍板5）
+    description: 有效缴款笔数（非税缴款笔数 按 fstate≠'2' 排除作废，过滤器"有效"；笔数键
+      COUNT(DISTINCT fpaycode)）
     expression:
       dialects:
       - dialect: CLICKHOUSE
-        expression: COUNT(DISTINCT CASE WHEN paybook_full_high.fstate != '2' THEN paybook_full_high.pay_code END)
+        expression: COUNT(DISTINCT CASE WHEN paybook_full_high_item.fstate != '2' THEN paybook_full_high_item.pay_code END)
     ai_context:
-      instructions: 基于 非税缴款笔数 的 filter 派生（paybook_full_high.fstate≠'2'）；金额分档统计（round-03 q19）用本指标
+      instructions: 基于 非税缴款笔数 的 filter 派生（paybook_full_high_item.fstate≠'2'）；金额分档统计用本指标
         × amount_bucket 分组，"今年缴款"按 pay_date 过滤；"已缴判定"说明：宽表行即 FNE 侧缴款记录（生产左连判定的已缴侧），
-        本表无需另加已缴过滤；fstate 实测 '2' 仅 1 行，与 非税缴款笔数 差异极小
+        本表无需另加已缴过滤
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_valid_pcode_uniq"},"derive":{"type":"filter","base":"非税缴款笔数","where":"paybook_full_high.fstate
-        != ''2''"},"dataset":"paybook_full_high","time_dimension":"paybook_full_high.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r03q19validpcodecnt00000"}'
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_item_valid_pcode_uniq"},"derive":{"type":"filter","base":"非税缴款笔数","where":"paybook_full_high_item.fstate
+        != ''2''"},"dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r03q19validpcodecnt00000"}'
   - name: 全程耗时缴款笔数
-    description: 缴款→缴库全程耗时分析笔数（每 fpaycode 一笔，池=有缴库记录，2026-10-27 round-03 q21 拍板）；实测 222 笔，
-      其中 2026 年缴款 84 笔、有入库日 8 笔
+    description: 缴款→缴库全程耗时分析笔数（每 fpaycode 一笔，池=有缴库记录）
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: COUNT(DISTINCT paybook_treasury_pair.pay_code)
     ai_context:
       instructions: 数据集 paybook_treasury_pair（fpaycode 粒度，已内置"有缴库记录"池，因 treasury 侧 fpaycode 全空必须两跳
-        关联）；耗时起点=pay_date（缴款日，全局拍板1）、终点=treasury_enter_date（fne_treasury_transfer_new.fenterdate 国库回执
-        入库日，勿与宽表 enter_date 划转 MSG 到账日混用，round-03 q21 注记）；耗时天数用 enter_days，分档用 enter_duration_bucket
-        （<1天/1-10天/10-100天/≥100天，全局拍板4）；"今年缴款"按 pay_date 过滤
+        关联）；耗时起点=pay_date（缴款日）、终点=treasury_enter_date（fne_treasury_transfer_new.fenterdate 国库回执
+        入库日，勿与宽表 enter_date 划转 MSG 到账日混用）；耗时天数用 enter_days，分档用 enter_duration_bucket
+        （<1天/1-10天/10-100天/≥100天）；"今年缴款"按 pay_date 过滤
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"paybook_treasury_pair","time_dimension":"paybook_treasury_pair.pay_date","subject_path":["非税收入","资金链","缴库"],"unit":"笔","uid":"r03q21fulldurcnt00000000"}'
   - name: 未缴笔数
-    description: 已开具未缴款缴款书笔数（UNE 开具左连宽表无缴款记录+fstate≠'2'，2026-10-27 round-03 q22 拍板左连判定）；
-      实测 6,214 笔
+    description: 已开具未缴款缴款书笔数（UNE 开具左连宽表无缴款记录+fstate='1'）
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: COUNT(DISTINCT unpaid_paybook.pay_code)
     ai_context:
-      instructions: 数据集 unpaid_paybook（缴款书级，已内置未缴池，替代 round-02 的 fstate='1' 直筛——宽表主表 FNE 侧未缴书
-        不进宽表故旧口径全 0）；时间锚 issue_date=开具日（une_paybook_high.fdate，与宽表 fdate 缴款日同名不同义）；分档用
-        unpaid_duration_bucket（<1天/1-10天/10-100天/≥100天，全局拍板4）；未缴金额可用 unpaid_paybook.total_amt（ftotalamt
-        头表口径，含滞纳金存疑同 q19）
+      instructions: 数据集 unpaid_paybook（缴款书级，池条件 fstate='1'+左连无缴款记录已内置）；时间锚 issue_date=开具日（une_paybook_high.fdate，与宽表 fdate 缴款日同名不同义）；分档用
+        unpaid_duration_bucket（<1天/1-10天/10-100天/≥100天）；未缴金额分析用 未缴且有效票面金额（有效期收窄的
+        total_amt 票面总额口径）；未缴判定只在 unpaid_paybook 池（宽表行即已缴侧，fstate 过滤不能替代池判定）
     custom_extensions:
     - vendor_name: DATUS
       data: '{"v":"1.11","dataset":"unpaid_paybook","time_dimension":"unpaid_paybook.issue_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r03q22unpaidcnt000000000"}'
   - name: 已收未汇缴金额
-    description: 执收单位已收未汇缴上缴的滞留资金（fne_income_daybook.fisgenerec=0 存量池，2026-10-27 round-03 q23 拍板）；
-      实测 740 条/1,472,288.25 元
+    description: 执收单位已收款但尚未汇总缴库形成汇缴收入的滞留资金（fne_income_daybook.fisgenerec=0 存量池，
+      "已收未汇缴"=已收款未汇总缴库）
     expression:
       dialects:
       - dialect: CLICKHOUSE
         expression: SUM(CASE WHEN income_daybook.fisgenerec = 0 THEN income_daybook.income_amt END)
     ai_context:
-      instructions: 数据集 income_daybook；"执收单位已收/未汇缴/滞留资金"类问题（round-03 q23）用本指标，禁止用 在途滞留金额
-        （q24 划拨在途池，round-03 q23 裁决 datus 误用根因）；金额列 fimamt（fownimamt 本级收入为备选，口径待人定）；
-        queryIncomeUnGeneRec 的资金性质预算内条件因 CK 列未核验未落地（数据现实偏差）；时间锚 received_date（到账日），
-        分档用 detention_duration_bucket（<1天/1-10天/10-100天/≥100天，全局拍板4）
+      instructions: 数据集 income_daybook；"执收单位已收/未汇缴/滞留资金"类问题用本指标，在途滞留金额（划拨在途池）
+        是另一口径不得顶替；基于 收入金额 的 filter 派生（fisgenerec=0 未汇缴收窄）；金额列 fimamt（fownimamt 本级收入为备选）；
+        queryIncomeUnGeneRec 的资金性质预算内条件所需列未抽取，未落地（断供注记，一律实查）；时间锚 received_date（到账日），
+        分档用 detention_duration_bucket（<1天/1-10天/10-100天/≥100天）
     custom_extensions:
     - vendor_name: DATUS
-      data: '{"v":"1.11","dataset":"income_daybook","time_dimension":"income_daybook.received_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","uid":"r03q23unremittedamt00000"}'
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"income_daybook_unremitted_amt_sum"},"derive":{"type":"filter","base":"收入金额","where":"income_daybook.fisgenerec = 0"},"dataset":"income_daybook","time_dimension":"income_daybook.received_date","subject_path":["非税收入","资金链","缴库"],"unit":"元","uid":"r03q23unremittedamt00000"}'
+  - name: 超期到账笔数
+    description: 缴款后资金超过10天才到账的缴款书笔数（fisreceived='1' 且 freceiveddate 非空 且 到账天数>10；
+      笔数键 COUNT(DISTINCT fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT CASE WHEN paybook_full_high_item.is_received = '1' AND paybook_full_high_item.received_date
+          IS NOT NULL AND dateDiff('day', paybook_full_high_item.pay_date, paybook_full_high_item.received_date)
+          > 10 THEN paybook_full_high_item.pay_code END)
+    ai_context:
+      instructions: 时长口径=缴款日（pay_date）→资金到账日（received_date），dateDiff>10 天；
+        禁用 trans_date/enter_date 划拨侧字段——划拨视图 V_FNE_CLEAR_PAYMENT 不能作到账源，国库账户到账批次不回写日期属正常
+        PayinfoReceivedServiceImpl.java:113-121）；"今年缴款"按 pay_date 过滤、"今年到账"按 received_date 过滤；到账标志与日期存在轻微错位，已由 received_date
+        IS NOT NULL 前置排除
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r04q30overduerecvcnt0000"}'
+  - name: 超期未对账笔数
+    description: 资金到账后超过15天仍未完成对账的缴款书笔数（fisreceived='1' 且（fisfundsrec='0' 或 ffundsrecdate 空）且
+      到账距今>15 天；笔数键 COUNT(DISTINCT fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT CASE WHEN paybook_full_high_item.is_received = '1' AND (paybook_full_high_item.funds_rec_flag
+          = '0' OR paybook_full_high_item.funds_rec_date IS NULL) AND dateDiff('day',
+          paybook_full_high_item.received_date, today()) > 15 THEN paybook_full_high_item.pay_code
+          END)
+    ai_context:
+      instructions: 对账完成=资金对账（funds_rec_flag/funds_rec_date）——
+        禁用缴库批次数（fstatus/fenterDate）、reconcile_status（缴库
+        报文对账）与 is_cleared（清分）顶替；未对账天数起算锚=received_date（到账日）距今；"今年到账"按 received_date
+        过滤；"已到账"分母用 完成缴款笔数
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.received_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r04q31overdueunreccnt000"}'
+  - name: 清分分入金额_跨区划
+    description: 由其他区划执收、清分分入的收入金额（fchgrgncode≠frecrgncode 收窄的 SUM(fimamt)，
+      "分入"核心模式=两区划字段参与判定，PayBook.xml:116-125）；"分入本区划"=本指标再按 frecrgncode=本区划 过滤，本区划取登录人所属区划，
+      无会话身份时按本库主体区划云南省本级 frecrgncode='530000'
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(CASE WHEN paybook_full_high_item.fchgrgncode != paybook_full_high_item.frecrgncode
+          THEN paybook_full_high_item.fimamt END)
+    ai_context:
+      instructions: 基于 清分金额 的跨区划收窄（分入金额=fimamt 清分金额列，禁用 ftransamt 划拨金额）；分组维度=执收区划 fchgrgncode（展示名 fchgrgnname），"按执收区划统计各分入多少"即本指标
+        按 fchgrgncode 分组；与执收单位级"分入本单位"（rec_agen_id_code=本单位过滤+fchgagenname 分组）是区划/单位两级口径；
+        时间轴 pay_date（fdate）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"paybook_full_high_item_crossrgn_fimamt_sum"},"derive":{"type":"filter","base":"清分金额","where":"paybook_full_high_item.fchgrgncode
+        != paybook_full_high_item.frecrgncode"},"dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","uid":"r04q14crossrgnamt0000000"}'
+  - name: 资金性质错配笔数
+    description: 应缴国库性质的资金却实落财政专户的缴款书笔数（判定=接收侧资金性质 rec_funds_nature IN
+      11-14 AND bgt_style_code='2'，笔数键 COUNT(DISTINCT pay_code)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT CASE WHEN paybook_full_high_item.rec_funds_nature IN
+          ('11','12','13','14') AND paybook_full_high_item.bgt_style_code = '2' THEN paybook_full_high_item.pay_code
+          END)
+    ai_context:
+      instructions: 判定=接收侧资金性质 rec_funds_nature（frecfundsnaturecode，ffundsort 抽取改名列）IN
+        11-14（应缴国库性质）AND bgt_style_code='2'（实落财政专户）；"有没有应缴国库却落入专户的资金/资金性质与
+        资金去向不符"类问题即本指标；时间轴 pay_date
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"paybook_full_high_item","time_dimension":"paybook_full_high_item.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"笔"}'
+  - name: 收入金额
+    description: 收入台账收入金额（fne_income_daybook.fimamt 直 SUM，收入流水口径）；本级口径 fownimamt（own_income_amt）
+      为记账金额与 report.sql 加权口径的备选列
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(income_daybook.income_amt)
+    ai_context:
+      instructions: 收入侧总指标（数据集 income_daybook：收入单位/预算科目/预算单位/主管部门类问题全走本数据集，
+        禁用缴款侧 paybook_full_high_item 冒充）；分组维度按题切：收入单位=income_agen_name（Top10 排名）、收入科目=subject_name
+        （空编码落"未归属"单列）、预算单位=bgt_agen_name、主管部门=dept_name、收入区划=物理
+        fimrgnname（未建模维度，需要时补建）；时间锚 enter_date（收入日期锚，"今年收入"按本字段落年）；
+        与 已收未汇缴金额（fisgenerec=0 子池）同源，后者是本指标的未汇缴收窄
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"income_daybook","time_dimension":"income_daybook.enter_date","subject_path":["非税收入","资金链","收入"],"unit":"元","uid":"r04q09incomeamt000000000"}'
+  - name: 财政记账收入金额
+    description: 已完成财政记账的收入金额（缴库报文回写口径，income_status='1' 收窄的 SUM(ftotalamt)，
+      判据 FINCOMESTATUS='1'，TreasuryTips.xml:545-553）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(CASE WHEN treasury_transfer_dedup.income_status = '1' THEN treasury_transfer_dedup.ftotalamt END)
+    ai_context:
+      instructions: income_status='1' 记账回写完成态与 enter_status='1' 资金入库态是两个状态，"已完成财政记账/记账回写"
+        类问题即本指标，"资金实际到账国库"用 已缴入国库金额；时间锚 enter_date（缴库单入库日，记账日期落地锚）；
+        必须使用 treasury_transfer_dedup 去重口径，直接 SUM 原始表会大幅虚增
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"treasury_transfer_dedup_income_status_totalamt_sum"},"derive":{"type":"filter","base":"缴库金额","where":"treasury_transfer_dedup.income_status
+        = ''1''"},"dataset":"treasury_transfer_dedup","time_dimension":"treasury_transfer_dedup.enter_date","subject_path":["非税收入","资金链","收入"],"unit":"元","uid":"r04q05geneacctamt0000000"}'
+  - name: 未缴且有效笔数
+    description: 今年开具、至今未缴款且缴款书仍有效未作废的笔数（未缴池 fstate='1' 内 eff_date>=当前日；
+      frecmode_treasury 排除项断供退化记注；笔数键 COUNT(DISTINCT
+      fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT CASE WHEN unpaid_paybook.eff_date >= today() THEN
+          unpaid_paybook.pay_code END)
+    ai_context:
+      instructions: 基于 未缴笔数 的有效期内收窄（池条件 fstate='1'+左连无缴款记录已内置）；有效期判定=
+        unpaid_paybook.eff_date 与当前日比较（OpenQueryAPIServiceImpl.java:615，无过期定时任务）；与 已过期未缴笔数 互补，
+        两池互补勾稽=未缴笔数（勾稽校验式）；"今年开具"按 issue_date 过滤（time_start/time_end 传本指标即按开具日过滤）；
+        票面金额合计用 未缴且有效票面金额（同池同界孪生指标）；未缴判定只在 unpaid_paybook 池（宽表行即已缴侧）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"unpaid_paybook_valid_pcode_uniq"},"derive":{"type":"filter","base":"未缴笔数","where":"unpaid_paybook.eff_date
+        >= today()"},"dataset":"unpaid_paybook","time_dimension":"unpaid_paybook.issue_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r04q25unpaidvalidcnt0000"}'
+  - name: 未缴且有效票面金额
+    description: 今年开具、至今未缴款且缴款书仍有效的缴款书票面总额（未缴池 eff_date>=当前日收窄的
+      SUM(total_amt)，total_amt=ftotalamt 票面总额口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(CASE WHEN unpaid_paybook.eff_date >= today() THEN unpaid_paybook.total_amt
+          END)
+    ai_context:
+      instructions: 与 未缴且有效笔数 同池同界（孪生指标：笔数配金额对答）；有效期判定=eff_date>=当前日严格比较
+        （OpenQueryAPIServiceImpl.java:615）；"今年开具"按 issue_date 过滤（time_start/time_end 传本指标即按开具日过滤）；
+        票面总额口径含滞纳金存疑（QryPayBook.java:337/355）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"unpaid_paybook","time_dimension":"unpaid_paybook.issue_date","subject_path":["非税收入","资金链","缴款"],"unit":"元"}'
+  - name: 已过期未缴笔数
+    description: 今年开具的缴款书中已过有效期仍未缴款的笔数（未缴池 fstate='1' 内 eff_date<当前日；
+      严格比较口径，OpenQueryAPIServiceImpl.java:615；frecmode_treasury 排除项
+      断供退化记注；笔数键 COUNT(DISTINCT fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT CASE WHEN unpaid_paybook.eff_date < today() THEN
+          unpaid_paybook.pay_code END)
+    ai_context:
+      instructions: 基于 未缴笔数 的已过期收窄；与 未缴且有效笔数 互补，两池互补勾稽=未缴笔数（勾稽
+        校验式）；过期判定=eff_date<当前日严格比较（EInvoiceToCloudErrorDataDao.xml:79 的 <=口径并存，本指标取严格<）；
+        "今年开具"按 issue_date 过滤；未缴判定只在 unpaid_paybook 池（宽表行即已缴侧）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","requires":["measure"],"measure":{"name":"unpaid_paybook_expired_pcode_uniq"},"derive":{"type":"filter","base":"未缴笔数","where":"unpaid_paybook.eff_date
+        < today()"},"dataset":"unpaid_paybook","time_dimension":"unpaid_paybook.issue_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r04q28unpaidexpcnt000000"}'
+  - name: 未形成收入笔数
+    description: 今年已缴款的缴款书中至今尚未形成收入记录的笔数（池 no_income_paybook：fisreceived='1' 左连收入台账
+      distinct fpaycode 无匹配记录，记录口径 CK 退化落地；权威 FUNGENEINCOMEAMT>0 未抽取断供记账；笔数键 COUNT(DISTINCT fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT no_income_paybook.pay_code)
+    ai_context:
+      instructions: 数据集 no_income_paybook（缴款书级，池条件已内置）；记录口径（台账按 fpaycode 无记录）与金额差额口径
+        （FUNGENEINCOMEAMT 权威）两义不可互推，金额差额备选=fownimamt；"今年已缴款"按 pay_date 过滤；已缴款判定=
+        fisreceived='1'；台账侧 DISTINCT fpaycode 防一对多扇出
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"no_income_paybook","time_dimension":"no_income_paybook.pay_date","subject_path":["非税收入","资金链","缴款"],"unit":"笔","uid":"r04q36noincomecnt0000000"}'
+  - name: 未清分笔数
+    description: 资金已缴入国库但对应缴款书尚未完成清分的笔数（池 entered_uncleared_paybook：fenterstatus='1'
+      AND fcollectid=''（未汇总入批次）；笔数键 COUNT(DISTINCT fpaycode)）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: COUNT(DISTINCT entered_uncleared_paybook.pay_code)
+    ai_context:
+      instructions: 数据集 entered_uncleared_paybook（缴款书级，池条件已内置）；判定组合=已缴入国库 t.fenterstatus='1'
+        AND 未清分 fcollectid=''（fispayenter 是缴库侧标志非清分完成标志勿用）；金额辅指标用 未清分金额
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"entered_uncleared_paybook","time_dimension":"entered_uncleared_paybook.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"笔","uid":"r04q39unclearedcnt000000"}'
+  - name: 未清分金额
+    description: 资金已缴入国库但对应缴款书尚未完成清分的金额（entered_uncleared_paybook.uncleared_amt 直 SUM，辅指标
+      SUM(fimamt) 清分金额口径）
+    expression:
+      dialects:
+      - dialect: CLICKHOUSE
+        expression: SUM(entered_uncleared_paybook.uncleared_amt)
+    ai_context:
+      instructions: 未清分笔数 的金额辅指标；数据集内 uncleared_amt 已按 fpaycode 聚合
+        明细行 fimamt（inner DISTINCT 防两跳扇出）；口径同 清分金额（fimamt 列）
+    custom_extensions:
+    - vendor_name: DATUS
+      data: '{"v":"1.11","dataset":"entered_uncleared_paybook","time_dimension":"entered_uncleared_paybook.pay_date","subject_path":["非税收入","资金链","清分"],"unit":"元","uid":"r04q39unclearedamt000000"}'
